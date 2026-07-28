@@ -74,7 +74,7 @@ impl Barbirolli {
                 errors.push(WarmupFailure::DuplicateVmId(spec.id));
                 continue;
             };
-            if let Err(err) = spec.reconcile(&barbirolli).await {
+            if let Err(err) = Box::pin(spec.reconcile(&barbirolli)).await {
                 errors.push(WarmupFailure::Reconcile(err));
                 continue;
             }
@@ -141,7 +141,7 @@ impl Barbirolli {
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
         let mut vm = self.vm_mut(vm_id)?;
-        vm.shutdown(self).await?;
+        Box::pin(vm.shutdown(self)).await?;
         let spec = vm.spec();
         self.store.delete(spec)?;
         self.vms.remove(&vm_id);
@@ -162,7 +162,7 @@ impl Barbirolli {
             let Some(mut vm) = self.vms.get_mut(&vm.key()) else {
                 continue;
             };
-            if let Err(err) = vm.shutdown(self).await {
+            if let Err(err) = Box::pin(vm.shutdown(self)).await {
                 errors.push(Box::new(err))
             }
         }

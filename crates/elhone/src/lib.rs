@@ -155,7 +155,9 @@ async fn start_vm(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
-    vm.start(&state.manager).await.map_err(ApiError::from)?;
+    Box::pin(vm.start(&state.manager))
+        .await
+        .map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
         id,
@@ -169,7 +171,9 @@ async fn shutdown_vm(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
-    vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
+    Box::pin(vm.shutdown(&state.manager))
+        .await
+        .map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
         id,

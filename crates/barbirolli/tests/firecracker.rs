@@ -52,7 +52,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         tokio::spawn(async move {
             start_barrier.wait().await;
             let mut vm = manager.vm_mut(first)?;
-            vm.start(&manager).await
+            Box::pin(vm.start(&manager)).await
         })
     };
     let duplicate_start = {
@@ -61,7 +61,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         tokio::spawn(async move {
             start_barrier.wait().await;
             let mut vm = manager.vm_mut(first)?;
-            vm.start(&manager).await
+            Box::pin(vm.start(&manager)).await
         })
     };
     start_barrier.wait().await;
@@ -106,7 +106,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         tokio::spawn(async move {
             shutdown_barrier.wait().await;
             let mut vm = manager.vm_mut(first)?;
-            vm.shutdown(&manager).await
+            Box::pin(vm.shutdown(&manager)).await
         })
     };
     let duplicate_shutdown = {
@@ -115,7 +115,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         tokio::spawn(async move {
             shutdown_barrier.wait().await;
             let mut vm = manager.vm_mut(first)?;
-            vm.shutdown(&manager).await
+            Box::pin(vm.shutdown(&manager)).await
         })
     };
     shutdown_barrier.wait().await;
@@ -155,7 +155,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("failed to create the second VM");
     {
         let mut vm = manager.vm_mut(second).expect("missing second VM");
-        vm.start(&manager)
+        Box::pin(vm.start(&manager))
             .await
             .expect("failed to start the second VM");
     }
@@ -179,7 +179,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
 
     {
         let mut vm = manager.vm_mut(second).expect("missing second VM");
-        vm.shutdown(&manager)
+        Box::pin(vm.shutdown(&manager))
             .await
             .expect("failed to shut down the second VM");
     }

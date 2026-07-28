@@ -223,7 +223,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     assert!(manager.ssh_address("alice").await.is_none());
     {
         let mut vm = manager.vm_mut(id).expect("missing VM");
-        vm.shutdown(&manager)
+        Box::pin(vm.shutdown(&manager))
             .await
             .expect("discovered shutdown should be idempotent");
     }

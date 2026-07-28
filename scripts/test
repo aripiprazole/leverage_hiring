@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/test [cargo-test-arguments]
+
+Run shell regression tests, formatting, Clippy with warnings denied, and the
+Linux workspace test suite. Extra arguments are forwarded to cargo test.
+EOF
+}
+
+if (($# > 0)); then
+    case "$1" in
+        help | --help | -h)
+            usage
+            exit 0
+            ;;
+    esac
+fi
+
+require_linux
+require_commands bash cargo timeout
+
+info "running shell-script tests"
+"$SCRIPTS_DIR/tests/test_scripts.sh"
+
+cd "$REPO_ROOT"
+
+info "checking Rust formatting"
+run_with_timeout "cargo fmt" cargo fmt --all -- --check
+
+info "running Clippy"
+run_with_timeout \
+    "cargo clippy" \
+    cargo clippy --workspace --all-targets --features linux -- -D warnings
+
+info "running workspace tests"
+run_with_timeout \
+    "cargo test" \
+    cargo test --workspace --features linux "$@"

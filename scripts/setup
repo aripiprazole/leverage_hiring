@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/setup
+
+Download and prepare Firecracker 1.13, a guest kernel, a writable rootfs,
+and the SSH key used by local development.
+EOF
+}
+
+if (($# > 0)); then
+    case "$1" in
+        help | --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unexpected argument: $1"
+            ;;
+    esac
+fi
+
+require_linux
+require_commands \
+    basename cmp curl grep id install ln mkdir mkfs.ext4 mktemp mv readlink rm \
+    sha256sum ssh-keygen sudo tar truncate uname unsquashfs
+
+ARCH="$(normalize_arch "$(uname -m)")"
+
+mkdir -p "$BARBIROLLI_RUNTIME_DIR/bin" "$DOWNLOAD_DIR" "$IMAGE_ROOT" "$VM_ROOT" "$SSH_DIR"
+
+if runtime_is_prepared; then
+    info "runtime is already prepared at $BARBIROLLI_RUNTIME_DIR"
+    exit 0
+fi
+
+download() {
+    local url="$1"
+    local destination="$2"
+    local temporary="$destination.part.$$"
+
+    info "downloading $(basename "$destination")"
+    if ! curl --fail --location --retry 3 --output "$temporary" "$url"; then
+        rm -f -- "$temporary"
+        die "failed to download $url"
+    fi
+    mv -f -- "$temporary" "$destination"
+}
+
+prepare_firecracker() {
+    if firecracker_is_compatible; then
+        info "Firecracker is already prepared"
+        return
+    fi
+
+    local archive_name checksum_name release_url archive checksum extraction
+    archive_name="firecracker-$FIRECRACKER_VERSION-$ARCH.tgz"
+    checksum_name="$archive_name.sha256.txt"
+    release_url="https://github.com/firecracker-microvm/firecracker/releases/download/$FIRECRACKER_VERSION"
+    archive="$DOWNLOAD_DIR/$archive_name"
+    checksum="$DOWNLOAD_DIR/$checksum_name"
+
+    download "$release_url/$archive_name" "$archive"
+    download "$release_url/$checksum_name" "$checksum"
+    (
+        cd "$DOWNLOAD_DIR"
+        sha256sum -c "$checksum_name"
+    )
+
+    extraction="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.firecracker.XXXXXX")"
+    tar -xzf "$archive" -C "$extraction"
+    install -m 0755 \
+        "$extraction/release-$FIRECRACKER_VERSION-$ARCH/firecracker-$FIRECRACKER_VERSION-$ARCH" \
+        "$FIRECRACKER"
+    rm -rf -- "$extraction"
+
+    firecracker_is_compatible ||
+        die "downloaded Firecracker does not report a supported 1.13 version"
+}
+
+prepare_key() {
+    if [[ -s "$SSH_PRIVATE_KEY" && -s "$DEFAULT_AUTHORIZED_KEYS" ]]; then
+        info "SSH key is already prepared"
+        return
+    fi
+    if [[ -e "$SSH_PRIVATE_KEY" || -e "$DEFAULT_AUTHORIZED_KEYS" ]]; then
+        die "incomplete SSH key pair in $SSH_DIR; move it aside and rerun setup"
+    fi
+
+    info "generating the development SSH key"
+    ssh-keygen -q -t ed25519 -N '' -f "$SSH_PRIVATE_KEY"
+}
+
+prepare_kernel() {
+    if [[ -s "$KERNEL_IMAGE" ]]; then
+        info "guest kernel is already prepared"
+        return
+    fi
+
+    download \
+        "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$FIRECRACKER_CI_VERSION/$ARCH/vmlinux-$KERNEL_VERSION" \
+        "$KERNEL_IMAGE"
+}
+
+ROOTFS_WORK=""
+ROOTFS_TEMP=""
+
+cleanup_rootfs() {
+    if [[ -n "$ROOTFS_WORK" && -d "$ROOTFS_WORK" ]]; then
+        sudo rm -rf -- "$ROOTFS_WORK"
+    fi
+    if [[ -n "$ROOTFS_TEMP" && -e "$ROOTFS_TEMP" ]]; then
+        rm -f -- "$ROOTFS_TEMP"
+    fi
+}
+
+prepare_rootfs() {
+    if [[ -s "$ROOTFS_IMAGE" ]] && rootfs_key_matches; then
+        info "guest rootfs is already prepared"
+        return
+    fi
+
+    if [[ ! -s "$ROOTFS_SQUASHFS" ]]; then
+        download \
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$FIRECRACKER_CI_VERSION/$ARCH/ubuntu-$ROOTFS_VERSION.squashfs" \
+            "$ROOTFS_SQUASHFS"
+    fi
+
+    ROOTFS_WORK="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.rootfs.XXXXXX")"
+    ROOTFS_TEMP="$IMAGE_ROOT/.ubuntu-$ROOTFS_VERSION.ext4.$$"
+    trap 'cleanup_rootfs' EXIT
+    trap 'cleanup_rootfs; exit 130' INT TERM
+
+    info "extracting and configuring the guest rootfs"
+    sudo unsquashfs -d "$ROOTFS_WORK/rootfs" "$ROOTFS_SQUASHFS"
+    sudo install -D -m 0600 \
+        "$DEFAULT_AUTHORIZED_KEYS" \
+        "$ROOTFS_WORK/rootfs/root/.ssh/authorized_keys"
+    sudo chown -R root:root "$ROOTFS_WORK/rootfs"
+
+    truncate -s 1G "$ROOTFS_TEMP"
+    sudo mkfs.ext4 -F -d "$ROOTFS_WORK/rootfs" "$ROOTFS_TEMP"
+    sudo chown "$(id -u):$(id -g)" "$ROOTFS_TEMP"
+    mv -f -- "$ROOTFS_TEMP" "$ROOTFS_IMAGE"
+    ROOTFS_TEMP=""
+    install -m 0644 "$DEFAULT_AUTHORIZED_KEYS" "$ROOTFS_KEY_MARKER"
+
+    sudo rm -rf -- "$ROOTFS_WORK"
+    ROOTFS_WORK=""
+    trap - EXIT INT TERM
+}
+
+prepare_test_rootfs_name() {
+    if [[ -e "$TEST_ROOTFS_IMAGE" ]]; then
+        return
+    fi
+    if [[ -L "$TEST_ROOTFS_IMAGE" ]]; then
+        die "$TEST_ROOTFS_IMAGE is a broken symbolic link"
+    fi
+    ln -s "$(basename "$ROOTFS_IMAGE")" "$TEST_ROOTFS_IMAGE"
+}
+
+prepare_firecracker
+prepare_key
+prepare_kernel
+prepare_rootfs
+prepare_test_rootfs_name
+
+runtime_is_prepared || die "setup finished without producing all required artifacts"
+info "runtime prepared at $BARBIROLLI_RUNTIME_DIR"

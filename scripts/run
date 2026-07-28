@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/run
+
+Build the service with the linux and local features, then run it with the
+privileges required for KVM, TAP, nftables, and IPv4 forwarding.
+EOF
+}
+
+if (($# > 0)); then
+    case "$1" in
+        help | --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unexpected argument: $1"
+            ;;
+    esac
+fi
+
+require_linux
+require_commands cargo cmp grep sudo
+require_runtime_artifacts
+[[ -e /dev/kvm ]] || die "/dev/kvm is unavailable inside this Lima guest"
+
+mkdir -p "$VM_ROOT" "$CARGO_TARGET_DIR"
+
+info "building the service"
+(
+    cd "$REPO_ROOT"
+    cargo build --features linux,local
+)
+
+info "starting HTTP at $ELHONE_ADDR and SSH forwarding at $MEIER_ADDR"
+exec sudo \
+    --preserve-env=VM_ROOT,IMAGE_ROOT,DEFAULT_AUTHORIZED_KEYS,FIRECRACKER,ELHONE_ADDR,MEIER_ADDR,RUST_LOG \
+    "$CARGO_TARGET_DIR/debug/ssh"

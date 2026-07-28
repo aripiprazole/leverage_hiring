@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/dev <setup|run|test|smoke> [arguments]
+
+Commands:
+  setup   Download and prepare Firecracker and VM artifacts
+  run     Build and run the local service
+  test    Run shell and Rust checks
+  smoke   Exercise the HTTP and SSH path against a running service
+EOF
+}
+
+command_name="${1:-help}"
+case "$command_name" in
+    help | --help | -h)
+        usage
+        exit 0
+        ;;
+    setup | run | test | smoke)
+        shift
+        exec "$SCRIPT_DIR/$command_name" "$@"
+        ;;
+    *)
+        printf 'error: unknown command: %s\n\n' "$command_name" >&2
+        usage >&2
+        exit 64
+        ;;
+esac
