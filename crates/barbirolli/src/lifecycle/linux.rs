@@ -2,6 +2,7 @@ use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
 
 use std::{
     collections::HashSet,
+    fmt::Debug,
     net::Ipv4Addr,
     path::PathBuf,
     sync::{
@@ -16,12 +17,13 @@ use dashmap::{
     mapref::one::{Ref, RefMut},
 };
 use nonempty_collections::NEVec;
-use validated::Validated::{self, Fail, Good};
+use validated::Validated;
 
 use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
 use crate::{StorageError, VmId, VmInput, VmSpec, VmStore};
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum BarbirolliVm {
     Discovered(VmSpec),
     Failed(VmSpec),
@@ -38,7 +40,8 @@ pub struct BarbirolliInner {
     pub draining: AtomicBool,
 }
 
-#[derive(derive_more::Deref, Clone)]
+#[derive(derive_more::Deref, Clone, derive_more::Debug)]
+#[debug("Barbirolli(Arc<BarbirolliInner>)")]
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
@@ -222,7 +225,9 @@ impl BarbirolliVm {
         }
     }
 
+    #[tracing::instrument]
     pub async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+        tracing::info!("starting barbirolli vm");
         let spec = match self {
             BarbirolliVm::Discovered(spec) => spec.clone(),
             BarbirolliVm::Failed(spec) => {
@@ -272,7 +277,9 @@ impl BarbirolliVm {
         }
     }
 
+    #[tracing::instrument]
     pub async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+        tracing::info!("shutting downs barbirolli vm");
         match self {
             Self::Discovered(_) => Ok(()),
             Self::Failed(spec) => {

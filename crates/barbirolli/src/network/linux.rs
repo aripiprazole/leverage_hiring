@@ -15,6 +15,7 @@ const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
 pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct ManagedNetwork {
     spec: NetworkSpec,
     table: String,

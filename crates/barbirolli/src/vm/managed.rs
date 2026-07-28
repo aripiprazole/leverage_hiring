@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use derive_more::Debug;
 use fctools::{
     process_spawner::DirectProcessSpawner,
     runtime::tokio::TokioRuntime,
@@ -31,14 +32,17 @@ use crate::{
 type FirecrackerResourceSystem = ResourceSystem<DirectProcessSpawner, TokioRuntime>;
 type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
 
+#[derive(Debug)]
 pub struct ManagedVm {
     pub spec: VmSpec,
+    #[debug(skip)]
     pub vm: FirecrackerVm,
     pub network: Option<ManagedNetwork>,
     pub failed: bool,
 }
 
 impl VmSpec {
+    #[tracing::instrument]
     async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm, LifecycleError> {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
