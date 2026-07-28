@@ -1,0 +1,342 @@
+use super::*;
+
+use nlink::{
+    netlink::{
+        Connection, Nftables, Route,
+        nftables::{Chain, ChainType, CtState, Family, Hook, Policy, Priority, Rule},
+    },
+    tuntap::{Mode, TunTap},
+};
+
+const NETWORK_PREFIX: u8 = 30;
+const MAIN_ROUTE_TABLE: u32 = 254;
+const VM_NETWORK_POOL: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 0);
+const VM_NETWORK_POOL_PREFIX: u8 = 16;
+
+pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error("no IPv4 default route with an output interface exists in the main routing table")]
+    MissingDefaultRoute,
+    #[error("failed to parse tap name: {0}")]
+    ParseValueError(#[from] ParseValueError),
+    #[error("network interface {0:?} was not found")]
+    InterfaceNotFound(String),
+    #[error("172.16.0.0/16 overlaps existing host route {0}")]
+    PoolOverlap(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Nlink(#[from] nlink::netlink::Error),
+    #[error(transparent)]
+    TunTap(#[from] nlink::tuntap::Error),
+    #[error("network cleanup failed (nftables: {nftables:?}, TAP: {tap:?})")]
+    Cleanup {
+        nftables: Option<Box<NetworkError>>,
+        tap: Option<Box<NetworkError>>,
+    },
+    #[error("network setup failed: {setup}; rollback also failed: {rollback}")]
+    SetupRollback {
+        setup: Box<NetworkError>,
+        rollback: Box<NetworkError>,
+    },
+}
+
+pub struct ManagedNetwork {
+    spec: NetworkSpec,
+    table: String,
+}
+
+impl ManagedNetwork {
+    pub async fn cleanup(&self) -> Result<()> {
+        self.spec.cleanup(&self.table).await
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DefaultRouteCandidate {
+    is_ipv4: bool,
+    is_default: bool,
+    metric: Option<u32>,
+    output_interface: Option<u32>,
+}
+
+impl NetworkSpec {
+    async fn setup(
+        &self,
+        route: &Connection<Route>,
+        nftables_conn: &Connection<Nftables>,
+        host: &InterfaceName,
+        table: &str,
+    ) -> Result<()> {
+        let tap = route
+            .get_link_by_name(self.tap.as_ref())
+            .await?
+            .ok_or_else(|| NetworkError::InterfaceNotFound(self.tap.to_string()))?;
+        route
+            .add_address_by_index(tap.ifindex(), self.host_ip.into(), NETWORK_PREFIX)
+            .await?;
+        route.set_link_up_by_index(tap.ifindex()).await?;
+        tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await?;
+        self.install_rules(nftables_conn, host, table).await
+    }
+
+    pub async fn prepare(&self) -> Result<ManagedNetwork> {
+        let table = format!("fc_vm_{}", self.vm_id);
+        let route_conn = Connection::<Route>::new()?;
+
+        ensure_pool_available(&route_conn).await?;
+
+        let routes = route_conn.get_routes_for_table(MAIN_ROUTE_TABLE).await?;
+        let candidates = routes
+            .iter()
+            .map(|route| DefaultRouteCandidate {
+                is_ipv4: route.is_ipv4(),
+                is_default: route.is_default(),
+                metric: route.priority(),
+                output_interface: route.oif(),
+            })
+            .collect::<Vec<_>>();
+        let output = select_default_route(&candidates).ok_or(NetworkError::MissingDefaultRoute)?;
+        let link = route_conn
+            .get_link_by_index(output)
+            .await?
+            .ok_or_else(|| NetworkError::InterfaceNotFound(format!("ifindex {output}")))?;
+        let host = link
+            .name()
+            .ok_or_else(|| NetworkError::InterfaceNotFound(format!("ifindex {output}")))?
+            .parse::<InterfaceName>()
+            .map_err(|error| NetworkError::InterfaceNotFound(error.to_string()))?;
+
+        let nftables_conn = Connection::<Nftables>::new()?;
+        nftables_conn
+            .del_table_if_exists(table.as_str(), Family::Ip)
+            .await?;
+        route_conn.del_link_if_exists(self.tap.as_ref()).await?;
+
+        TunTap::builder()
+            .name(self.tap.as_ref())
+            .mode(Mode::Tap)
+            .create_persistent()?;
+
+        match self.setup(&route_conn, &nftables_conn, &host, &table).await {
+            Ok(()) => Ok(ManagedNetwork {
+                spec: self.clone(),
+                table,
+            }),
+            Err(err) => {
+                match self
+                    .cleanup_with_connections(&route_conn, &nftables_conn, &table)
+                    .await
+                {
+                    Ok(()) => Err(err),
+                    Err(rollback) => Err(NetworkError::SetupRollback {
+                        setup: Box::new(err),
+                        rollback: Box::new(rollback),
+                    }),
+                }
+            }
+        }
+    }
+
+    async fn cleanup_with_connections(
+        &self,
+        route: &Connection<Route>,
+        nftables: &Connection<Nftables>,
+        table: &str,
+    ) -> Result<(), NetworkError> {
+        let nftables = nftables
+            .del_table_if_exists(table, Family::Ip)
+            .await
+            .map(|_| ())
+            .map_err(NetworkError::from);
+        let tap = route
+            .del_link_if_exists(self.tap.as_ref())
+            .await
+            .map(|_| ())
+            .map_err(NetworkError::from);
+        match (nftables, tap) {
+            (Ok(()), Ok(())) => Ok(()),
+            (nftables, tap) => Err(NetworkError::Cleanup {
+                nftables: nftables.err().map(Box::new),
+                tap: tap.err().map(Box::new),
+            }),
+        }
+    }
+
+    async fn cleanup(&self, table: &str) -> Result<(), NetworkError> {
+        let nftables = match Connection::<Nftables>::new() {
+            Ok(connection) => connection
+                .del_table_if_exists(table, Family::Ip)
+                .await
+                .map(|_| ())
+                .map_err(NetworkError::from),
+            Err(error) => Err(NetworkError::from(error)),
+        };
+        let tap = match Connection::<Route>::new() {
+            Ok(connection) => connection
+                .del_link_if_exists(self.tap.as_ref())
+                .await
+                .map(|_| ())
+                .map_err(NetworkError::from),
+            Err(error) => Err(NetworkError::from(error)),
+        };
+        match (nftables, tap) {
+            (Ok(()), Ok(())) => Ok(()),
+            (nftables, tap) => Err(NetworkError::Cleanup {
+                nftables: nftables.err().map(Box::new),
+                tap: tap.err().map(Box::new),
+            }),
+        }
+    }
+
+    pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
+        self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
+    }
+
+    async fn install_rules(
+        &self,
+        conn: &Connection<Nftables>,
+        host: &InterfaceName,
+        table: &str,
+    ) -> Result<(), NetworkError> {
+        let forward_chain = Chain::new(table, "forward")?
+            .family(Family::Ip)
+            .hook(Hook::Forward)
+            .priority(Priority::Filter)
+            .chain_type(ChainType::Filter)
+            .policy(Policy::Accept);
+        let postrouting_chain = Chain::new(table, "postrouting")?
+            .family(Family::Ip)
+            .hook(Hook::Postrouting)
+            .priority(Priority::SrcNat)
+            .chain_type(ChainType::Nat)
+            .policy(Policy::Accept);
+        let isolate = Rule::new(table, "forward")
+            .family(Family::Ip)
+            .match_iif(self.tap.as_ref())
+            .match_daddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
+            .drop()
+            .comment("vm-isolation");
+        let outbound = Rule::new(table, "forward")
+            .family(Family::Ip)
+            .match_iif(self.tap.as_ref())
+            .match_oif(host.as_ref())
+            .accept();
+        let established = Rule::new(table, "forward")
+            .family(Family::Ip)
+            .match_iif(host.as_ref())
+            .match_oif(self.tap.as_ref())
+            .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
+            .accept();
+        let masquerade = Rule::new(table, "postrouting")
+            .family(Family::Ip)
+            .match_saddr_v4(self.subnet, NETWORK_PREFIX)
+            .match_oif(host.as_ref())
+            .masquerade();
+
+        conn.transaction()
+            .add_table(table, Family::Ip)
+            .add_chain(forward_chain)
+            .add_chain(postrouting_chain)
+            .add_rule(isolate)
+            .add_rule(outbound)
+            .add_rule(established)
+            .add_rule(masquerade)
+            .commit(conn)
+            .await?;
+        Ok(())
+    }
+}
+
+fn select_default_route(routes: &[DefaultRouteCandidate]) -> Option<u32> {
+    routes
+        .iter()
+        .filter(|route| route.is_ipv4 && route.is_default)
+        .filter_map(|route| {
+            route
+                .output_interface
+                .map(|interface| (route.metric.unwrap_or(0), interface))
+        })
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, interface)| interface)
+}
+
+async fn ensure_pool_available(connection: &Connection<Route>) -> Result<(), NetworkError> {
+    for route in connection.get_routes().await? {
+        let Some(std::net::IpAddr::V4(destination)) = route.destination() else {
+            continue;
+        };
+        if route.dst_len() == 0 {
+            continue;
+        }
+        if let Some(interface) = route.oif()
+            && connection
+                .get_link_by_index(interface)
+                .await?
+                .and_then(|link| link.name().map(str::to_owned))
+                .is_some_and(|name| name.starts_with("fc-tap"))
+        {
+            continue;
+        }
+
+        let prefix = route.dst_len();
+        if overlaps_vm_pool(*destination, prefix) {
+            return Err(NetworkError::PoolOverlap(format!("{destination}/{prefix}")));
+        }
+    }
+    Ok(())
+}
+
+fn overlaps_vm_pool(destination: Ipv4Addr, prefix: u8) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    let route_start = u32::from(destination) & mask;
+    let route_end = route_start | !mask;
+    let pool_start = u32::from(Ipv4Addr::new(172, 16, 0, 0));
+    let pool_end = pool_start | 0xffff;
+    route_start <= pool_end && pool_start <= route_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultRouteCandidate, overlaps_vm_pool, select_default_route};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn selects_lowest_metric_ipv4_default_route() {
+        let routes = [
+            DefaultRouteCandidate {
+                is_ipv4: true,
+                is_default: true,
+                metric: Some(100),
+                output_interface: Some(4),
+            },
+            DefaultRouteCandidate {
+                is_ipv4: false,
+                is_default: true,
+                metric: Some(1),
+                output_interface: Some(5),
+            },
+            DefaultRouteCandidate {
+                is_ipv4: true,
+                is_default: true,
+                metric: None,
+                output_interface: Some(6),
+            },
+        ];
+
+        assert_eq!(select_default_route(&routes), Some(6));
+    }
+
+    #[test]
+    fn detects_routes_that_overlap_the_vm_pool() {
+        assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 16));
+        assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 12));
+        assert!(!overlaps_vm_pool(Ipv4Addr::new(10, 0, 0, 0), 8));
+    }
+}

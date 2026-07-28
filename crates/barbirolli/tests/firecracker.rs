@@ -13,20 +13,17 @@ use tokio::{
 #[firecracker_test]
 #[ignore = "requires Linux, KVM, Firecracker, and VM artifacts"]
 async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
-    let vm_root = tempfile::tempdir().expect("failed to create VM_ROOT");
-    let default_authorized_keys = vm_root.path().join("default_authorized_keys");
+    let temporary = tempfile::tempdir().expect("failed to create temporary storage");
+    let vm_root = temporary.path().join("vms");
+    let default_authorized_keys = temporary.path().join("default_authorized_keys");
     std::fs::write(&default_authorized_keys, b"")
         .expect("failed to create DEFAULT_AUTHORIZED_KEYS");
     let image_root = PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
     let firecracker =
         PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
-    let api_socket = vm_root.path().join(".sockets/firecracker.socket");
-    let store = VmStore::new(
-        vm_root.path().to_owned(),
-        image_root,
-        default_authorized_keys,
-    )
-    .expect("failed to create the VM store");
+    let api_socket = vm_root.join(".sockets/firecracker.socket");
+    let store = VmStore::new(vm_root, image_root, default_authorized_keys)
+        .expect("failed to create the VM store");
     let manager = Barbirolli::new(store, firecracker)
         .await
         .expect("failed to create Barbirolli");
