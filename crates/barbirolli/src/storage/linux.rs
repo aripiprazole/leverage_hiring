@@ -51,6 +51,14 @@ pub struct VmRootFolderItem {
 }
 
 impl VmStore {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            vm_root = %vm_root.display(),
+            image_root = %image_root.display()
+        ),
+        err
+    )]
     pub fn new(
         vm_root: PathBuf,
         image_root: PathBuf,
@@ -79,6 +87,11 @@ impl VmStore {
         })
     }
 
+    #[tracing::instrument(
+        skip(self, input),
+        fields(user = %input.user),
+        err
+    )]
     pub async fn create(&self, input: VmInput) -> Result<VmSpec, StorageError> {
         let final_dir = self.vm_root.dir.join(input.user.as_ref());
         if final_dir.exists() {
@@ -153,6 +166,11 @@ impl VmStore {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, spec),
+        fields(vm_id = %spec.id, user = %spec.user),
+        err
+    )]
     pub fn delete(&self, spec: &VmSpec) -> Result<()> {
         remove_dir_all(&spec.artifact_dir)
             .map_err(|error| StorageError::io(&spec.artifact_dir, error))

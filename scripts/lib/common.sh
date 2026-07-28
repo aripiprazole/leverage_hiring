@@ -7,7 +7,6 @@ REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 : "${BARBIROLLI_RUNTIME_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/barbirolli}"
 : "${CARGO_TARGET_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/barbirolli-target}"
 : "${ELHONE_ADDR:=127.0.0.1:3000}"
-: "${MEIER_ADDR:=0.0.0.0:2222}"
 : "${RUST_LOG:=info}"
 
 FIRECRACKER_VERSION="v1.13.2"
@@ -35,7 +34,6 @@ export IMAGE_ROOT
 export DEFAULT_AUTHORIZED_KEYS
 export FIRECRACKER
 export ELHONE_ADDR
-export MEIER_ADDR
 export RUST_LOG
 
 info() {

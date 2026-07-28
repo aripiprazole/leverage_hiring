@@ -46,21 +46,11 @@ pub enum ConfigError {
     MissingVariable(&'static str),
     #[error("ELHONE_TOKEN must not be empty")]
     EmptyToken,
-    #[error("ELHONE_ADDR is not a valid socket address: {0}")]
-    InvalidAddress(String),
     #[error("the local feature requires ELHONE_ADDR to be loopback, got {0}")]
     NonLoopbackLocal(SocketAddr),
 }
 
-pub fn address_from_env() -> Result<SocketAddr, ConfigError> {
-    let value = env::var("ELHONE_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
-    parse_address(value)
-}
-
-fn parse_address(value: String) -> Result<SocketAddr, ConfigError> {
-    let address = value
-        .parse::<SocketAddr>()
-        .map_err(|_| ConfigError::InvalidAddress(value))?;
+pub fn validate_address(address: SocketAddr) -> Result<SocketAddr, ConfigError> {
     if cfg!(feature = "local") && !address.ip().is_loopback() {
         return Err(ConfigError::NonLoopbackLocal(address));
     }

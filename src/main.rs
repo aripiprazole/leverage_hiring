@@ -10,12 +10,12 @@ struct Config {
     image_root: PathBuf,
     default_authorized_keys: PathBuf,
     firecracker: PathBuf,
-    #[serde(default = "default_meier_address")]
-    meier_addr: SocketAddr,
+    #[serde(default = "default_elhone_address")]
+    elhone_addr: SocketAddr,
 }
 
-fn default_meier_address() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 2222))
+fn default_elhone_address() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 3000))
 }
 
 #[tokio::main]
@@ -37,24 +37,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let manager = Arc::new(Barbirolli::new(store, config.firecracker).await?);
 
-    let elhone_address = elhone::address_from_env()?;
+    let elhone_address = elhone::validate_address(config.elhone_addr)?;
     let elhone_listener = tokio::net::TcpListener::bind(elhone_address).await?;
     let elhone = axum::serve(
         elhone_listener,
         elhone::router(manager.clone(), elhone::Auth::from_env()?),
     );
 
-    let meier_address = config.meier_addr;
-    let meier = meier::serve(manager.clone(), meier_address);
-
-    tracing::info!(
-        %elhone_address,
-        %meier_address,
-        "SSH and HTTP services started"
-    );
+    tracing::info!(%elhone_address, "HTTP service started");
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
-        result = meier => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
     };
     let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
@@ -87,6 +79,7 @@ mod tests {
                 "FIRECRACKER".to_owned(),
                 "/usr/local/bin/firecracker".to_owned(),
             ),
+            ("ELHONE_ADDR".to_owned(), "127.0.0.1:4000".to_owned()),
         ])
         .expect("configuration should deserialize");
 
@@ -100,6 +93,9 @@ mod tests {
             config.firecracker,
             PathBuf::from("/usr/local/bin/firecracker")
         );
-        assert_eq!(config.meier_addr, "0.0.0.0:2222".parse().unwrap());
+        assert_eq!(
+            config.elhone_addr,
+            "127.0.0.1:4000".parse().expect("valid Elhone address")
+        );
     }
 }

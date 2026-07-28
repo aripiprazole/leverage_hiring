@@ -45,7 +45,7 @@ pub struct BarbirolliInner {
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
-    #[tracing::instrument(skip(firecracker))]
+    #[tracing::instrument(skip_all, err)]
     pub async fn new(
         mut store: VmStore,
         firecracker: impl Into<PathBuf>,
@@ -84,7 +84,10 @@ impl Barbirolli {
         }
         match NEVec::try_from_vec(errors) {
             Some(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
-            None => Ok(barbirolli),
+            None => {
+                tracing::info!(vm_count = barbirolli.vms.len(), "barbirolli ready");
+                Ok(barbirolli)
+            }
         }
     }
 
@@ -106,6 +109,11 @@ impl Barbirolli {
             .ok_or(LifecycleError::NotFound(vm_id))
     }
 
+    #[tracing::instrument(
+        skip(self, input),
+        fields(user = %input.user),
+        err
+    )]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.accepting_operations()?;
         let spec = self.store.create(input).await?;
@@ -138,6 +146,7 @@ impl Barbirolli {
         })
     }
 
+    #[tracing::instrument(skip(self), fields(%vm_id), err)]
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
         let mut vm = self.vm_mut(vm_id)?;
@@ -155,7 +164,9 @@ impl Barbirolli {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(vm_count = self.vms.len()), err)]
     pub async fn shutdown(&self) -> Result<(), LifecycleError> {
+        tracing::info!("draining barbirolli");
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
         for vm in self.vms.iter() {
@@ -168,11 +179,15 @@ impl Barbirolli {
         }
         match NEVec::try_from_vec(errors) {
             Some(errors) => Err(LifecycleError::Shutdown(Validated::Fail(errors))),
-            None => Ok(()),
+            None => {
+                tracing::info!("barbirolli shutdown complete");
+                Ok(())
+            }
         }
     }
 }
 
+#[tracing::instrument(skip(firecracker), err)]
 pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathBuf> {
     let firecracker = firecracker.into();
     let output = tokio::process::Command::new(&firecracker)
@@ -186,6 +201,11 @@ pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathB
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     };
     if output.status.success() && version.starts_with("Firecracker v1.13.") {
+        tracing::debug!(
+            path = %firecracker.display(),
+            %version,
+            "verified Firecracker executable"
+        );
         Ok(firecracker)
     } else {
         Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
@@ -225,9 +245,11 @@ impl BarbirolliVm {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip(self, barbirolli),
+        fields(vm_id = %self.spec().id, user = %self.spec().user)
+    )]
     pub async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
-        tracing::info!("starting barbirolli vm");
         let spec = match self {
             BarbirolliVm::Discovered(spec) => spec.clone(),
             BarbirolliVm::Failed(spec) => {
@@ -277,9 +299,11 @@ impl BarbirolliVm {
         }
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip(self, barbirolli),
+        fields(vm_id = %self.spec().id, user = %self.spec().user)
+    )]
     pub async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
-        tracing::info!("shutting downs barbirolli vm");
         match self {
             Self::Discovered(_) => Ok(()),
             Self::Failed(spec) => {

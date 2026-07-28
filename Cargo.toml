@@ -15,7 +15,7 @@ edition.workspace = true
 
 [features]
 default = []
-local = ["elhone/local", "meier/local"]
+local = ["elhone/local"]
 linux = ["barbirolli/linux", "elhone/linux"]
 
 [workspace.dependencies]
@@ -28,8 +28,6 @@ nonempty-collections = "1.4.0"
 fctools = { version = "=0.6.0", default-features = false }
 http-body-util = "0.1.3"
 nlink = "0.25.0"
-rand = "0.10.2"
-russh = "0.62.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.151"
 ssh-key = "0.7.0-rc.11"
@@ -47,7 +45,6 @@ axum.workspace = true
 barbirolli = { workspace = true, default-features = false }
 elhone = { path = "crates/elhone", default-features = false }
 envy.workspace = true
-meier = { path = "crates/meier" }
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -23,7 +23,9 @@ pub struct ManagedNetwork {
 
 impl ManagedNetwork {
     pub async fn cleanup(&self) -> Result<()> {
-        self.spec.cleanup(&self.table).await
+        self.spec.cleanup(&self.table).await?;
+        tracing::info!("VM network cleaned up");
+        Ok(())
     }
 }
 
@@ -55,7 +57,9 @@ impl NetworkSpec {
         self.install_rules(nftables_conn, host, table).await
     }
 
+    #[tracing::instrument]
     pub async fn prepare(&self) -> Result<ManagedNetwork> {
+        tracing::info!("preparing network");
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -94,10 +98,13 @@ impl NetworkSpec {
             .create_persistent()?;
 
         match self.setup(&route_conn, &nftables_conn, &host, &table).await {
-            Ok(()) => Ok(ManagedNetwork {
-                spec: self.clone(),
-                table,
-            }),
+            Ok(()) => {
+                tracing::info!(host_interface = %host, "VM network prepared");
+                Ok(ManagedNetwork {
+                    spec: self.clone(),
+                    table,
+                })
+            }
             Err(err) => {
                 match self
                     .cleanup_with_connections(&route_conn, &nftables_conn, &table)
@@ -113,6 +120,7 @@ impl NetworkSpec {
         }
     }
 
+    #[tracing::instrument(skip(route, nftables))]
     async fn cleanup_with_connections(
         &self,
         route: &Connection<Route>,

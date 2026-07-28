@@ -5,15 +5,9 @@
 ## `local` feature
 
 - Cargo feature, disabled by default and intended only for development.
-- Allows everyone to SSH on every VM by bypassing Meier's authorized-key check.
 - Allows everyone to create/start/stop/delete/list VMs through Elhone.
 - Elhone must bind to a loopback address while `local` is enabled.
 - Without `local`, unauthenticated Elhone requests return `403 Forbidden`.
-
-# Module: Meier
-
-- `russh`
-- SSH forwarding to `Arc<Barbirolli>` vms
 
 # Module: Elhone
 

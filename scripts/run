@@ -39,7 +39,7 @@ info "building the service"
     cargo build --features linux,local
 )
 
-info "starting HTTP at $ELHONE_ADDR and SSH forwarding at $MEIER_ADDR"
+info "starting HTTP at $ELHONE_ADDR"
 exec sudo \
-    --preserve-env=VM_ROOT,IMAGE_ROOT,DEFAULT_AUTHORIZED_KEYS,FIRECRACKER,ELHONE_ADDR,MEIER_ADDR,RUST_LOG \
+    --preserve-env=VM_ROOT,IMAGE_ROOT,DEFAULT_AUTHORIZED_KEYS,FIRECRACKER,ELHONE_ADDR,RUST_LOG \
     "$CARGO_TARGET_DIR/debug/ssh"
