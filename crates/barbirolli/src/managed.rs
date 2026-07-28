@@ -232,6 +232,9 @@ impl ManagedVm {
     }
 
     pub async fn shutdown(&mut self, shutdown_timeout: Duration) -> Result<(), LifecycleError> {
+        if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+            return Ok(());
+        }
         self.vm
             .shutdown([
                 VmShutdownAction {

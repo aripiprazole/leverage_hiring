@@ -442,6 +442,26 @@ pub struct VmSummary {
     pub status: VmStatus,
 }
 
+pub struct BarbirolliVm;
+
+impl BarbirolliVm {
+    pub fn spec(&self) -> &VmSpec {
+        unreachable!("Barbirolli VMs require the linux feature")
+    }
+
+    pub fn summary(&self) -> VmSummary {
+        unreachable!("Barbirolli VMs require the linux feature")
+    }
+
+    pub async fn start(&mut self, _barbirolli: &Barbirolli) -> Result<()> {
+        Err(LifecycleError::UnsupportedPlatform)
+    }
+
+    pub async fn shutdown(&mut self, _barbirolli: &Barbirolli) -> Result<()> {
+        Err(LifecycleError::UnsupportedPlatform)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Barbirolli;
 
@@ -461,11 +481,7 @@ impl Barbirolli {
         Vec::new()
     }
 
-    pub async fn status(&self, _vm_id: VmId) -> Result<VmSummary, LifecycleError> {
-        Err(LifecycleError::UnsupportedPlatform)
-    }
-
-    pub async fn spec(&self, _vm_id: VmId) -> Result<VmSpec, LifecycleError> {
+    pub fn vm(&self, _vm_id: VmId) -> Result<BarbirolliVm, LifecycleError> {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
@@ -475,14 +491,6 @@ impl Barbirolli {
 
     pub async fn ssh_address(&self, _user: &str) -> Option<Ipv4Addr> {
         None
-    }
-
-    pub async fn start(&self, _vm_id: VmId) -> Result<(), LifecycleError> {
-        Err(LifecycleError::UnsupportedPlatform)
-    }
-
-    pub async fn shutdown(&self, _vm_id: VmId) -> Result<(), LifecycleError> {
-        Err(LifecycleError::UnsupportedPlatform)
     }
 
     pub async fn delete(&self, _vm_id: VmId) -> Result<(), LifecycleError> {

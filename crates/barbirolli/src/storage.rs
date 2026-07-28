@@ -88,6 +88,7 @@ impl VmStore {
 
         let source_kernel = self.resolve_artifact(&input.kernel)?;
         let source_rootfs = self.resolve_artifact(&input.rootfs)?;
+        let id = self.vm_root.next_id()?;
 
         let tmp = tempfile::Builder::new()
             .prefix(".creating-")
@@ -101,7 +102,6 @@ impl VmStore {
         copy(&source_rootfs, &rootfs).map_err(|error| StorageError::io(&rootfs, error))?;
         self.write_authorized_keys(tmp.path(), &input.authorized_keys)?;
 
-        let id = self.vm_root.next_id()?;
         let persisted = PersistedVmSpec::new(VmSpec {
             id,
             user: input.user,

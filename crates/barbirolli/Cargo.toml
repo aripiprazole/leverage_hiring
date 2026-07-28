@@ -31,3 +31,7 @@ tracing = { workspace = true, optional = true }
 barbirolli_derive.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+[[test]]
+name = "behavior"
+required-features = ["linux"]

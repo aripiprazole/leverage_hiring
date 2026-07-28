@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use barbirolli::{
     ArtifactName, Barbirolli, MemoryMib, UserName, VcpuCount, VmInput, VmStatus, VmStore,
@@ -7,6 +7,7 @@ use barbirolli_derive::firecracker_test;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
+    sync::Barrier,
 };
 
 #[firecracker_test]
@@ -47,14 +48,26 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         })
         .await
         .expect("failed to create the first VM");
+    let start_barrier = Arc::new(Barrier::new(3));
     let first_start = {
         let manager = manager.clone();
-        tokio::spawn(async move { manager.start(first).await })
+        let start_barrier = start_barrier.clone();
+        tokio::spawn(async move {
+            start_barrier.wait().await;
+            let mut vm = manager.vm(first)?;
+            vm.start(&manager).await
+        })
     };
     let duplicate_start = {
         let manager = manager.clone();
-        tokio::spawn(async move { manager.start(first).await })
+        let start_barrier = start_barrier.clone();
+        tokio::spawn(async move {
+            start_barrier.wait().await;
+            let mut vm = manager.vm(first)?;
+            vm.start(&manager).await
+        })
     };
+    start_barrier.wait().await;
     first_start
         .await
         .expect("the first start task panicked")
@@ -65,9 +78,9 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("the duplicate start failed");
     assert_eq!(
         manager
-            .status(first)
-            .await
+            .vm(first)
             .expect("missing first VM")
+            .summary()
             .status,
         VmStatus::Running
     );
@@ -89,14 +102,26 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
     assert!(response.contains("\"vcpu_count\":1"));
     assert!(response.contains("\"mem_size_mib\":128"));
 
+    let shutdown_barrier = Arc::new(Barrier::new(3));
     let first_shutdown = {
         let manager = manager.clone();
-        tokio::spawn(async move { manager.shutdown(first).await })
+        let shutdown_barrier = shutdown_barrier.clone();
+        tokio::spawn(async move {
+            shutdown_barrier.wait().await;
+            let mut vm = manager.vm(first)?;
+            vm.shutdown(&manager).await
+        })
     };
     let duplicate_shutdown = {
         let manager = manager.clone();
-        tokio::spawn(async move { manager.shutdown(first).await })
+        let shutdown_barrier = shutdown_barrier.clone();
+        tokio::spawn(async move {
+            shutdown_barrier.wait().await;
+            let mut vm = manager.vm(first)?;
+            vm.shutdown(&manager).await
+        })
     };
+    shutdown_barrier.wait().await;
     first_shutdown
         .await
         .expect("the first shutdown task panicked")
@@ -107,9 +132,9 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("the duplicate shutdown failed");
     assert_eq!(
         manager
-            .status(first)
-            .await
+            .vm(first)
             .expect("missing first VM")
+            .summary()
             .status,
         VmStatus::Discovered
     );
@@ -119,8 +144,8 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
             user: "global-socket-second"
                 .parse::<UserName>()
                 .expect("valid user"),
-            vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
-            memory_mib: MemoryMib::try_from(128).expect("valid memory"),
+            vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
+            memory_mib: MemoryMib::try_from(192).expect("valid memory"),
             kernel: "vmlinux"
                 .parse::<ArtifactName>()
                 .expect("valid kernel name"),
@@ -131,10 +156,12 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         })
         .await
         .expect("failed to create the second VM");
-    manager
-        .start(second)
-        .await
-        .expect("failed to start the second VM");
+    {
+        let mut vm = manager.vm(second).expect("missing second VM");
+        vm.start(&manager)
+            .await
+            .expect("failed to start the second VM");
+    }
 
     let mut socket = UnixStream::connect(&api_socket)
         .await
@@ -150,13 +177,15 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("failed to read the second Firecracker response");
     let response = String::from_utf8(response).expect("Firecracker returned non-UTF-8 HTTP");
     assert!(response.starts_with("HTTP/1.1 200"));
-    assert!(response.contains("\"vcpu_count\":1"));
-    assert!(response.contains("\"mem_size_mib\":128"));
+    assert!(response.contains("\"vcpu_count\":2"));
+    assert!(response.contains("\"mem_size_mib\":192"));
 
-    manager
-        .shutdown(second)
-        .await
-        .expect("failed to shut down the second VM");
+    {
+        let mut vm = manager.vm(second).expect("missing second VM");
+        vm.shutdown(&manager)
+            .await
+            .expect("failed to shut down the second VM");
+    }
     manager
         .delete(first)
         .await

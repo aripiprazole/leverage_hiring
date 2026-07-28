@@ -35,7 +35,7 @@ pub struct VmSummary {
 }
 
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum BarbirolliVm {
+pub enum BarbirolliVm {
     Discovered(VmSpec),
     Failed(VmSpec),
     Managed(ManagedVm),
@@ -105,7 +105,7 @@ impl Barbirolli {
         }
     }
 
-    fn vm(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
+    pub fn vm(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
         self.vms
             .get_mut(&vm_id)
             .ok_or(LifecycleError::NotFound(vm_id))
@@ -122,25 +122,8 @@ impl Barbirolli {
     pub async fn list(&self) -> Vec<VmSummary> {
         self.vms
             .iter()
-            .map(|entry| VmSummary {
-                id: *entry.key(),
-                user: entry.value().spec().user.clone(),
-                status: entry.value().status(),
-            })
+            .map(|entry| entry.value().summary())
             .collect()
-    }
-
-    pub async fn status(&self, vm_id: VmId) -> Result<VmSummary, LifecycleError> {
-        let vm = self.vm(vm_id)?;
-        Ok(VmSummary {
-            id: vm_id,
-            user: vm.spec().user.clone(),
-            status: vm.status(),
-        })
-    }
-
-    pub async fn spec(&self, vm_id: VmId) -> Result<VmSpec, LifecycleError> {
-        Ok(self.vm(vm_id)?.spec().clone())
     }
 
     pub async fn authorized_keys_path(&self, user: &str) -> Option<PathBuf> {
@@ -160,65 +143,12 @@ impl Barbirolli {
         })
     }
 
-    pub async fn start(&self, vm_id: VmId) -> Result<(), LifecycleError> {
-        self.accepting_operations()?;
-        let mut vm = self.vm(vm_id)?;
-        let spec = match &*vm {
-            BarbirolliVm::Discovered(spec) | BarbirolliVm::Failed(spec) => spec.clone(),
-            BarbirolliVm::Managed(managed) if managed.failed => {
-                return Err(LifecycleError::InvalidTransition {
-                    vm_id,
-                    operation: "start",
-                    status: VmStatus::Failed,
-                });
-            }
-            BarbirolliVm::Managed(_) => return Ok(()),
-        };
-        tracing::info!(
-            vm_id = %spec.id,
-            user = %spec.user,
-            operation = "start",
-            status = "starting",
-            "VM state transition"
-        );
-        let managed = match ManagedVm::start(spec.clone(), self).await {
-            Ok(managed) => managed,
-            Err(error) => {
-                tracing::error!(
-                    vm_id = %spec.id,
-                    user = %spec.user,
-                    operation = "start",
-                    status = "failed",
-                    %error,
-                    "VM startup failed"
-                );
-                *vm = BarbirolliVm::Failed(spec);
-                return Err(error.into());
-            }
-        };
-        tracing::info!(
-            vm_id = %spec.id,
-            user = %spec.user,
-            operation = "start",
-            status = "running",
-            "VM state transition"
-        );
-        *vm = BarbirolliVm::Managed(managed);
-        Ok(())
-    }
-
-    pub async fn shutdown(&self, vm_id: VmId) -> Result<(), LifecycleError> {
-        self.accepting_operations()?;
-        self.vm(vm_id)?.shutdown(self).await
-    }
-
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
         let mut vm = self.vm(vm_id)?;
-        vm.shutdown(self).await?;
         let spec = vm.spec().clone();
+        vm.shutdown(self).await?;
         self.store.delete(&spec)?;
-        drop(vm);
         self.vms.remove(&vm_id);
         tracing::info!(
             vm_id = %spec.id,
@@ -275,23 +205,89 @@ pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathB
 }
 
 impl BarbirolliVm {
-    fn spec(&self) -> &VmSpec {
+    pub fn spec(&self) -> &VmSpec {
         match self {
             Self::Discovered(spec) | Self::Failed(spec) => spec,
             Self::Managed(vm) => &vm.spec,
         }
     }
 
-    fn status(&self) -> VmStatus {
+    pub fn summary(&self) -> VmSummary {
         match self {
-            Self::Discovered(_) => VmStatus::Discovered,
-            Self::Failed(_) => VmStatus::Failed,
-            Self::Managed(vm) if vm.failed => VmStatus::Failed,
-            Self::Managed(_) => VmStatus::Running,
+            Self::Discovered(spec) => VmSummary {
+                id: spec.id,
+                user: spec.user.clone(),
+                status: VmStatus::Discovered,
+            },
+            Self::Failed(spec) => VmSummary {
+                id: spec.id,
+                user: spec.user.clone(),
+                status: VmStatus::Failed,
+            },
+            Self::Managed(vm) if vm.failed => VmSummary {
+                id: vm.spec.id,
+                user: vm.spec.user.clone(),
+                status: VmStatus::Failed,
+            },
+            Self::Managed(vm) => VmSummary {
+                id: vm.spec.id,
+                user: vm.spec.user.clone(),
+                status: VmStatus::Running,
+            },
         }
     }
 
-    async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+    pub async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+        let spec = match self {
+            BarbirolliVm::Discovered(spec) => spec.clone(),
+            BarbirolliVm::Failed(spec) => {
+                spec.reconcile(barbirolli).await?;
+                spec.clone()
+            }
+            BarbirolliVm::Managed(managed) if managed.failed => {
+                return Err(LifecycleError::InvalidTransition {
+                    vm_id: managed.spec.id,
+                    operation: "start",
+                    status: VmStatus::Failed,
+                });
+            }
+            BarbirolliVm::Managed(_) => return Ok(()),
+        };
+        tracing::info!(
+            vm_id = %spec.id,
+            user = %spec.user,
+            operation = "start",
+            status = "starting",
+            "VM state transition"
+        );
+        match ManagedVm::start(spec.clone(), barbirolli).await {
+            Ok(managed) => {
+                tracing::info!(
+                    vm_id = %spec.id,
+                    user = %spec.user,
+                    operation = "start",
+                    status = "running",
+                    "VM state transition"
+                );
+                *self = BarbirolliVm::Managed(managed);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    vm_id = %spec.id,
+                    user = %spec.user,
+                    operation = "start",
+                    status = "failed",
+                    %error,
+                    "VM startup failed"
+                );
+                *self = BarbirolliVm::Failed(spec);
+                Err(error.into())
+            }
+        }
+    }
+
+    pub async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
         match self {
             Self::Discovered(_) => Ok(()),
             Self::Failed(spec) => {
