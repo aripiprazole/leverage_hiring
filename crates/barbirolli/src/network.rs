@@ -215,7 +215,7 @@ impl NetworkSpec {
         }
     }
 
-    async fn cleanup_stale(&self) -> Result<(), NetworkError> {
+    pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
         self.cleanup(&format!("fc_vm_{}", spec.vm_id)).await
     }
 

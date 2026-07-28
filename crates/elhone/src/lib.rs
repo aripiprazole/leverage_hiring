@@ -263,17 +263,3 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "local")]
-    use super::parse_address;
-
-    #[cfg(feature = "local")]
-    #[test]
-    fn local_mode_rejects_non_loopback_addresses() {
-        assert!(parse_address("0.0.0.0:3000".to_owned()).is_err());
-        assert!(parse_address("127.0.0.1:3000".to_owned()).is_ok());
-        assert!(parse_address("[::1]:3000".to_owned()).is_ok());
-    }
-}

@@ -79,18 +79,6 @@ impl Barbirolli {
         });
         let specs = specs.collect::<Result<Vec<VmSpec>>>()?;
         let mut failures = Vec::new();
-        for spec in &specs {
-            if let Err(error) = crate::managed::reconcile(spec, &firecracker).await {
-                tracing::error!(
-                    vm_id = %spec.id,
-                    user = %spec.user,
-                    operation = "warmup_reconciliation",
-                    %error,
-                    "VM warmup reconciliation failed"
-                );
-                failures.push(format!("VM {} ({}): {error}", spec.id, spec.user));
-            }
-        }
         if !failures.is_empty() {
             return Err(LifecycleError::Warmup(failures));
         }
@@ -222,58 +210,6 @@ impl Barbirolli {
     pub async fn shutdown(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         let vm = self.vm(vm_id)?;
         let mut vm = vm.lock().await;
-        self.shutdown_locked(&mut vm).await
-    }
-
-    async fn shutdown_locked(&self, vm: &mut BarbirolliVm) -> Result<(), LifecycleError> {
-        if let BarbirolliVm::Failed(spec) = &*vm {
-            let spec = spec.clone();
-            crate::managed::reconcile(&spec, &self.firecracker).await?;
-            *vm = BarbirolliVm::Discovered(spec);
-            return Ok(());
-        }
-        let BarbirolliVm::Managed(managed) = &mut *vm else {
-            return Ok(());
-        };
-        let spec = managed.spec.clone();
-        tracing::info!(
-            vm_id = %spec.id,
-            user = %spec.user,
-            operation = "shutdown",
-            status = "shutting_down",
-            "VM state transition"
-        );
-        let shutdown = managed.shutdown().await;
-        let cleanup = managed.cleanup().await;
-        match (shutdown, cleanup) {
-            (Ok(()), Ok(())) => {
-                tracing::info!(
-                    vm_id = %spec.id,
-                    user = %spec.user,
-                    operation = "shutdown",
-                    status = "discovered",
-                    "VM state transition"
-                );
-                *vm = BarbirolliVm::Discovered(spec);
-                Ok(())
-            }
-            (shutdown, cleanup) => {
-                managed.mark_failed();
-                let error = crate::managed::LifecycleError::ShutdownCleanup {
-                    shutdown: shutdown.err().map(Box::new),
-                    cleanup: cleanup.err().map(Box::new),
-                };
-                tracing::error!(
-                    vm_id = %spec.id,
-                    user = %spec.user,
-                    operation = "shutdown",
-                    status = "failed",
-                    %error,
-                    "VM shutdown failed"
-                );
-                Err(error.into())
-            }
-        }
     }
 
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
@@ -308,6 +244,56 @@ impl Barbirolli {
             Ok(())
         } else {
             Err(LifecycleError::Shutdown(failures))
+        }
+    }
+}
+
+impl BarbirolliVm {
+    async fn shutdown(&self, barbirolli: &Barbirolli) -> Result<()> {
+        match self {
+            BarbirolliVm::Discovered(vm_spec) => Ok(()),
+            BarbirolliVm::Failed(spec) => {
+                spec.reconcile(&spec, &self.firecracker).await?;
+                *self = BarbirolliVm::Discovered(spec.clone());
+                Ok(())
+            }
+            BarbirolliVm::Managed(managed) => {
+                tracing::info!(
+                    vm_id = %managed.spec.id,
+                    user = %managed.spec.user,
+                    operation = "shutdown",
+                    status = "shutting_down",
+                    "VM state transition"
+                );
+                match (managed.shutdown().await, managed.cleanup().await) {
+                    (Ok(()), Ok(())) => {
+                        tracing::info!(
+                            vm_id = %managed.spec.id,
+                            user = %managed.spec.user,
+                            operation = "shutdown",
+                            status = "discovered",
+                            "VM state transition"
+                        );
+                        *self = BarbirolliVm::Discovered(managed.spec);
+                        Ok(())
+                    }
+                    (shutdown, cleanup) => {
+                        managed.failed = true;
+                        tracing::error!(
+                            vm_id = %managed.spec.id,
+                            user = %managed.spec.user,
+                            operation = "shutdown",
+                            status = "failed",
+                            "VM shutdown failed"
+                        );
+                        Err(crate::managed::LifecycleError::ShutdownCleanup {
+                            shutdown: shutdown.err().map(Box::new),
+                            cleanup: cleanup.err().map(Box::new),
+                        }
+                        .into())
+                    }
+                }
+            }
         }
     }
 }

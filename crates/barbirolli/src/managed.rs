@@ -30,40 +30,11 @@ use crate::{
 type FirecrackerResourceSystem = ResourceSystem<DirectProcessSpawner, TokioRuntime>;
 type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
 
-#[derive(Debug, thiserror::Error)]
-pub enum LifecycleError {
-    #[error(transparent)]
-    Network(#[from] NetworkError),
-    #[error(transparent)]
-    ResourceSystem(#[from] ResourceSystemError),
-    #[error(transparent)]
-    VmmId(#[from] VmmIdError),
-    #[error(transparent)]
-    Vm(#[from] FctoolsVmError),
-    #[error(transparent)]
-    Shutdown(#[from] VmShutdownError),
-    #[error(
-        "startup failed: {startup_error}; rollback: {vm_rollback_error:?}; network rollback: {network_rollback_error:?}"
-    )]
-    StartupRollback {
-        startup_error: Box<LifecycleError>,
-        vm_rollback_error: Option<Box<LifecycleError>>,
-        network_rollback_error: Option<Box<NetworkError>>,
-    },
-    #[error("VM cleanup failed (VM: {vm:?}, network: {network:?})")]
-    Cleanup {
-        vm: Option<Box<LifecycleError>>,
-        network: Option<Box<NetworkError>>,
-    },
-    #[error("VM shutdown/cleanup failed (shutdown: {shutdown:?}, cleanup: {cleanup:?})")]
-    ShutdownCleanup {
-        shutdown: Option<Box<LifecycleError>>,
-        cleanup: Option<Box<LifecycleError>>,
-    },
-    #[error("warmup reconciliation failed: {0:?}")]
-    Reconcile(Vec<String>),
-    #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
-    UnsupportedFirecracker(String),
+pub struct ManagedVm {
+    pub spec: VmSpec,
+    pub vm: FirecrackerVm,
+    pub network: Option<ManagedNetwork>,
+    pub failed: bool,
 }
 
 impl VmSpec {
@@ -74,35 +45,19 @@ impl VmSpec {
             VmmOwnershipModel::Shared,
             2,
         );
-        let configuration = vm_configuration(&mut resources, spec)?;
-        let arguments =
-            VmmArguments::new(VmmApiSocket::Enabled(spec.network.api_socket().to_owned()));
+        let configuration = vm_configuration(&mut resources, self.spec)?;
+        let arguments = VmmArguments::new(VmmApiSocket::Enabled(
+            self.spec.network.api_socket().to_owned(),
+        ));
         let executor = UnrestrictedVmmExecutor::new(arguments)
-            .id(VmmId::new(format!("barbirolli-{}", spec.vm_id))?);
-        let installation =
-            VmmInstallation::new(firecracker.clone(), firecracker.clone(), firecracker);
+            .id(VmmId::new(format!("barbirolli-{}", self.spec.vm_id))?);
+        let installation = VmmInstallation::new(
+            barbirolli.firecracker.clone(),
+            barbirolli.firecracker.clone(),
+            barbirolli.firecracker,
+        );
 
         Ok(FirecrackerVm::prepare(executor, resources, installation, configuration).await?)
-    }
-
-    async fn reconcile(&self, barbirolli: Barbirolli) -> Result<(), LifecycleError> {
-        let mut failures = Vec::new();
-        if let Err(error) = kill_stale_processes(spec, firecracker).await {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = crate::network::cleanup_stale(&spec.network).await {
-            failures.push(error.to_string());
-        }
-        match tokio::fs::remove_file(spec.network.api_socket()).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(error.to_string()),
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(LifecycleError::Reconcile(failures))
-        }
     }
 }
 
@@ -183,19 +138,12 @@ async fn rollback_vm(
     Ok(())
 }
 
-pub struct ManagedVm {
-    pub spec: VmSpec,
-    pub vm: FirecrackerVm,
-    pub network: Option<ManagedNetwork>,
-    pub failed: bool,
-}
-
 impl ManagedVm {
     pub async fn start(spec: VmSpec, barbirolli: Barbirolli) -> Result<Self, LifecycleError> {
         let network = spec.network.prepare().await?;
         let mut vm = map_prepare_vm(spec.prepare_vm(barbirolli).await).await?;
 
-        match vm.start(self.api_socket_timeout).await {
+        match vm.start(spec.api_socket_timeout).await {
             Ok(()) => Ok(Self {
                 spec,
                 vm,
@@ -203,7 +151,7 @@ impl ManagedVm {
                 failed: false,
             }),
             Err(err) => Err(LifecycleError::StartupRollback {
-                startup_error: Box::new(startup.into()),
+                startup_error: Box::new(err.into()),
                 vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
                     .await
                     .err()
@@ -261,7 +209,30 @@ impl ManagedVm {
         }
     }
 
-    pub async fn kill_stale_processes(&self, barbirolli: Barbirolli) -> Result<(), std::io::Error> {
+    pub async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<(), LifecycleError> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.kill_stale_processes(barbirolli).await {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = self.spec.network.cleanup_stale().await {
+            failures.push(error.to_string());
+        }
+        match std::fs::remove_file(barbirolli.api_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(error.to_string()),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(LifecycleError::Reconcile(failures))
+        }
+    }
+
+    pub async fn kill_stale_processes(
+        &self,
+        barbirolli: &Barbirolli,
+    ) -> Result<(), std::io::Error> {
         let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
         let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
         let mut proc = tokio::fs::read_dir("/proc").await?;
@@ -314,4 +285,40 @@ async fn map_prepare_vm(vm: Result<FirecrackerVm>) -> Result<FirecrackerVm> {
             });
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LifecycleError {
+    #[error(transparent)]
+    Network(#[from] NetworkError),
+    #[error(transparent)]
+    ResourceSystem(#[from] ResourceSystemError),
+    #[error(transparent)]
+    VmmId(#[from] VmmIdError),
+    #[error(transparent)]
+    Vm(#[from] FctoolsVmError),
+    #[error(transparent)]
+    Shutdown(#[from] VmShutdownError),
+    #[error(
+        "startup failed: {startup_error}; rollback: {vm_rollback_error:?}; network rollback: {network_rollback_error:?}"
+    )]
+    StartupRollback {
+        startup_error: Box<LifecycleError>,
+        vm_rollback_error: Option<Box<LifecycleError>>,
+        network_rollback_error: Option<Box<NetworkError>>,
+    },
+    #[error("VM cleanup failed (VM: {vm:?}, network: {network:?})")]
+    Cleanup {
+        vm: Option<Box<LifecycleError>>,
+        network: Option<Box<NetworkError>>,
+    },
+    #[error("VM shutdown/cleanup failed (shutdown: {shutdown:?}, cleanup: {cleanup:?})")]
+    ShutdownCleanup {
+        shutdown: Option<Box<LifecycleError>>,
+        cleanup: Option<Box<LifecycleError>>,
+    },
+    #[error("warmup reconciliation failed: {0:?}")]
+    Reconcile(Vec<String>),
+    #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
+    UnsupportedFirecracker(String),
 }

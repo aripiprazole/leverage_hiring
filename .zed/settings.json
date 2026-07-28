@@ -1,0 +1,12 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "features": ["linux"],
+          "target": "aarch64-unknown-linux-gnu"
+        }
+      }
+    }
+  }
+}
