@@ -1,0 +1,10 @@
+no_default_features = true
+test_workspace = true
+
+examine_re = [
+  "is_safe_name",
+  "is_authorized_key",
+  "VmStore::",
+  "NetworkSpec::",
+  "Barbirolli::(create|list|status|spec|authorized_keys_path|ssh_address|delete|shutdown_all)",
+]
