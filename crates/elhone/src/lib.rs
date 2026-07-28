@@ -229,7 +229,10 @@ impl From<LifecycleError> for ApiError {
                 StatusCode::CONFLICT
             }
             LifecycleError::Storage(
-                StorageError::Io { .. } | StorageError::InvalidConfig { .. },
+                StorageError::SocketDirectory
+                | StorageError::CreatingDirectory
+                | StorageError::Io { .. }
+                | StorageError::InvalidConfig { .. },
             )
             | LifecycleError::Shutdown(_)
             | LifecycleError::Warmup(_) => StatusCode::INTERNAL_SERVER_ERROR,

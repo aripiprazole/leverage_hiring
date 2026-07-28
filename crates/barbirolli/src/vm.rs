@@ -23,7 +23,7 @@ pub struct VmInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmSpec {
-    pub vm_id: VmId,
+    pub id: VmId,
     pub user: UserName,
     pub artifact_dir: PathBuf,
     pub kernel: PathBuf,

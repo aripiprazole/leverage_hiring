@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "linux")]
 use crate::managed::{LifecycleError, ManagedVm};
-use crate::{StorageError, UserName, VmId, VmInput, VmSpec, VmStore};
+use crate::{StorageError, UserName, VmId, VmInput, VmSpec, VmStore, storage::VmRootFolder};
 
 pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 
@@ -71,34 +71,33 @@ impl Barbirolli {
         store: VmStore,
         firecracker: impl Into<PathBuf>,
     ) -> Result<Self, LifecycleError> {
-        let firecracker = firecracker.into();
-        let specs = store.discover().await?;
-        crate::managed::verify_firecracker(&firecracker).await?;
+        let firecracker = verify_firecracker(&firecracker).await?;
+        let specs = store.vm_root.map(|item| {
+            let item = item?;
+
+            Ok(item.persisted_spec.spec)
+        });
+        let specs = specs.collect::<Result<Vec<VmSpec>>>()?;
         let mut failures = Vec::new();
         for spec in &specs {
             if let Err(error) = crate::managed::reconcile(spec, &firecracker).await {
                 tracing::error!(
-                    vm_id = %spec.vm_id,
+                    vm_id = %spec.id,
                     user = %spec.user,
                     operation = "warmup_reconciliation",
                     %error,
                     "VM warmup reconciliation failed"
                 );
-                failures.push(format!("VM {} ({}): {error}", spec.vm_id, spec.user));
+                failures.push(format!("VM {} ({}): {error}", spec.id, spec.user));
             }
         }
         if !failures.is_empty() {
             return Err(LifecycleError::Warmup(failures));
         }
-        let vms = specs
-            .into_iter()
-            .map(|spec| {
-                (
-                    spec.vm_id,
-                    Arc::new(Mutex::new(BarbirolliVm::Discovered(spec))),
-                )
-            })
-            .collect();
+        let mut vms = dashmap::DashMap::default();
+        for vm in specs.into_iter() {
+            vms.insert(vm.id, Arc::new(Mutex::new(BarbirolliVm::Discovered(vm))));
+        }
 
         Ok(Self(Arc::new(BarbirolliInner {
             vms,
@@ -119,7 +118,7 @@ impl Barbirolli {
 
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         let spec = self.store.create(input).await?;
-        let id = spec.vm_id;
+        let id = spec.id;
         self.vms
             .insert(id, Arc::new(Mutex::new(BarbirolliVm::Discovered(spec))));
         Ok(id)
@@ -188,7 +187,7 @@ impl Barbirolli {
             BarbirolliVm::Managed(_) => return Ok(()),
         };
         tracing::info!(
-            vm_id = %spec.vm_id,
+            vm_id = %spec.id,
             user = %spec.user,
             operation = "start",
             status = "starting",
@@ -198,7 +197,7 @@ impl Barbirolli {
             Ok(managed) => managed,
             Err(error) => {
                 tracing::error!(
-                    vm_id = %spec.vm_id,
+                    vm_id = %spec.id,
                     user = %spec.user,
                     operation = "start",
                     status = "failed",
@@ -210,7 +209,7 @@ impl Barbirolli {
             }
         };
         tracing::info!(
-            vm_id = %spec.vm_id,
+            vm_id = %spec.id,
             user = %spec.user,
             operation = "start",
             status = "running",
@@ -238,7 +237,7 @@ impl Barbirolli {
         };
         let spec = managed.spec.clone();
         tracing::info!(
-            vm_id = %spec.vm_id,
+            vm_id = %spec.id,
             user = %spec.user,
             operation = "shutdown",
             status = "shutting_down",
@@ -249,7 +248,7 @@ impl Barbirolli {
         match (shutdown, cleanup) {
             (Ok(()), Ok(())) => {
                 tracing::info!(
-                    vm_id = %spec.vm_id,
+                    vm_id = %spec.id,
                     user = %spec.user,
                     operation = "shutdown",
                     status = "discovered",
@@ -265,7 +264,7 @@ impl Barbirolli {
                     cleanup: cleanup.err().map(Box::new),
                 };
                 tracing::error!(
-                    vm_id = %spec.vm_id,
+                    vm_id = %spec.id,
                     user = %spec.user,
                     operation = "shutdown",
                     status = "failed",
@@ -282,7 +281,7 @@ impl Barbirolli {
         let vm = self.vm(vm_id)?;
         let mut vm = vm.lock().await;
         self.shutdown_locked(&mut vm).await?;
-        self.store.delete(vm.spec()).await?;
+        self.store.delete(vm.spec())?;
         let spec = vm.spec().clone();
         drop(vm);
         self.vms.remove(&vm_id);
@@ -310,6 +309,25 @@ impl Barbirolli {
         } else {
             Err(LifecycleError::Shutdown(failures))
         }
+    }
+}
+
+pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathBuf> {
+    let firecracker = firecracker.into();
+    let output = tokio::process::Command::new(&firecracker)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|error| LifecycleError::UnsupportedFirecracker(error.to_string()))?;
+    let version = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).trim().to_owned()
+    } else {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    if output.status.success() && version.starts_with("Firecracker v1.13.") {
+        Ok(firecracker)
+    } else {
+        Err(LifecycleError::UnsupportedFirecracker(version))
     }
 }
 

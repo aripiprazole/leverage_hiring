@@ -106,24 +106,6 @@ impl VmSpec {
     }
 }
 
-pub async fn verify_firecracker(firecracker: &std::path::Path) -> Result<(), LifecycleError> {
-    let output = tokio::process::Command::new(firecracker)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|error| LifecycleError::UnsupportedFirecracker(error.to_string()))?;
-    let version = if output.stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).trim().to_owned()
-    } else {
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-    if output.status.success() && version.starts_with("Firecracker v1.13.") {
-        Ok(())
-    } else {
-        Err(LifecycleError::UnsupportedFirecracker(version))
-    }
-}
-
 fn vm_configuration(
     resources: &mut FirecrackerResourceSystem,
     spec: &VmSpec,

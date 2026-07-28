@@ -36,7 +36,7 @@ async fn manager(store: VmStore) -> Barbirolli {
     let firecracker = {
         use std::os::unix::fs::PermissionsExt;
 
-        let firecracker = store.vm_root().parent().unwrap().join("firecracker");
+        let firecracker = store.vm_root.parent().unwrap().join("firecracker");
         fs::write(&firecracker, "#!/bin/sh\necho 'Firecracker v1.13.0'\n").unwrap();
         fs::set_permissions(&firecracker, fs::Permissions::from_mode(0o755)).unwrap();
         firecracker
