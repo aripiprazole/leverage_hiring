@@ -15,6 +15,7 @@ use dashmap::{
     DashMap,
     mapref::one::{Ref, RefMut},
 };
+use nonempty_collections::NEVec;
 use validated::Validated::{self, Fail, Good};
 
 use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
@@ -41,18 +42,20 @@ pub struct BarbirolliInner {
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
+    #[tracing::instrument(skip(firecracker))]
     pub async fn new(
         mut store: VmStore,
         firecracker: impl Into<PathBuf>,
     ) -> Result<Self, LifecycleError> {
         let firecracker = verify_firecracker(firecracker).await?;
+        tracing::info!(?firecracker, "initializing barbirolli");
         let specs = store
             .vm_root
             .by_ref()
             .map(|item| item.map(|item| item.persisted_spec.spec))
-            .collect::<std::result::Result<Vec<_>, StorageError>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?;
         let api_socket = store.vm_root.dir.join(".sockets/firecracker.socket");
-        let manager = Self(Arc::new(BarbirolliInner {
+        let barbirolli = Self(Arc::new(BarbirolliInner {
             vms: DashMap::default(),
             store,
             firecracker,
@@ -61,26 +64,24 @@ impl Barbirolli {
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
         }));
-
         let mut ids = HashSet::new();
-        let mut reconciliation = Good(());
+        let mut errors = vec![];
         for spec in specs {
-            let result = if ids.insert(spec.id) {
-                match spec.reconcile(&manager).await {
-                    Ok(()) => {
-                        manager.vms.insert(spec.id, BarbirolliVm::Discovered(spec));
-                        Ok(())
-                    }
-                    Err(error) => Err(WarmupFailure::Reconcile(error)),
-                }
-            } else {
-                Err(WarmupFailure::DuplicateVmId(spec.id))
+            if !ids.insert(spec.id) {
+                errors.push(WarmupFailure::DuplicateVmId(spec.id));
+                continue;
             };
-            reconciliation = reconciliation.map2(Validated::from(result), |(), ()| ());
+            if let Err(err) = spec.reconcile(&barbirolli).await {
+                errors.push(WarmupFailure::Reconcile(err));
+                continue;
+            }
+            barbirolli
+                .vms
+                .insert(spec.id, BarbirolliVm::Discovered(spec));
         }
-        match reconciliation {
-            Good(()) => Ok(manager),
-            failures @ Fail(_) => Err(LifecycleError::Warmup(failures)),
+        match NEVec::try_from_vec(errors) {
+            Some(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
+            None => Ok(barbirolli),
         }
     }
 
@@ -151,19 +152,20 @@ impl Barbirolli {
         Ok(())
     }
 
-    pub async fn shutdown_all(&self) -> Result<(), LifecycleError> {
+    pub async fn shutdown(&self) -> Result<(), LifecycleError> {
         self.draining.store(true, Ordering::Release);
-        let mut shutdown = Good(());
+        let mut errors = vec![];
         for vm in self.vms.iter() {
-            let result = match self.vms.get_mut(&vm.key()) {
-                Some(mut vm) => vm.shutdown(self).await,
-                None => continue,
+            let Some(mut vm) = self.vms.get_mut(&vm.key()) else {
+                continue;
             };
-            shutdown = shutdown.map2(Validated::from(result.map_err(Box::new)), |(), ()| ());
+            if let Err(err) = vm.shutdown(self).await {
+                errors.push(Box::new(err))
+            }
         }
-        match shutdown {
-            Good(()) => Ok(()),
-            failures @ Fail(_) => Err(LifecycleError::Shutdown(failures)),
+        match NEVec::try_from_vec(errors) {
+            Some(errors) => Err(LifecycleError::Shutdown(Validated::Fail(errors))),
+            None => Ok(()),
         }
     }
 }

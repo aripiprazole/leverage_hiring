@@ -23,6 +23,8 @@ axum = "0.8.8"
 barbirolli = { path = "crates/barbirolli", default-features = false }
 barbirolli_derive = { path = "crates/barbirolli_derive" }
 dashmap = "6.2.1"
+envy = "0.4.2"
+nonempty-collections = "1.4.0"
 fctools = { version = "=0.6.0", default-features = false }
 http-body-util = "0.1.3"
 nlink = "0.25.0"
@@ -44,7 +46,9 @@ validated = "1.0.0"
 axum.workspace = true
 barbirolli = { workspace = true, default-features = false }
 elhone = { path = "crates/elhone", default-features = false }
+envy.workspace = true
 meier = { path = "crates/meier" }
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

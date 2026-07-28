@@ -62,7 +62,7 @@ impl Barbirolli {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
-    pub async fn shutdown_all(&self) -> Result<(), LifecycleError> {
+    pub async fn shutdown(&self) -> Result<(), LifecycleError> {
         Err(LifecycleError::UnsupportedPlatform)
     }
 }

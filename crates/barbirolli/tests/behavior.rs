@@ -241,7 +241,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     manager.delete(id).await.expect("failed to delete VM");
     assert!(manager.list().await.is_empty());
     manager
-        .shutdown_all()
+        .shutdown()
         .await
         .expect("failed to drain an empty manager");
     let drained = manager

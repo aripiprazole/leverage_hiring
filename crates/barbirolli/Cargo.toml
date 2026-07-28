@@ -20,6 +20,7 @@ fctools = { workspace = true, features = [
 nlink = { workspace = true, features = ["tuntap"], optional = true }
 rustix = { version = "1.0.5", default-features = false, features = ["process"], optional = true }
 serde.workspace = true
+nonempty-collections.workspace = true
 serde_json = { workspace = true, optional = true }
 ssh-key.workspace = true
 tempfile = { workspace = true, optional = true }
