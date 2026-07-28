@@ -94,6 +94,7 @@ POST /vms
 
 - `fctools`
 - `nlink`
+- `validated`
 - The first milestone owns persistence, Firecracker lifecycle, and VM networking.
 - Support Firecracker 1.13 on x86_64 and aarch64 Linux; `FIRECRACKER` names its executable.
 - Use `UnrestrictedVmmExecutor` initially. Jailer, cgroups, and external port publishing are out of

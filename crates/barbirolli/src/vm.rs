@@ -4,6 +4,7 @@ use std::{
     str::FromStr,
 };
 
+use derive_more::Display;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
@@ -36,23 +37,9 @@ pub struct VmSpec {
     pub network: NetworkSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid {kind}: {value:?}")]
-pub struct ParseValueError {
-    kind: &'static str,
-    value: String,
-}
-
-impl ParseValueError {
-    pub(crate) fn new(kind: &'static str, value: impl Into<String>) -> Self {
-        Self {
-            kind,
-            value: value.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
 pub struct UserName(String);
 
 impl FromStr for UserName {
@@ -71,24 +58,9 @@ impl FromStr for UserName {
     }
 }
 
-impl Display for UserName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 impl AsRef<str> for UserName {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-impl Serialize for UserName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
     }
 }
 
@@ -103,7 +75,9 @@ impl<'de> Deserialize<'de> for UserName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
 pub struct ArtifactName(String);
 
 impl FromStr for ArtifactName {
@@ -122,24 +96,9 @@ impl FromStr for ArtifactName {
     }
 }
 
-impl Display for ArtifactName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 impl AsRef<str> for ArtifactName {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-impl Serialize for ArtifactName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
     }
 }
 
@@ -154,41 +113,23 @@ impl<'de> Deserialize<'de> for ArtifactName {
     }
 }
 
-fn is_authorized_key(value: &str) -> bool {
-    !value.contains(['\n', '\r']) && ssh_key::PublicKey::from_openssh(value).is_ok()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
 pub struct AuthorizedKey(String);
 
 impl FromStr for AuthorizedKey {
     type Err = ParseValueError;
-
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        is_authorized_key(value)
+        (!value.contains(['\n', '\r']) && ssh_key::PublicKey::from_openssh(value).is_ok())
             .then(|| Self(value.to_owned()))
             .ok_or_else(|| ParseValueError::new("authorized key", value))
-    }
-}
-
-impl Display for AuthorizedKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
     }
 }
 
 impl AsRef<str> for AuthorizedKey {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-impl Serialize for AuthorizedKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
     }
 }
 
@@ -246,7 +187,9 @@ impl Display for VmId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
 pub struct VcpuCount(u8);
 
 impl TryFrom<u8> for VcpuCount {
@@ -266,15 +209,6 @@ impl From<VcpuCount> for u8 {
     }
 }
 
-impl Serialize for VcpuCount {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
 impl<'de> Deserialize<'de> for VcpuCount {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -284,13 +218,9 @@ impl<'de> Deserialize<'de> for VcpuCount {
     }
 }
 
-impl Display for VcpuCount {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
 pub struct MemoryMib(u16);
 
 impl TryFrom<u16> for MemoryMib {
@@ -310,15 +240,6 @@ impl From<MemoryMib> for u16 {
     }
 }
 
-impl Serialize for MemoryMib {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
 impl<'de> Deserialize<'de> for MemoryMib {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -328,8 +249,18 @@ impl<'de> Deserialize<'de> for MemoryMib {
     }
 }
 
-impl Display for MemoryMib {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind}: {value:?}")]
+pub struct ParseValueError {
+    kind: &'static str,
+    value: String,
+}
+
+impl ParseValueError {
+    pub(crate) fn new(kind: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            kind,
+            value: value.into(),
+        }
     }
 }

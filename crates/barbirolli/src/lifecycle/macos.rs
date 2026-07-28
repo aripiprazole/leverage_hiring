@@ -46,6 +46,10 @@ impl Barbirolli {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
+    pub fn vm_mut(&self, _vm_id: VmId) -> Result<BarbirolliVm, LifecycleError> {
+        Err(LifecycleError::UnsupportedPlatform)
+    }
+
     pub async fn authorized_keys_path(&self, _user: &str) -> Option<PathBuf> {
         None
     }

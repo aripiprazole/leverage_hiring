@@ -268,7 +268,7 @@ impl VmRootFolderItem {
             directory: descriptor.directory,
             config: descriptor.config,
             name,
-            persisted_spec: persisted_spec,
+            persisted_spec,
         })
     }
 }

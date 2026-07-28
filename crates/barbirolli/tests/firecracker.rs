@@ -51,7 +51,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         let start_barrier = start_barrier.clone();
         tokio::spawn(async move {
             start_barrier.wait().await;
-            let mut vm = manager.vm(first)?;
+            let mut vm = manager.vm_mut(first)?;
             vm.start(&manager).await
         })
     };
@@ -60,7 +60,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         let start_barrier = start_barrier.clone();
         tokio::spawn(async move {
             start_barrier.wait().await;
-            let mut vm = manager.vm(first)?;
+            let mut vm = manager.vm_mut(first)?;
             vm.start(&manager).await
         })
     };
@@ -75,7 +75,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("the duplicate start failed");
     assert_eq!(
         manager
-            .vm(first)
+            .vm_mut(first)
             .expect("missing first VM")
             .summary()
             .status,
@@ -105,7 +105,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         let shutdown_barrier = shutdown_barrier.clone();
         tokio::spawn(async move {
             shutdown_barrier.wait().await;
-            let mut vm = manager.vm(first)?;
+            let mut vm = manager.vm_mut(first)?;
             vm.shutdown(&manager).await
         })
     };
@@ -114,7 +114,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         let shutdown_barrier = shutdown_barrier.clone();
         tokio::spawn(async move {
             shutdown_barrier.wait().await;
-            let mut vm = manager.vm(first)?;
+            let mut vm = manager.vm_mut(first)?;
             vm.shutdown(&manager).await
         })
     };
@@ -129,7 +129,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .expect("the duplicate shutdown failed");
     assert_eq!(
         manager
-            .vm(first)
+            .vm_mut(first)
             .expect("missing first VM")
             .summary()
             .status,
@@ -154,7 +154,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .await
         .expect("failed to create the second VM");
     {
-        let mut vm = manager.vm(second).expect("missing second VM");
+        let mut vm = manager.vm_mut(second).expect("missing second VM");
         vm.start(&manager)
             .await
             .expect("failed to start the second VM");
@@ -178,7 +178,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
     assert!(response.contains("\"mem_size_mib\":192"));
 
     {
-        let mut vm = manager.vm(second).expect("missing second VM");
+        let mut vm = manager.vm_mut(second).expect("missing second VM");
         vm.shutdown(&manager)
             .await
             .expect("failed to shut down the second VM");

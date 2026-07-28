@@ -1,4 +1,4 @@
-use super::{LifecycleError, Result, VmStatus, VmSummary};
+use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
 
 use std::{
     collections::HashSet,
@@ -11,7 +11,11 @@ use std::{
     time::Duration,
 };
 
-use dashmap::{DashMap, mapref::one::RefMut};
+use dashmap::{
+    DashMap,
+    mapref::one::{Ref, RefMut},
+};
+use validated::Validated::{self, Fail, Good};
 
 use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
 use crate::{StorageError, VmId, VmInput, VmSpec, VmStore};
@@ -59,23 +63,24 @@ impl Barbirolli {
         }));
 
         let mut ids = HashSet::new();
-        let mut failures = Vec::new();
+        let mut reconciliation = Good(());
         for spec in specs {
-            if !ids.insert(spec.id) {
-                failures.push(format!("duplicate VM ID {}", spec.id));
-                continue;
-            }
-            match spec.reconcile(&manager).await {
-                Ok(()) => {
-                    manager.vms.insert(spec.id, BarbirolliVm::Discovered(spec));
+            let result = if ids.insert(spec.id) {
+                match spec.reconcile(&manager).await {
+                    Ok(()) => {
+                        manager.vms.insert(spec.id, BarbirolliVm::Discovered(spec));
+                        Ok(())
+                    }
+                    Err(error) => Err(WarmupFailure::Reconcile(error)),
                 }
-                Err(error) => failures.push(error.to_string()),
-            }
+            } else {
+                Err(WarmupFailure::DuplicateVmId(spec.id))
+            };
+            reconciliation = reconciliation.map2(Validated::from(result), |(), ()| ());
         }
-        if failures.is_empty() {
-            Ok(manager)
-        } else {
-            Err(LifecycleError::Warmup(failures))
+        match reconciliation {
+            Good(()) => Ok(manager),
+            failures @ Fail(_) => Err(LifecycleError::Warmup(failures)),
         }
     }
 
@@ -87,7 +92,11 @@ impl Barbirolli {
         }
     }
 
-    pub fn vm(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
+    pub fn vm(&self, vm_id: VmId) -> Result<Ref<'_, VmId, BarbirolliVm>> {
+        self.vms.get(&vm_id).ok_or(LifecycleError::NotFound(vm_id))
+    }
+
+    pub fn vm_mut(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
         self.vms
             .get_mut(&vm_id)
             .ok_or(LifecycleError::NotFound(vm_id))
@@ -127,10 +136,10 @@ impl Barbirolli {
 
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
-        let mut vm = self.vm(vm_id)?;
+        let mut vm = self.vm_mut(vm_id)?;
         vm.shutdown(self).await?;
         let spec = vm.spec();
-        self.store.delete(&spec)?;
+        self.store.delete(spec)?;
         self.vms.remove(&vm_id);
         tracing::info!(
             vm_id = %spec.id,
@@ -144,25 +153,17 @@ impl Barbirolli {
 
     pub async fn shutdown_all(&self) -> Result<(), LifecycleError> {
         self.draining.store(true, Ordering::Release);
-        let ids = self
-            .vms
-            .iter()
-            .map(|entry| *entry.key())
-            .collect::<Vec<_>>();
-        let mut failures = Vec::new();
-        for vm_id in ids {
-            let result = match self.vms.get_mut(&vm_id) {
+        let mut shutdown = Good(());
+        for vm in self.vms.iter() {
+            let result = match self.vms.get_mut(&vm.key()) {
                 Some(mut vm) => vm.shutdown(self).await,
                 None => continue,
             };
-            if let Err(error) = result {
-                failures.push(error.to_string());
-            }
+            shutdown = shutdown.map2(Validated::from(result.map_err(Box::new)), |(), ()| ());
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(LifecycleError::Shutdown(failures))
+        match shutdown {
+            Good(()) => Ok(()),
+            failures @ Fail(_) => Err(LifecycleError::Shutdown(failures)),
         }
     }
 }

@@ -154,7 +154,7 @@ async fn start_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
-    let mut vm = state.manager.vm(id).map_err(ApiError::from)?;
+    let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
@@ -168,7 +168,7 @@ async fn shutdown_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
-    let mut vm = state.manager.vm(id).map_err(ApiError::from)?;
+    let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
@@ -187,7 +187,7 @@ async fn delete_vm(
 }
 
 async fn status_json(manager: &Barbirolli, id: VmId) -> Result<Json<StatusResponse>, ApiError> {
-    let summary = manager.vm(id).map_err(ApiError::from)?.summary();
+    let summary = manager.vm_mut(id).map_err(ApiError::from)?.summary();
     Ok(Json(StatusResponse {
         id,
         status: summary.status,

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use validated::Validated;
 
 use crate::{StorageError, UserName, VmId};
 
@@ -32,6 +33,15 @@ pub struct VmSummary {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum WarmupFailure {
+    #[error("duplicate VM ID {0}")]
+    DuplicateVmId(VmId),
+    #[cfg(feature = "linux")]
+    #[error(transparent)]
+    Reconcile(#[from] crate::vm::managed::LifecycleError),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -49,9 +59,9 @@ pub enum LifecycleError {
     #[error(transparent)]
     Vm(#[from] crate::vm::managed::LifecycleError),
     #[error("warmup reconciliation failed: {0:?}")]
-    Warmup(Vec<String>),
+    Warmup(Validated<(), WarmupFailure>),
     #[error("application shutdown failed: {0:?}")]
-    Shutdown(Vec<String>),
+    Shutdown(Validated<(), Box<LifecycleError>>),
     #[cfg(not(feature = "linux"))]
     #[error("Firecracker lifecycle operations require Linux")]
     UnsupportedPlatform,

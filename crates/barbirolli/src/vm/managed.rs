@@ -21,6 +21,7 @@ use fctools::{
         },
     },
 };
+use validated::Validated::{self, Fail, Good};
 
 use crate::{
     Barbirolli, VmSpec,
@@ -59,22 +60,28 @@ impl VmSpec {
     }
 
     pub(crate) async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<(), LifecycleError> {
-        let mut failures = Vec::new();
-        if let Err(error) = self.kill_stale_processes(barbirolli).await {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = self.network.cleanup_stale().await {
-            failures.push(error.to_string());
-        }
-        match std::fs::remove_file(&barbirolli.api_socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(error.to_string()),
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(LifecycleError::Reconcile(failures))
+        let stale_processes = self
+            .kill_stale_processes(barbirolli)
+            .await
+            .map_err(ReconcileFailure::Processes);
+        let stale_network = self
+            .network
+            .cleanup_stale()
+            .await
+            .map_err(ReconcileFailure::Network);
+        let stale_socket = match std::fs::remove_file(&barbirolli.api_socket) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ReconcileFailure::Socket(error)),
+        };
+        let reconciliation = Validated::from(stale_processes).map3(
+            Validated::from(stale_network),
+            Validated::from(stale_socket),
+            |(), (), ()| (),
+        );
+        match reconciliation {
+            Good(()) => Ok(()),
+            failures @ Fail(_) => Err(LifecycleError::Reconcile(failures)),
         }
     }
 
@@ -314,7 +321,17 @@ pub enum LifecycleError {
         cleanup: Option<Box<LifecycleError>>,
     },
     #[error("warmup reconciliation failed: {0:?}")]
-    Reconcile(Vec<String>),
+    Reconcile(Validated<(), ReconcileFailure>),
     #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
     UnsupportedFirecracker(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileFailure {
+    #[error("failed to kill stale Firecracker processes")]
+    Processes(#[source] std::io::Error),
+    #[error("failed to clean up stale network")]
+    Network(#[source] NetworkError),
+    #[error("failed to remove stale Firecracker API socket")]
+    Socket(#[source] std::io::Error),
 }

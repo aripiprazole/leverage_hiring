@@ -206,7 +206,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     assert_eq!(listed[0].user.as_ref(), "alice");
     assert_eq!(listed[0].status, VmStatus::Discovered);
     {
-        let vm = manager.vm(id).expect("missing VM");
+        let vm = manager.vm_mut(id).expect("missing VM");
         assert_eq!(vm.summary().status, VmStatus::Discovered);
         assert_eq!(vm.spec().id, id);
     }
@@ -222,7 +222,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     assert!(manager.authorized_keys_path("missing").await.is_none());
     assert!(manager.ssh_address("alice").await.is_none());
     {
-        let mut vm = manager.vm(id).expect("missing VM");
+        let mut vm = manager.vm_mut(id).expect("missing VM");
         vm.shutdown(&manager)
             .await
             .expect("discovered shutdown should be idempotent");
@@ -230,7 +230,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
 
     let missing = VmId::try_from(10).expect("valid VM ID");
     assert!(matches!(
-        manager.vm(missing),
+        manager.vm_mut(missing),
         Err(LifecycleError::NotFound(id)) if id == missing
     ));
     assert!(matches!(

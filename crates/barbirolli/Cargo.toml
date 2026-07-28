@@ -6,11 +6,11 @@ license.workspace = true
 
 [features]
 default = []
-linux = ["dep:dashmap", "dep:derive_more", "dep:fctools", "dep:nlink", "dep:rustix", "dep:serde_json", "dep:tempfile", "dep:tokio", "dep:tracing"]
+linux = ["dep:dashmap", "dep:fctools", "dep:nlink", "dep:rustix", "dep:serde_json", "dep:tempfile", "dep:tokio", "dep:tracing"]
 
 [dependencies]
 dashmap = { workspace = true, optional = true }
-derive_more = { version = "2.1.1", features = ["full"], optional = true }
+derive_more = { version = "2.1.1", features = ["full"] }
 fctools = { workspace = true, features = [
     "direct-process-spawner",
     "tokio-runtime",
@@ -26,6 +26,7 @@ tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+validated.workspace = true
 
 [dev-dependencies]
 barbirolli_derive.workspace = true

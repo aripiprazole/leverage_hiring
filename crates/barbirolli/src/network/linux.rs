@@ -15,34 +15,6 @@ const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
 pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
 
-#[derive(Debug, thiserror::Error)]
-pub enum NetworkError {
-    #[error("no IPv4 default route with an output interface exists in the main routing table")]
-    MissingDefaultRoute,
-    #[error("failed to parse tap name: {0}")]
-    ParseValueError(#[from] ParseValueError),
-    #[error("network interface {0:?} was not found")]
-    InterfaceNotFound(String),
-    #[error("172.16.0.0/16 overlaps existing host route {0}")]
-    PoolOverlap(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Nlink(#[from] nlink::netlink::Error),
-    #[error(transparent)]
-    TunTap(#[from] nlink::tuntap::Error),
-    #[error("network cleanup failed (nftables: {nftables:?}, TAP: {tap:?})")]
-    Cleanup {
-        nftables: Option<Box<NetworkError>>,
-        tap: Option<Box<NetworkError>>,
-    },
-    #[error("network setup failed: {setup}; rollback also failed: {rollback}")]
-    SetupRollback {
-        setup: Box<NetworkError>,
-        rollback: Box<NetworkError>,
-    },
-}
-
 pub struct ManagedNetwork {
     spec: NetworkSpec,
     table: String,
@@ -300,6 +272,34 @@ fn overlaps_vm_pool(destination: Ipv4Addr, prefix: u8) -> bool {
     let pool_start = u32::from(Ipv4Addr::new(172, 16, 0, 0));
     let pool_end = pool_start | 0xffff;
     route_start <= pool_end && pool_start <= route_end
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error("no IPv4 default route with an output interface exists in the main routing table")]
+    MissingDefaultRoute,
+    #[error("failed to parse tap name: {0}")]
+    ParseValueError(#[from] ParseValueError),
+    #[error("network interface {0:?} was not found")]
+    InterfaceNotFound(String),
+    #[error("172.16.0.0/16 overlaps existing host route {0}")]
+    PoolOverlap(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Nlink(#[from] nlink::netlink::Error),
+    #[error(transparent)]
+    TunTap(#[from] nlink::tuntap::Error),
+    #[error("network cleanup failed (nftables: {nftables:?}, TAP: {tap:?})")]
+    Cleanup {
+        nftables: Option<Box<NetworkError>>,
+        tap: Option<Box<NetworkError>>,
+    },
+    #[error("network setup failed: {setup}; rollback also failed: {rollback}")]
+    SetupRollback {
+        setup: Box<NetworkError>,
+        rollback: Box<NetworkError>,
+    },
 }
 
 #[cfg(test)]
