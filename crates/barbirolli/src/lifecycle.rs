@@ -16,28 +16,7 @@ use tokio::sync::Mutex;
 use crate::managed::{LifecycleError, ManagedVm};
 use crate::{StorageError, UserName, VmId, VmInput, VmSpec, VmStore};
 
-#[derive(Debug, thiserror::Error)]
-pub enum LifecycleError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("VM {0} was not found")]
-    NotFound(VmId),
-    #[error("lifecycle operations are draining")]
-    Draining,
-    #[error("cannot {operation} VM {vm_id} while it is {status:?}")]
-    InvalidTransition {
-        vm_id: VmId,
-        operation: &'static str,
-        status: VmStatus,
-    },
-
-    #[error(transparent)]
-    Vm(#[from] LifecycleError),
-    #[error("warmup reconciliation failed: {0:?}")]
-    Warmup(Vec<String>),
-    #[error("application shutdown failed: {0:?}")]
-    Shutdown(Vec<String>),
-}
+pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,13 +53,14 @@ impl BarbirolliVm {
 }
 
 pub struct BarbirolliInner {
-    vms: DashMap<VmId, Arc<Mutex<BarbirolliVm>>>,
-    store: VmStore,
+    pub vms: DashMap<VmId, Arc<Mutex<BarbirolliVm>>>,
+    pub store: VmStore,
     #[cfg_attr(not(feature = "linux"), allow(dead_code))]
-    firecracker: PathBuf,
-    api_socket_timeout: Duration,
-    shutdown_timeout: Duration,
-    draining: AtomicBool,
+    pub firecracker: PathBuf,
+    pub api_socket: PathBuf,
+    pub api_socket_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub draining: AtomicBool,
 }
 
 #[derive(derive_more::Deref, derive_more::DerefMut, Clone)]
@@ -130,14 +110,6 @@ impl Barbirolli {
         })))
     }
 
-    fn accepting_operations(&self) -> Result<(), LifecycleError> {
-        if self.draining.load(Ordering::Acquire) {
-            Err(LifecycleError::Draining)
-        } else {
-            Ok(())
-        }
-    }
-
     fn vm(&self, vm_id: VmId) -> Result<Arc<Mutex<BarbirolliVm>>, LifecycleError> {
         self.vms
             .get(&vm_id)
@@ -146,7 +118,6 @@ impl Barbirolli {
     }
 
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
-        self.accepting_operations()?;
         let spec = self.store.create(input).await?;
         let id = spec.vm_id;
         self.vms
@@ -203,7 +174,6 @@ impl Barbirolli {
     }
 
     pub async fn start(self, vm_id: VmId) -> Result<(), LifecycleError> {
-        self.accepting_operations()?;
         let vm = self.vm(vm_id)?;
         let mut vm = vm.lock().await;
         let spec = match &*vm {
@@ -251,7 +221,6 @@ impl Barbirolli {
     }
 
     pub async fn shutdown(&self, vm_id: VmId) -> Result<(), LifecycleError> {
-        self.accepting_operations()?;
         let vm = self.vm(vm_id)?;
         let mut vm = vm.lock().await;
         self.shutdown_locked(&mut vm).await
@@ -327,17 +296,11 @@ impl Barbirolli {
         Ok(())
     }
 
-    pub async fn shutdown_all(&self) -> Result<(), LifecycleError> {
-        self.draining.store(true, Ordering::Release);
-        let ids = self
-            .vms
-            .iter()
-            .map(|entry| *entry.key())
-            .collect::<Vec<_>>();
+    pub async fn shutdown_all(self) -> Result<(), LifecycleError> {
         let mut failures = Vec::new();
 
-        for id in ids {
-            if let Err(error) = self.shutdown_vm(id).await {
+        for entry in self.vms.iter() {
+            if let Err(error) = self.shutdown(*entry.key()).await {
                 failures.push(error.to_string());
             }
         }
@@ -348,4 +311,27 @@ impl Barbirolli {
             Err(LifecycleError::Shutdown(failures))
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LifecycleError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("VM {0} was not found")]
+    NotFound(VmId),
+    #[error("lifecycle operations are draining")]
+    Draining,
+    #[error("cannot {operation} VM {vm_id} while it is {status:?}")]
+    InvalidTransition {
+        vm_id: VmId,
+        operation: &'static str,
+        status: VmStatus,
+    },
+
+    #[error(transparent)]
+    Vm(#[from] LifecycleError),
+    #[error("warmup reconciliation failed: {0:?}")]
+    Warmup(Vec<String>),
+    #[error("application shutdown failed: {0:?}")]
+    Shutdown(Vec<String>),
 }

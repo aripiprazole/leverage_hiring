@@ -208,63 +208,38 @@ pub struct ManagedVm {
     pub failed: bool,
 }
 
-async fn map_prepare_vm(
-    vm: Result<FirecrackerVm, LifecycleError>,
-) -> Result<FirecrackerVm, LifecycleError> {
-    match vm.await {
-        Ok(vm) => vm,
-        Err(startup) => {
-            let network_rollback = network.cleanup().await.err().map(Box::new);
-            return Err(LifecycleError::StartupRollback {
-                startup_error: Box::new(startup),
-                vm_rollback_error: None,
-                network_rollback_error: network_rollback,
-            });
-        }
-    }
-}
-
 impl ManagedVm {
     pub async fn start(spec: VmSpec, barbirolli: Barbirolli) -> Result<Self, LifecycleError> {
-        let network = crate::network::prepare(&spec.network).await?;
-        let mut vm = map_prepare_vm(prepare_vm(&spec, firecracker).await).await?;
+        let network = spec.network.prepare().await?;
+        let mut vm = map_prepare_vm(spec.prepare_vm(barbirolli).await).await?;
 
-        match vm.start(api_socket_timeout).await {
+        match vm.start(self.api_socket_timeout).await {
             Ok(()) => Ok(Self {
                 spec,
                 vm,
                 network: Some(network),
                 failed: false,
             }),
-            Err(_) => {
-                let vm_rollback = rollback_vm(&mut vm, shutdown_timeout)
+            Err(err) => Err(LifecycleError::StartupRollback {
+                startup_error: Box::new(startup.into()),
+                vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
                     .await
                     .err()
-                    .map(Box::new);
-                let network_rollback = network.cleanup().await.err().map(Box::new);
-                Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(startup.into()),
-                    vm_rollback_error: vm_rollback,
-                    network_rollback_error: network_rollback,
-                })
-            }
+                    .map(Box::new),
+                network_rollback_error: network.cleanup().await.err().map(Box::new),
+            }),
         }
     }
 
-    pub fn mark_failed(&mut self) {
-        self.failed = true;
-    }
-
     pub async fn shutdown(&mut self) -> Result<(), LifecycleError> {
-        let graceful_method = if cfg!(target_arch = "x86_64") {
-            VmShutdownMethod::CtrlAltDel
-        } else {
-            VmShutdownMethod::WriteToSerial(b"reboot\n".to_vec())
-        };
         self.vm
             .shutdown([
                 VmShutdownAction {
-                    method: graceful_method,
+                    method: if cfg!(target_arch = "x86_64") {
+                        VmShutdownMethod::CtrlAltDel
+                    } else {
+                        VmShutdownMethod::WriteToSerial(b"reboot\n".to_vec())
+                    },
                     timeout: Some(self.shutdown_timeout),
                     graceful: true,
                 },
@@ -303,43 +278,58 @@ impl ManagedVm {
             }),
         }
     }
+
+    pub async fn kill_stale_processes(&self, barbirolli: Barbirolli) -> Result<(), std::io::Error> {
+        let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
+        let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
+        let mut proc = tokio::fs::read_dir("/proc").await?;
+        while let Some(entry) = proc.next_entry().await? {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
+                Ok(command) => command,
+                Err(_) => continue,
+            };
+            let arguments = command
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .collect::<Vec<_>>();
+            let is_firecracker = arguments
+                .first()
+                .is_some_and(|argument| *argument == expected_firecracker);
+            let has_socket = arguments
+                .windows(2)
+                .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
+            if is_firecracker
+                && has_socket
+                && let Some(pid) = rustix::process::Pid::from_raw(pid)
+            {
+                rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+    }
 }
 
-async fn kill_stale_processes(
-    spec: &VmSpec,
-    firecracker: &std::path::Path,
-) -> Result<(), std::io::Error> {
-    let expected_socket = spec.network.api_socket().as_os_str().as_encoded_bytes();
-    let expected_firecracker = firecracker.as_os_str().as_encoded_bytes();
-    let mut proc = tokio::fs::read_dir("/proc").await?;
-    while let Some(entry) = proc.next_entry().await? {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let command = match tokio::fs::read(entry.path().join("cmdline")).await {
-            Ok(command) => command,
-            Err(_) => continue,
-        };
-        let arguments = command
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .collect::<Vec<_>>();
-        let is_firecracker = arguments
-            .first()
-            .is_some_and(|argument| *argument == expected_firecracker);
-        let has_socket = arguments
-            .windows(2)
-            .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
-        if is_firecracker
-            && has_socket
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+async fn map_prepare_vm(vm: Result<FirecrackerVm>) -> Result<FirecrackerVm> {
+    match vm.await {
+        Ok(vm) => vm,
+        Err(startup) => {
+            let network_rollback = network.cleanup().await.err().map(Box::new);
+            return Err(LifecycleError::StartupRollback {
+                startup_error: Box::new(startup),
+                vm_rollback_error: None,
+                network_rollback_error: network_rollback,
+            });
         }
     }
-    Ok(())
 }

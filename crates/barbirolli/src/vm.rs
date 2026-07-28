@@ -8,6 +8,31 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmInput {
+    pub user: UserName,
+    pub vcpu_count: VcpuCount,
+    pub memory_mib: MemoryMib,
+    pub kernel: ArtifactName,
+    pub rootfs: ArtifactName,
+    #[serde(default)]
+    pub authorized_keys: Vec<AuthorizedKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmSpec {
+    pub vm_id: VmId,
+    pub user: UserName,
+    pub artifact_dir: PathBuf,
+    pub kernel: PathBuf,
+    pub rootfs: PathBuf,
+    pub vcpu_count: VcpuCount,
+    pub memory_mib: MemoryMib,
+    pub network: NetworkSpec,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid {kind}: {value:?}")]
 pub struct ParseValueError {
@@ -298,29 +323,4 @@ impl Display for MemoryMib {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VmInput {
-    pub user: UserName,
-    pub vcpu_count: VcpuCount,
-    pub memory_mib: MemoryMib,
-    pub kernel: ArtifactName,
-    pub rootfs: ArtifactName,
-    #[serde(default)]
-    pub authorized_keys: Vec<AuthorizedKey>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VmSpec {
-    pub vm_id: VmId,
-    pub user: UserName,
-    pub artifact_dir: PathBuf,
-    pub kernel: PathBuf,
-    pub rootfs: PathBuf,
-    pub vcpu_count: VcpuCount,
-    pub memory_mib: MemoryMib,
-    pub network: NetworkSpec,
 }

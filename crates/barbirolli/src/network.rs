@@ -23,6 +23,21 @@ const MAIN_ROUTE_TABLE: u32 = 254;
 const VM_NETWORK_POOL: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 0);
 const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
+pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
+
+#[cfg(feature = "linux")]
+pub struct ManagedNetwork {
+    spec: NetworkSpec,
+    table: String,
+}
+
+#[cfg(feature = "linux")]
+impl ManagedNetwork {
+    pub async fn cleanup(&self) -> Result<()> {
+        self.spec.cleanup(&self.table).await
+    }
+}
+
 #[cfg(any(feature = "linux", test))]
 #[derive(Clone, Copy)]
 struct DefaultRouteCandidate {
@@ -36,16 +51,15 @@ struct DefaultRouteCandidate {
 #[serde(deny_unknown_fields)]
 pub struct NetworkSpec {
     vm_id: VmId,
-    tap_name: InterfaceName,
+    tap: InterfaceName,
     subnet: Ipv4Addr,
     host_ip: Ipv4Addr,
     guest_ip: Ipv4Addr,
     guest_mac: String,
-    api_socket: PathBuf,
 }
 
 impl NetworkSpec {
-    pub fn new(vm_id: VmId, api_socket: PathBuf) -> Result<Self, ParseValueError> {
+    pub fn new(vm_id: VmId) -> Result<Self> {
         let id = u16::from(vm_id);
         let offset = id * 4;
         let third = (offset / 256) as u8;
@@ -54,12 +68,11 @@ impl NetworkSpec {
 
         Ok(Self {
             vm_id,
-            tap_name: format!("fc-tap{id}").parse()?,
+            tap: format!("fc-tap{id}").parse()?,
             subnet: Ipv4Addr::new(172, 16, third, fourth),
             host_ip: Ipv4Addr::new(172, 16, third, fourth + 1),
             guest_ip: Ipv4Addr::new(172, 16, third, guest),
             guest_mac: format!("06:00:ac:10:{third:02x}:{guest:02x}"),
-            api_socket,
         })
     }
 
@@ -77,7 +90,7 @@ impl NetworkSpec {
     async fn setup(
         &self,
         route: &Connection<Route>,
-        nftables_conn: Connection<Nftables>,
+        nftables_conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
     ) -> Result<()> {
@@ -95,7 +108,9 @@ impl NetworkSpec {
 
     #[cfg(feature = "linux")]
     pub async fn prepare(&self) -> Result<ManagedNetwork> {
+        let table = format!("fc_vm_{}", spec.vm_id);
         let route_conn = Connection::<Route>::new()?;
+
         ensure_pool_available(&route_conn).await?;
 
         let routes = route_conn.get_routes_for_table(MAIN_ROUTE_TABLE).await?;
@@ -119,21 +134,18 @@ impl NetworkSpec {
             .parse::<InterfaceName>()
             .map_err(|error| NetworkError::InterfaceNotFound(error.to_string()))?;
 
-        let table = format!("fc_vm_{}", spec.vm_id);
         let nftables_conn = Connection::<Nftables>::new()?;
         nftables_conn
             .del_table_if_exists(table.as_str(), Family::Ip)
             .await?;
-        route_conn
-            .del_link_if_exists(spec.tap_name().as_ref())
-            .await?;
+        route_conn.del_link_if_exists(&self.tap).await?;
 
         TunTap::builder()
-            .name(spec.tap_name().as_ref())
+            .name(&self.tap)
             .mode(Mode::Tap)
             .create_persistent()?;
 
-        match setup {
+        match self.setup(&route_conn, &nftables_conn, &host, &table) {
             Ok(()) => Ok(ManagedNetwork {
                 spec: spec.clone(),
                 table,
@@ -163,7 +175,7 @@ impl NetworkSpec {
             .map(|_| ())
             .map_err(NetworkError::from);
         let tap = route
-            .del_link_if_exists(&self.tap_name)
+            .del_link_if_exists(&self.tap)
             .await
             .map(|_| ())
             .map_err(NetworkError::from);
@@ -188,7 +200,7 @@ impl NetworkSpec {
         };
         let tap = match Connection::<Route>::new() {
             Ok(connection) => connection
-                .del_link_if_exists(&self.tap_name)
+                .del_link_if_exists(&self.tap)
                 .await
                 .map(|_| ())
                 .map_err(NetworkError::from),
@@ -259,46 +271,6 @@ impl NetworkSpec {
             .commit(conn)
             .await?;
         Ok(())
-    }
-}
-
-#[cfg(feature = "linux")]
-#[derive(Debug, thiserror::Error)]
-pub enum NetworkError {
-    #[error("no IPv4 default route with an output interface exists in the main routing table")]
-    MissingDefaultRoute,
-    #[error("network interface {0:?} was not found")]
-    InterfaceNotFound(String),
-    #[error("172.16.0.0/16 overlaps existing host route {0}")]
-    PoolOverlap(String),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Nlink(#[from] nlink::netlink::Error),
-    #[error(transparent)]
-    TunTap(#[from] nlink::tuntap::Error),
-    #[error("network cleanup failed (nftables: {nftables:?}, TAP: {tap:?})")]
-    Cleanup {
-        nftables: Option<Box<NetworkError>>,
-        tap: Option<Box<NetworkError>>,
-    },
-    #[error("network setup failed: {setup}; rollback also failed: {rollback}")]
-    SetupRollback {
-        setup: Box<NetworkError>,
-        rollback: Box<NetworkError>,
-    },
-}
-
-#[cfg(feature = "linux")]
-pub struct ManagedNetwork {
-    spec: NetworkSpec,
-    table: String,
-}
-
-#[cfg(feature = "linux")]
-impl ManagedNetwork {
-    pub async fn cleanup(&self) -> Result<(), NetworkError> {
-        self.spec.cleanup(&self.table).await
     }
 }
 
@@ -389,6 +361,35 @@ impl AsRef<str> for InterfaceName {
     fn as_ref(&self) -> &str {
         &self.0
     }
+}
+
+#[cfg(feature = "linux")]
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkError {
+    #[error("no IPv4 default route with an output interface exists in the main routing table")]
+    MissingDefaultRoute,
+    #[error("failed to parse tap name: {0}")]
+    ParseValueError(ParseValueError),
+    #[error("network interface {0:?} was not found")]
+    InterfaceNotFound(String),
+    #[error("172.16.0.0/16 overlaps existing host route {0}")]
+    PoolOverlap(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Nlink(#[from] nlink::netlink::Error),
+    #[error(transparent)]
+    TunTap(#[from] nlink::tuntap::Error),
+    #[error("network cleanup failed (nftables: {nftables:?}, TAP: {tap:?})")]
+    Cleanup {
+        nftables: Option<Box<NetworkError>>,
+        tap: Option<Box<NetworkError>>,
+    },
+    #[error("network setup failed: {setup}; rollback also failed: {rollback}")]
+    SetupRollback {
+        setup: Box<NetworkError>,
+        rollback: Box<NetworkError>,
+    },
 }
 
 #[cfg(test)]
