@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::Ipv4Addr,
     path::PathBuf,
     sync::{
@@ -8,13 +9,11 @@ use std::{
     time::Duration,
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::one::RefMut};
 use serde::Serialize;
-use tokio::sync::Mutex;
 
-#[cfg(feature = "linux")]
-use crate::managed::{LifecycleError, ManagedVm};
-use crate::{StorageError, UserName, VmId, VmInput, VmSpec, VmStore, storage::VmRootFolder};
+use crate::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
+use crate::{StorageError, UserName, VmId, VmInput, VmSpec, VmStore};
 
 pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 
@@ -35,27 +34,16 @@ pub struct VmSummary {
     pub status: VmStatus,
 }
 
-enum BarbirolliVm {
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum BarbirolliVm {
     Discovered(VmSpec),
     Failed(VmSpec),
     Managed(ManagedVm),
 }
 
-impl BarbirolliVm {
-    fn status(&self) -> VmStatus {
-        match self {
-            Self::Discovered(_) => VmStatus::Discovered,
-            Self::Failed(_) => VmStatus::Failed,
-            Self::Managed(vm) if vm.failed => VmStatus::Failed,
-            Self::Managed(_) => VmStatus::Running,
-        }
-    }
-}
-
 pub struct BarbirolliInner {
-    pub vms: DashMap<VmId, Arc<Mutex<BarbirolliVm>>>,
+    pub(crate) vms: DashMap<VmId, BarbirolliVm>,
     pub store: VmStore,
-    #[cfg_attr(not(feature = "linux"), allow(dead_code))]
     pub firecracker: PathBuf,
     pub api_socket: PathBuf,
     pub api_socket_timeout: Duration,
@@ -63,71 +51,87 @@ pub struct BarbirolliInner {
     pub draining: AtomicBool,
 }
 
-#[derive(derive_more::Deref, derive_more::DerefMut, Clone)]
+#[derive(derive_more::Deref, Clone)]
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
     pub async fn new(
-        store: VmStore,
+        mut store: VmStore,
         firecracker: impl Into<PathBuf>,
     ) -> Result<Self, LifecycleError> {
-        let firecracker = verify_firecracker(&firecracker).await?;
-        let specs = store.vm_root.map(|item| {
-            let item = item?;
-
-            Ok(item.persisted_spec.spec)
-        });
-        let specs = specs.collect::<Result<Vec<VmSpec>>>()?;
-        let mut failures = Vec::new();
-        if !failures.is_empty() {
-            return Err(LifecycleError::Warmup(failures));
-        }
-        let mut vms = dashmap::DashMap::default();
-        for vm in specs.into_iter() {
-            vms.insert(vm.id, Arc::new(Mutex::new(BarbirolliVm::Discovered(vm))));
-        }
-
-        Ok(Self(Arc::new(BarbirolliInner {
-            vms,
+        let firecracker = verify_firecracker(firecracker).await?;
+        let specs = store
+            .vm_root
+            .by_ref()
+            .map(|item| item.map(|item| item.persisted_spec.spec))
+            .collect::<std::result::Result<Vec<_>, StorageError>>()?;
+        let api_socket = store.vm_root.dir.join(".sockets/firecracker.socket");
+        let manager = Self(Arc::new(BarbirolliInner {
+            vms: DashMap::default(),
             store,
             firecracker,
+            api_socket,
             api_socket_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
-        })))
+        }));
+
+        let mut ids = HashSet::new();
+        let mut failures = Vec::new();
+        for spec in specs {
+            if !ids.insert(spec.id) {
+                failures.push(format!("duplicate VM ID {}", spec.id));
+                continue;
+            }
+            match spec.reconcile(&manager).await {
+                Ok(()) => {
+                    manager.vms.insert(spec.id, BarbirolliVm::Discovered(spec));
+                }
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(manager)
+        } else {
+            Err(LifecycleError::Warmup(failures))
+        }
     }
 
-    fn vm(&self, vm_id: VmId) -> Result<Arc<Mutex<BarbirolliVm>>, LifecycleError> {
+    fn accepting_operations(&self) -> Result<()> {
+        if self.draining.load(Ordering::Acquire) {
+            Err(LifecycleError::Draining)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn vm(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
         self.vms
-            .get(&vm_id)
-            .map(|vm| vm.value().clone())
+            .get_mut(&vm_id)
             .ok_or(LifecycleError::NotFound(vm_id))
     }
 
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
+        self.accepting_operations()?;
         let spec = self.store.create(input).await?;
         let id = spec.id;
-        self.vms
-            .insert(id, Arc::new(Mutex::new(BarbirolliVm::Discovered(spec))));
+        self.vms.insert(id, BarbirolliVm::Discovered(spec));
         Ok(id)
     }
 
     pub async fn list(&self) -> Vec<VmSummary> {
-        let mut summaries = Vec::with_capacity(self.vms.len());
-        for entry in self.vms.iter() {
-            let vm = entry.lock().await;
-            summaries.push(VmSummary {
+        self.vms
+            .iter()
+            .map(|entry| VmSummary {
                 id: *entry.key(),
-                user: vm.spec().user.clone(),
-                status: vm.status(),
-            });
-        }
-        summaries
+                user: entry.value().spec().user.clone(),
+                status: entry.value().status(),
+            })
+            .collect()
     }
 
     pub async fn status(&self, vm_id: VmId) -> Result<VmSummary, LifecycleError> {
         let vm = self.vm(vm_id)?;
-        let vm = vm.lock().await;
         Ok(VmSummary {
             id: vm_id,
             user: vm.spec().user.clone(),
@@ -136,36 +140,32 @@ impl Barbirolli {
     }
 
     pub async fn spec(&self, vm_id: VmId) -> Result<VmSpec, LifecycleError> {
-        let vm = self.vm(vm_id)?;
-        Ok(vm.lock().await.spec().clone())
+        Ok(self.vm(vm_id)?.spec().clone())
     }
 
     pub async fn authorized_keys_path(&self, user: &str) -> Option<PathBuf> {
-        for vm in self.vms.iter() {
-            let vm = vm.lock().await;
-            if vm.spec().user.as_ref() == user {
-                return Some(vm.spec().artifact_dir.join("authorized_keys"));
-            }
-        }
-        None
+        self.vms.iter().find_map(|entry| {
+            let spec = entry.value().spec();
+            (spec.user.as_ref() == user).then(|| spec.artifact_dir.join("authorized_keys"))
+        })
     }
 
     pub async fn ssh_address(&self, user: &str) -> Option<Ipv4Addr> {
-        for vm in self.vms.iter() {
-            let vm = vm.lock().await;
-            if vm.user.as_ref() == user {
-                return Some(vm.network.guest_ip);
-            }
-        }
-        None
+        self.vms.iter().find_map(|entry| {
+            let BarbirolliVm::Managed(managed) = entry.value() else {
+                return None;
+            };
+            (!managed.failed && managed.spec.user.as_ref() == user)
+                .then_some(managed.spec.network.guest_ip)
+        })
     }
 
-    pub async fn start(self, vm_id: VmId) -> Result<(), LifecycleError> {
-        let vm = self.vm(vm_id)?;
-        let mut vm = vm.lock().await;
+    pub async fn start(&self, vm_id: VmId) -> Result<(), LifecycleError> {
+        self.accepting_operations()?;
+        let mut vm = self.vm(vm_id)?;
         let spec = match &*vm {
             BarbirolliVm::Discovered(spec) | BarbirolliVm::Failed(spec) => spec.clone(),
-            BarbirolliVm::Managed(managed) if managed.is_failed() => {
+            BarbirolliVm::Managed(managed) if managed.failed => {
                 return Err(LifecycleError::InvalidTransition {
                     vm_id,
                     operation: "start",
@@ -181,7 +181,7 @@ impl Barbirolli {
             status = "starting",
             "VM state transition"
         );
-        let managed = match ManagedVm::start(spec.clone(), self.clone()).await {
+        let managed = match ManagedVm::start(spec.clone(), self).await {
             Ok(managed) => managed,
             Err(error) => {
                 tracing::error!(
@@ -208,21 +208,20 @@ impl Barbirolli {
     }
 
     pub async fn shutdown(&self, vm_id: VmId) -> Result<(), LifecycleError> {
-        let vm = self.vm(vm_id)?;
-        let mut vm = vm.lock().await;
+        self.accepting_operations()?;
+        self.vm(vm_id)?.shutdown(self).await
     }
 
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
-        let vm = self.vm(vm_id)?;
-        let mut vm = vm.lock().await;
-        self.shutdown_locked(&mut vm).await?;
-        self.store.delete(vm.spec())?;
+        let mut vm = self.vm(vm_id)?;
+        vm.shutdown(self).await?;
         let spec = vm.spec().clone();
+        self.store.delete(&spec)?;
         drop(vm);
         self.vms.remove(&vm_id);
         tracing::info!(
-            vm_id = %spec.vm_id,
+            vm_id = %spec.id,
             user = %spec.user,
             operation = "delete",
             status = "deleted",
@@ -231,69 +230,27 @@ impl Barbirolli {
         Ok(())
     }
 
-    pub async fn shutdown_all(self) -> Result<(), LifecycleError> {
+    pub async fn shutdown_all(&self) -> Result<(), LifecycleError> {
+        self.draining.store(true, Ordering::Release);
+        let ids = self
+            .vms
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
         let mut failures = Vec::new();
-
-        for entry in self.vms.iter() {
-            if let Err(error) = self.shutdown(*entry.key()).await {
+        for vm_id in ids {
+            let result = match self.vms.get_mut(&vm_id) {
+                Some(mut vm) => vm.shutdown(self).await,
+                None => continue,
+            };
+            if let Err(error) = result {
                 failures.push(error.to_string());
             }
         }
-
         if failures.is_empty() {
             Ok(())
         } else {
             Err(LifecycleError::Shutdown(failures))
-        }
-    }
-}
-
-impl BarbirolliVm {
-    async fn shutdown(&self, barbirolli: &Barbirolli) -> Result<()> {
-        match self {
-            BarbirolliVm::Discovered(vm_spec) => Ok(()),
-            BarbirolliVm::Failed(spec) => {
-                spec.reconcile(&spec, &self.firecracker).await?;
-                *self = BarbirolliVm::Discovered(spec.clone());
-                Ok(())
-            }
-            BarbirolliVm::Managed(managed) => {
-                tracing::info!(
-                    vm_id = %managed.spec.id,
-                    user = %managed.spec.user,
-                    operation = "shutdown",
-                    status = "shutting_down",
-                    "VM state transition"
-                );
-                match (managed.shutdown().await, managed.cleanup().await) {
-                    (Ok(()), Ok(())) => {
-                        tracing::info!(
-                            vm_id = %managed.spec.id,
-                            user = %managed.spec.user,
-                            operation = "shutdown",
-                            status = "discovered",
-                            "VM state transition"
-                        );
-                        *self = BarbirolliVm::Discovered(managed.spec);
-                        Ok(())
-                    }
-                    (shutdown, cleanup) => {
-                        managed.failed = true;
-                        tracing::error!(
-                            vm_id = %managed.spec.id,
-                            user = %managed.spec.user,
-                            operation = "shutdown",
-                            status = "failed",
-                            "VM shutdown failed"
-                        );
-                        Err(crate::managed::LifecycleError::ShutdownCleanup {
-                            shutdown: shutdown.err().map(Box::new),
-                            cleanup: cleanup.err().map(Box::new),
-                        }
-                        .into())
-                    }
-                }
-            }
         }
     }
 }
@@ -304,7 +261,7 @@ pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathB
         .arg("--version")
         .output()
         .await
-        .map_err(|error| LifecycleError::UnsupportedFirecracker(error.to_string()))?;
+        .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
     let version = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr).trim().to_owned()
     } else {
@@ -313,7 +270,73 @@ pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathB
     if output.status.success() && version.starts_with("Firecracker v1.13.") {
         Ok(firecracker)
     } else {
-        Err(LifecycleError::UnsupportedFirecracker(version))
+        Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+    }
+}
+
+impl BarbirolliVm {
+    fn spec(&self) -> &VmSpec {
+        match self {
+            Self::Discovered(spec) | Self::Failed(spec) => spec,
+            Self::Managed(vm) => &vm.spec,
+        }
+    }
+
+    fn status(&self) -> VmStatus {
+        match self {
+            Self::Discovered(_) => VmStatus::Discovered,
+            Self::Failed(_) => VmStatus::Failed,
+            Self::Managed(vm) if vm.failed => VmStatus::Failed,
+            Self::Managed(_) => VmStatus::Running,
+        }
+    }
+
+    async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+        match self {
+            Self::Discovered(_) => Ok(()),
+            Self::Failed(spec) => {
+                spec.reconcile(barbirolli).await?;
+                *self = Self::Discovered(spec.clone());
+                Ok(())
+            }
+            Self::Managed(managed) => {
+                tracing::info!(
+                    vm_id = %managed.spec.id,
+                    user = %managed.spec.user,
+                    operation = "shutdown",
+                    status = "shutting_down",
+                    "VM state transition"
+                );
+                let shutdown = managed.shutdown(barbirolli.shutdown_timeout).await;
+                let cleanup = managed.cleanup().await;
+                if shutdown.is_ok() && cleanup.is_ok() {
+                    let spec = managed.spec.clone();
+                    tracing::info!(
+                        vm_id = %spec.id,
+                        user = %spec.user,
+                        operation = "shutdown",
+                        status = "discovered",
+                        "VM state transition"
+                    );
+                    *self = Self::Discovered(spec);
+                    Ok(())
+                } else {
+                    managed.failed = true;
+                    tracing::error!(
+                        vm_id = %managed.spec.id,
+                        user = %managed.spec.user,
+                        operation = "shutdown",
+                        status = "failed",
+                        "VM shutdown failed"
+                    );
+                    Err(ManagedLifecycleError::ShutdownCleanup {
+                        shutdown: shutdown.err().map(Box::new),
+                        cleanup: cleanup.err().map(Box::new),
+                    }
+                    .into())
+                }
+            }
+        }
     }
 }
 
@@ -331,9 +354,8 @@ pub enum LifecycleError {
         operation: &'static str,
         status: VmStatus,
     },
-
     #[error(transparent)]
-    Vm(#[from] LifecycleError),
+    Vm(#[from] ManagedLifecycleError),
     #[error("warmup reconciliation failed: {0:?}")]
     Warmup(Vec<String>),
     #[error("application shutdown failed: {0:?}")]

@@ -63,7 +63,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                     std::env::var_os("BARBIROLLI_LIMA_GUEST").is_some();
                 if run_on_lima && !already_in_lima {
                     let instance = std::env::var("LIMA_INSTANCE")
-                        .unwrap_or_else(|_| "default".to_owned());
+                        .unwrap_or_else(|_| "mvm".to_owned());
                     let current_dir = std::env::current_dir()
                         .expect("the current directory is required to run the test in Lima");
                     let status = std::process::Command::new("limactl")

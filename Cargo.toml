@@ -14,9 +14,9 @@ keywords.workspace = true
 edition.workspace = true
 
 [features]
-default = ["linux"]
+default = []
 local = ["elhone/local", "meier/local"]
-linux = ["elhone/linux"]
+linux = ["barbirolli/linux", "elhone/linux"]
 
 [workspace.dependencies]
 axum = "0.8.8"
@@ -41,8 +41,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dependencies]
 axum.workspace = true
+barbirolli = { workspace = true, default-features = false }
 elhone = { path = "crates/elhone", default-features = false }
-barbirolli.workspace = true
 meier = { path = "crates/meier" }
 tokio.workspace = true
 tracing.workspace = true

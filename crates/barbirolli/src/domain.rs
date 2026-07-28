@@ -1,51 +1,34 @@
-use std::{
-    fmt::{self, Display},
-    path::PathBuf,
-    str::FromStr,
-};
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct InterfaceName(String);
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+impl FromStr for InterfaceName {
+    type Err = ParseValueError;
 
-use crate::NetworkSpec;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VmInput {
-    pub user: UserName,
-    pub vcpu_count: VcpuCount,
-    pub memory_mib: MemoryMib,
-    pub kernel: ArtifactName,
-    pub rootfs: ArtifactName,
-    #[serde(default)]
-    pub authorized_keys: Vec<AuthorizedKey>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VmSpec {
-    pub id: VmId,
-    pub user: UserName,
-    pub artifact_dir: PathBuf,
-    pub kernel: PathBuf,
-    pub rootfs: PathBuf,
-    pub vcpu_count: VcpuCount,
-    pub memory_mib: MemoryMib,
-    pub network: NetworkSpec,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid {kind}: {value:?}")]
-pub struct ParseValueError {
-    kind: &'static str,
-    value: String,
-}
-
-impl ParseValueError {
-    pub(crate) fn new(kind: &'static str, value: impl Into<String>) -> Self {
-        Self {
-            kind,
-            value: value.into(),
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let valid = !value.is_empty()
+            && value.len() <= 15
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
+        if valid {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ParseValueError::new("network interface", value))
         }
+    }
+}
+
+impl Display for InterfaceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl AsRef<str> for InterfaceName {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -328,5 +311,21 @@ impl<'de> Deserialize<'de> for MemoryMib {
 impl Display for MemoryMib {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid {kind}: {value:?}")]
+pub struct ParseValueError {
+    kind: &'static str,
+    value: String,
+}
+
+impl ParseValueError {
+    pub(crate) fn new(kind: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            kind,
+            value: value.into(),
+        }
     }
 }

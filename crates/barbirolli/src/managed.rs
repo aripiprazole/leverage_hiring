@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use fctools::{
     process_spawner::DirectProcessSpawner,
@@ -38,26 +38,80 @@ pub struct ManagedVm {
 }
 
 impl VmSpec {
-    async fn prepare_vm(&self, barbirolli: Barbirolli) -> Result<FirecrackerVm> {
+    async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm, LifecycleError> {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
             TokioRuntime,
             VmmOwnershipModel::Shared,
             2,
         );
-        let configuration = vm_configuration(&mut resources, self.spec)?;
-        let arguments = VmmArguments::new(VmmApiSocket::Enabled(
-            self.spec.network.api_socket().to_owned(),
-        ));
+        let configuration = vm_configuration(&mut resources, self)?;
+        let arguments = VmmArguments::new(VmmApiSocket::Enabled(barbirolli.api_socket.clone()));
         let executor = UnrestrictedVmmExecutor::new(arguments)
-            .id(VmmId::new(format!("barbirolli-{}", self.spec.vm_id))?);
+            .id(VmmId::new(format!("barbirolli-{}", self.id))?);
         let installation = VmmInstallation::new(
             barbirolli.firecracker.clone(),
             barbirolli.firecracker.clone(),
-            barbirolli.firecracker,
+            barbirolli.firecracker.clone(),
         );
 
         Ok(FirecrackerVm::prepare(executor, resources, installation, configuration).await?)
+    }
+
+    pub(crate) async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<(), LifecycleError> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.kill_stale_processes(barbirolli).await {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = self.network.cleanup_stale().await {
+            failures.push(error.to_string());
+        }
+        match std::fs::remove_file(&barbirolli.api_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(error.to_string()),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(LifecycleError::Reconcile(failures))
+        }
+    }
+
+    async fn kill_stale_processes(&self, barbirolli: &Barbirolli) -> Result<(), std::io::Error> {
+        let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
+        let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
+        let mut proc = tokio::fs::read_dir("/proc").await?;
+        while let Some(entry) = proc.next_entry().await? {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
+                Ok(command) => command,
+                Err(_) => continue,
+            };
+            let arguments = command
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .collect::<Vec<_>>();
+            let is_firecracker = arguments
+                .first()
+                .is_some_and(|argument| *argument == expected_firecracker);
+            let has_socket = arguments
+                .windows(2)
+                .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
+            if is_firecracker
+                && has_socket
+                && let Some(pid) = rustix::process::Pid::from_raw(pid)
+            {
+                rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -103,8 +157,8 @@ fn vm_configuration(
             cpu_template: None,
             network_interfaces: vec![NetworkInterface {
                 iface_id: "eth0".into(),
-                host_dev_name: spec.network.tap_name().as_ref().to_owned(),
-                guest_mac: Some(spec.network.guest_mac().to_owned()),
+                host_dev_name: spec.network.tap.as_ref().to_owned(),
+                guest_mac: Some(spec.network.guest_mac.to_owned()),
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             }],
@@ -122,36 +176,52 @@ async fn rollback_vm(
     vm: &mut FirecrackerVm,
     shutdown_timeout: Duration,
 ) -> Result<(), LifecycleError> {
-    match vm.get_state() {
-        VmState::NotStarted => {}
-        VmState::Running | VmState::Paused => {
-            vm.shutdown([VmShutdownAction {
+    let shutdown = match vm.get_state() {
+        VmState::NotStarted | VmState::Exited | VmState::Crashed(_) => Ok(()),
+        VmState::Running | VmState::Paused => vm
+            .shutdown([VmShutdownAction {
                 method: VmShutdownMethod::Kill,
                 timeout: Some(shutdown_timeout),
                 graceful: false,
             }])
-            .await?;
-        }
-        VmState::Exited | VmState::Crashed(_) => {}
+            .await
+            .map(|_| ())
+            .map_err(LifecycleError::from),
+    };
+    let cleanup = vm.cleanup().await.map_err(LifecycleError::from);
+    match (shutdown, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(shutdown), Err(cleanup)) => Err(LifecycleError::ShutdownCleanup {
+            shutdown: Some(Box::new(shutdown)),
+            cleanup: Some(Box::new(cleanup)),
+        }),
     }
-    vm.cleanup().await?;
-    Ok(())
 }
 
 impl ManagedVm {
-    pub async fn start(spec: VmSpec, barbirolli: Barbirolli) -> Result<Self, LifecycleError> {
+    pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self, LifecycleError> {
         let network = spec.network.prepare().await?;
-        let mut vm = map_prepare_vm(spec.prepare_vm(barbirolli).await).await?;
+        let mut vm = match spec.prepare_vm(barbirolli).await {
+            Ok(vm) => vm,
+            Err(startup) => {
+                return Err(LifecycleError::StartupRollback {
+                    startup_error: Box::new(startup),
+                    vm_rollback_error: None,
+                    network_rollback_error: network.cleanup().await.err().map(Box::new),
+                });
+            }
+        };
 
-        match vm.start(spec.api_socket_timeout).await {
+        match vm.start(barbirolli.api_socket_timeout).await {
             Ok(()) => Ok(Self {
                 spec,
                 vm,
                 network: Some(network),
                 failed: false,
             }),
-            Err(err) => Err(LifecycleError::StartupRollback {
-                startup_error: Box::new(err.into()),
+            Err(error) => Err(LifecycleError::StartupRollback {
+                startup_error: Box::new(error.into()),
                 vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
                     .await
                     .err()
@@ -161,7 +231,7 @@ impl ManagedVm {
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), LifecycleError> {
+    pub async fn shutdown(&mut self, shutdown_timeout: Duration) -> Result<(), LifecycleError> {
         self.vm
             .shutdown([
                 VmShutdownAction {
@@ -170,17 +240,17 @@ impl ManagedVm {
                     } else {
                         VmShutdownMethod::WriteToSerial(b"reboot\n".to_vec())
                     },
-                    timeout: Some(self.shutdown_timeout),
+                    timeout: Some(shutdown_timeout),
                     graceful: true,
                 },
                 VmShutdownAction {
                     method: VmShutdownMethod::PauseThenKill,
-                    timeout: Some(self.shutdown_timeout / 2),
+                    timeout: Some(shutdown_timeout / 2),
                     graceful: false,
                 },
                 VmShutdownAction {
                     method: VmShutdownMethod::Kill,
-                    timeout: Some(self.shutdown_timeout / 2),
+                    timeout: Some(shutdown_timeout / 2),
                     graceful: false,
                 },
             ])
@@ -206,83 +276,6 @@ impl ManagedVm {
                 vm: Some(Box::new(vm)),
                 network: Some(Box::new(network)),
             }),
-        }
-    }
-
-    pub async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<(), LifecycleError> {
-        let mut failures = Vec::new();
-        if let Err(error) = self.kill_stale_processes(barbirolli).await {
-            failures.push(error.to_string());
-        }
-        if let Err(error) = self.spec.network.cleanup_stale().await {
-            failures.push(error.to_string());
-        }
-        match std::fs::remove_file(barbirolli.api_socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(error.to_string()),
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(LifecycleError::Reconcile(failures))
-        }
-    }
-
-    pub async fn kill_stale_processes(
-        &self,
-        barbirolli: &Barbirolli,
-    ) -> Result<(), std::io::Error> {
-        let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
-        let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
-        let mut proc = tokio::fs::read_dir("/proc").await?;
-        while let Some(entry) = proc.next_entry().await? {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
-                Ok(command) => command,
-                Err(_) => continue,
-            };
-            let arguments = command
-                .split(|byte| *byte == 0)
-                .filter(|argument| !argument.is_empty())
-                .collect::<Vec<_>>();
-            let is_firecracker = arguments
-                .first()
-                .is_some_and(|argument| *argument == expected_firecracker);
-            let has_socket = arguments
-                .windows(2)
-                .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
-            if is_firecracker
-                && has_socket
-                && let Some(pid) = rustix::process::Pid::from_raw(pid)
-            {
-                rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn mark_failed(&mut self) {
-        self.failed = true;
-    }
-}
-
-async fn map_prepare_vm(vm: Result<FirecrackerVm>) -> Result<FirecrackerVm> {
-    match vm.await {
-        Ok(vm) => vm,
-        Err(startup) => {
-            let network_rollback = network.cleanup().await.err().map(Box::new);
-            return Err(LifecycleError::StartupRollback {
-                startup_error: Box::new(startup),
-                vm_rollback_error: None,
-                network_rollback_error: network_rollback,
-            });
         }
     }
 }

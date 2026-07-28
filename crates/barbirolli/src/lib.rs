@@ -1,10 +1,18 @@
+#[cfg(feature = "linux")]
 mod lifecycle;
 #[cfg(feature = "linux")]
 mod managed;
+#[cfg(feature = "linux")]
 mod network;
+#[cfg(feature = "linux")]
 mod storage;
+#[cfg(feature = "linux")]
 mod vm;
 
+#[cfg(not(feature = "linux"))]
+mod macos;
+
+#[cfg(feature = "linux")]
 pub mod test_support {
     use std::sync::{
         Mutex, MutexGuard,
@@ -28,10 +36,17 @@ pub mod test_support {
     }
 }
 
+#[cfg(feature = "linux")]
 pub use lifecycle::{Barbirolli, LifecycleError, VmStatus, VmSummary};
+#[cfg(feature = "linux")]
 pub use network::{InterfaceName, NetworkSpec};
+#[cfg(feature = "linux")]
 pub use storage::{StorageError, VmStore};
+#[cfg(feature = "linux")]
 pub use vm::{
     ArtifactName, AuthorizedKey, MemoryMib, ParseValueError, UserName, VcpuCount, VmId, VmInput,
     VmSpec,
 };
+
+#[cfg(not(feature = "linux"))]
+pub use macos::*;

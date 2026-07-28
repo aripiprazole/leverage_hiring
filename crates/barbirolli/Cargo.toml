@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["linux"]
-linux = ["dep:fctools", "dep:nlink", "dep:rustix"]
+default = []
+linux = ["dep:dashmap", "dep:derive_more", "dep:fctools", "dep:nlink", "dep:rustix", "dep:serde_json", "dep:tempfile", "dep:tokio", "dep:tracing"]
 
 [dependencies]
-dashmap.workspace = true
+dashmap = { workspace = true, optional = true }
+derive_more = { version = "2.1.1", features = ["full"], optional = true }
 fctools = { workspace = true, features = [
     "direct-process-spawner",
     "tokio-runtime",
@@ -19,13 +20,14 @@ fctools = { workspace = true, features = [
 nlink = { workspace = true, features = ["tuntap"], optional = true }
 rustix = { version = "1.0.5", default-features = false, features = ["process"], optional = true }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, optional = true }
 ssh-key.workspace = true
-derive_more = { version = "2.1.1", features = ["full"] }
-tempfile.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 barbirolli_derive.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

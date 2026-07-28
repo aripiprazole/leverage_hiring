@@ -1,14 +1,14 @@
 use std::{
     collections::HashSet,
     fs::{
-        Metadata, canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
+        canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
+        symlink_metadata,
     },
     io,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 
 use crate::{ArtifactName, AuthorizedKey, NetworkSpec, UserName, VmId, VmInput, VmSpec};
 
@@ -17,7 +17,7 @@ const SOCKET_DIRECTORY: &str = ".sockets";
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VmStore {
     pub vm_root: VmRootFolder,
     pub image_root: PathBuf,
@@ -26,7 +26,7 @@ pub struct VmStore {
 
 #[derive(Debug)]
 pub struct VmRootFolder {
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     paths: std::vec::IntoIter<PathDescriptor>,
 }
 
@@ -63,8 +63,13 @@ impl VmStore {
         if !socket_dir.exists() {
             create_dir(&socket_dir).map_err(|error| StorageError::io(&socket_dir, error))?;
         }
-        if !socket_dir.is_dir() {
-            return Err(StorageError::io(&socket_dir, error));
+        let socket_metadata =
+            symlink_metadata(&socket_dir).map_err(|error| StorageError::io(&socket_dir, error))?;
+        if !socket_metadata.file_type().is_dir() {
+            return Err(StorageError::InvalidConfig {
+                path: socket_dir,
+                message: "socket path must be a real directory".to_owned(),
+            });
         }
         Ok(Self {
             vm_root: VmRootFolder::new(vm_root)?,
@@ -81,36 +86,36 @@ impl VmStore {
             return Err(StorageError::DuplicateUser(input.user));
         }
 
-        let source_kernel = self.resolve_artifact(&input.kernel).await?;
-        let source_rootfs = self.resolve_artifact(&input.rootfs).await?;
+        let source_kernel = self.resolve_artifact(&input.kernel)?;
+        let source_rootfs = self.resolve_artifact(&input.rootfs)?;
 
         let tmp = tempfile::Builder::new()
             .prefix(".creating-")
-            .tempdir_in(&self.vm_root)
-            .map_err(|error| StorageError::io(&self.vm_root, error))?;
+            .tempdir_in(&self.vm_root.dir)
+            .map_err(|error| StorageError::io(&self.vm_root.dir, error))?;
 
         let kernel = tmp.path().join("vmlinux");
         let rootfs = tmp.path().join("rootfs.ext4");
 
         copy(&source_kernel, &kernel).map_err(|error| StorageError::io(&kernel, error))?;
         copy(&source_rootfs, &rootfs).map_err(|error| StorageError::io(&rootfs, error))?;
-        self.write_authorized_keys(tmp.path(), &input.authorized_keys)
-            .await?;
+        self.write_authorized_keys(tmp.path(), &input.authorized_keys)?;
 
+        let id = self.vm_root.next_id()?;
         let persisted = PersistedVmSpec::new(VmSpec {
-            id: self.vm_root.next_id()?,
+            id,
             user: input.user,
             artifact_dir: final_dir.clone(),
             kernel: final_dir.join("vmlinux"),
             rootfs: final_dir.join("rootfs.ext4"),
             vcpu_count: input.vcpu_count,
             memory_mib: input.memory_mib,
-            network: NetworkSpec::new(vm_id)
+            network: NetworkSpec::new(id)
                 .map_err(|error| StorageError::InvalidInput(error.to_string()))?,
         });
-        persisted.write_into(tmp.join("config.json"))?;
-        rename(tmp, &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
-        tracing::info!(vm_id = %persisted.spec.id, user = %persisted.user, operation = "create", "VM state transition");
+        persisted.write_into(tmp.path().join("config.json"))?;
+        rename(tmp.path(), &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
+        tracing::info!(vm_id = %persisted.spec.id, user = %persisted.spec.user, operation = "create", "VM state transition");
         Ok(persisted.spec)
     }
 
@@ -164,8 +169,12 @@ impl PersistedVmSpec {
     }
 
     pub fn write_into(&self, path: PathBuf) -> Result<()> {
-        std::fs::write(&path, serde_json::to_vec_pretty(&self)?)
-            .map_err(|error| StorageError::io(&config_path, error))?;
+        let contents =
+            serde_json::to_vec_pretty(&self).map_err(|error| StorageError::InvalidConfig {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        std::fs::write(&path, contents).map_err(|error| StorageError::io(&path, error))?;
         Ok(())
     }
 }
@@ -193,8 +202,9 @@ impl PathDescriptor {
             return Err(StorageError::SocketDirectory);
         }
         if name.as_encoded_bytes().starts_with(".creating-".as_bytes()) {
-            tracing::warn!(path = %path.display(), "removing stale VM creation directory");
-            remove_dir_all(&path).map_err(|error| StorageError::io(&path, error))?;
+            tracing::warn!(path = %self.directory.display(), "removing stale VM creation directory");
+            remove_dir_all(&self.directory)
+                .map_err(|error| StorageError::io(&self.directory, error))?;
             return Err(StorageError::CreatingDirectory);
         }
         Ok(name.to_string_lossy().into_owned())
@@ -240,7 +250,10 @@ impl VmRootFolderItem {
         }
         for required in ["vmlinux", "rootfs.ext4", "authorized_keys"] {
             let path = directory.join(required);
-            if !path.is_file() {
+            let is_file = symlink_metadata(&path)
+                .map(|metadata| metadata.file_type().is_file())
+                .unwrap_or(false);
+            if !is_file {
                 return Err(StorageError::InvalidConfig {
                     path,
                     message: "required artifact must be a real file".to_owned(),
@@ -254,12 +267,14 @@ impl VmRootFolderItem {
 impl VmRootFolder {
     pub fn new(vm_root: impl AsRef<Path>) -> Result<Self> {
         let vm_root = vm_root.as_ref();
-        let directory = read_dir(vm_ & root).map_err(|error| StorageError::io(&vm_root, error))?;
+        let directory = read_dir(vm_root).map_err(|error| StorageError::io(vm_root, error))?;
         let mut paths = Vec::new();
         for entry in directory {
-            let entry = entry.map_err(|error| StorageError::io(&vm_root, error))?;
+            let entry = entry.map_err(|error| StorageError::io(vm_root, error))?;
             let directory = entry.path();
-            if !directory.is_dir() {
+            let metadata = symlink_metadata(&directory)
+                .map_err(|error| StorageError::io(&directory, error))?;
+            if !metadata.file_type().is_dir() {
                 return Err(StorageError::InvalidConfig {
                     path: directory,
                     message: "VM entry must be a real directory".to_owned(),
@@ -277,11 +292,13 @@ impl VmRootFolder {
     }
 
     fn next_id(&self) -> Result<VmId> {
-        let next_id = u16::try_from(discovered.len())
-            .ok()
-            .and_then(|id| id.checked_add(1))
-            .ok_or(StorageError::IdsExhausted)?;
-        Ok(VmId(next_id))
+        let occupied = VmRootFolder::new(&self.dir)?
+            .map(|item| item.map(|item| item.persisted_spec.spec.id))
+            .collect::<Result<HashSet<_>>>()?;
+        (0..=16_383)
+            .map(|id| VmId::try_from(id).expect("the VM ID range is valid"))
+            .find(|id| !occupied.contains(id))
+            .ok_or(StorageError::IdsExhausted)
     }
 
     fn next_item(&mut self) -> Result<Option<VmRootFolderItem>> {
@@ -308,12 +325,14 @@ impl VmRootFolder {
                 });
             }
 
-            return Ok(Some(VmRootFolderItem {
+            let item = VmRootFolderItem {
                 directory: descriptor.directory,
                 config: descriptor.config,
                 name,
                 persisted_spec: spec,
-            }));
+            };
+            item.verify()?;
+            return Ok(Some(item));
         }
     }
 }

@@ -1,13 +1,11 @@
 use std::{
     fmt::{self, Display},
     net::Ipv4Addr,
-    path::PathBuf,
     str::FromStr,
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "linux")]
 use nlink::{
     netlink::{
         Connection, Nftables, Route,
@@ -25,20 +23,17 @@ const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
 pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
 
-#[cfg(feature = "linux")]
 pub struct ManagedNetwork {
     spec: NetworkSpec,
     table: String,
 }
 
-#[cfg(feature = "linux")]
 impl ManagedNetwork {
     pub async fn cleanup(&self) -> Result<()> {
         self.spec.cleanup(&self.table).await
     }
 }
 
-#[cfg(any(feature = "linux", test))]
 #[derive(Clone, Copy)]
 struct DefaultRouteCandidate {
     is_ipv4: bool,
@@ -50,12 +45,12 @@ struct DefaultRouteCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkSpec {
-    vm_id: VmId,
-    tap: InterfaceName,
-    subnet: Ipv4Addr,
-    host_ip: Ipv4Addr,
-    guest_ip: Ipv4Addr,
-    guest_mac: String,
+    pub vm_id: VmId,
+    pub tap: InterfaceName,
+    pub subnet: Ipv4Addr,
+    pub host_ip: Ipv4Addr,
+    pub guest_ip: Ipv4Addr,
+    pub guest_mac: String,
 }
 
 impl NetworkSpec {
@@ -94,21 +89,20 @@ impl NetworkSpec {
         host: &InterfaceName,
         table: &str,
     ) -> Result<()> {
-        let tap = route_conn
-            .get_link_by_name(spec.tap_name().as_ref())
+        let tap = route
+            .get_link_by_name(self.tap.as_ref())
             .await?
-            .ok_or_else(|| NetworkError::InterfaceNotFound(spec.tap_name.to_string()))?;
-        route_conn
-            .add_address_by_index(tap.ifindex(), spec.host_ip().into(), NETWORK_PREFIX)
+            .ok_or_else(|| NetworkError::InterfaceNotFound(self.tap.to_string()))?;
+        route
+            .add_address_by_index(tap.ifindex(), self.host_ip.into(), NETWORK_PREFIX)
             .await?;
-        route_conn.set_link_up_by_index(tap.ifindex()).await?;
+        route.set_link_up_by_index(tap.ifindex()).await?;
         tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await?;
-        self.install_rules(&nftables_conn, &host, &table).await
+        self.install_rules(nftables_conn, host, table).await
     }
 
-    #[cfg(feature = "linux")]
     pub async fn prepare(&self) -> Result<ManagedNetwork> {
-        let table = format!("fc_vm_{}", spec.vm_id);
+        let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
         ensure_pool_available(&route_conn).await?;
@@ -138,20 +132,23 @@ impl NetworkSpec {
         nftables_conn
             .del_table_if_exists(table.as_str(), Family::Ip)
             .await?;
-        route_conn.del_link_if_exists(&self.tap).await?;
+        route_conn.del_link_if_exists(self.tap.as_ref()).await?;
 
         TunTap::builder()
-            .name(&self.tap)
+            .name(self.tap.as_ref())
             .mode(Mode::Tap)
             .create_persistent()?;
 
-        match self.setup(&route_conn, &nftables_conn, &host, &table) {
+        match self.setup(&route_conn, &nftables_conn, &host, &table).await {
             Ok(()) => Ok(ManagedNetwork {
-                spec: spec.clone(),
+                spec: self.clone(),
                 table,
             }),
             Err(err) => {
-                match cleanup_with_connections(&route_conn, &nftables_conn, spec, &table).await {
+                match self
+                    .cleanup_with_connections(&route_conn, &nftables_conn, &table)
+                    .await
+                {
                     Ok(()) => Err(err),
                     Err(rollback) => Err(NetworkError::SetupRollback {
                         setup: Box::new(err),
@@ -162,7 +159,6 @@ impl NetworkSpec {
         }
     }
 
-    #[cfg(feature = "linux")]
     async fn cleanup_with_connections(
         &self,
         route: &Connection<Route>,
@@ -175,7 +171,7 @@ impl NetworkSpec {
             .map(|_| ())
             .map_err(NetworkError::from);
         let tap = route
-            .del_link_if_exists(&self.tap)
+            .del_link_if_exists(self.tap.as_ref())
             .await
             .map(|_| ())
             .map_err(NetworkError::from);
@@ -188,7 +184,6 @@ impl NetworkSpec {
         }
     }
 
-    #[cfg(feature = "linux")]
     async fn cleanup(&self, table: &str) -> Result<(), NetworkError> {
         let nftables = match Connection::<Nftables>::new() {
             Ok(connection) => connection
@@ -200,7 +195,7 @@ impl NetworkSpec {
         };
         let tap = match Connection::<Route>::new() {
             Ok(connection) => connection
-                .del_link_if_exists(&self.tap)
+                .del_link_if_exists(self.tap.as_ref())
                 .await
                 .map(|_| ())
                 .map_err(NetworkError::from),
@@ -216,7 +211,7 @@ impl NetworkSpec {
     }
 
     pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
-        self.cleanup(&format!("fc_vm_{}", spec.vm_id)).await
+        self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
     }
 
     async fn install_rules(
@@ -239,24 +234,24 @@ impl NetworkSpec {
             .policy(Policy::Accept);
         let isolate = Rule::new(table, "forward")
             .family(Family::Ip)
-            .match_iif(spec.tap_name().as_ref())
+            .match_iif(self.tap.as_ref())
             .match_daddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
             .drop()
             .comment("vm-isolation");
         let outbound = Rule::new(table, "forward")
             .family(Family::Ip)
-            .match_iif(spec.tap_name().as_ref())
+            .match_iif(self.tap.as_ref())
             .match_oif(host.as_ref())
             .accept();
         let established = Rule::new(table, "forward")
             .family(Family::Ip)
             .match_iif(host.as_ref())
-            .match_oif(spec.tap_name().as_ref())
+            .match_oif(self.tap.as_ref())
             .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
             .accept();
         let masquerade = Rule::new(table, "postrouting")
             .family(Family::Ip)
-            .match_saddr_v4(spec.subnet(), NETWORK_PREFIX)
+            .match_saddr_v4(self.subnet, NETWORK_PREFIX)
             .match_oif(host.as_ref())
             .masquerade();
 
@@ -274,7 +269,6 @@ impl NetworkSpec {
     }
 }
 
-#[cfg(any(feature = "linux", test))]
 fn select_default_route(routes: &[DefaultRouteCandidate]) -> Option<u32> {
     routes
         .iter()
@@ -288,7 +282,6 @@ fn select_default_route(routes: &[DefaultRouteCandidate]) -> Option<u32> {
         .map(|(_, interface)| interface)
 }
 
-#[cfg(feature = "linux")]
 async fn ensure_pool_available(connection: &Connection<Route>) -> Result<(), NetworkError> {
     for route in connection.get_routes().await? {
         let Some(std::net::IpAddr::V4(destination)) = route.destination() else {
@@ -315,7 +308,6 @@ async fn ensure_pool_available(connection: &Connection<Route>) -> Result<(), Net
     Ok(())
 }
 
-#[cfg(any(feature = "linux", test))]
 fn overlaps_vm_pool(destination: Ipv4Addr, prefix: u8) -> bool {
     let mask = if prefix == 0 {
         0
@@ -363,13 +355,12 @@ impl AsRef<str> for InterfaceName {
     }
 }
 
-#[cfg(feature = "linux")]
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {
     #[error("no IPv4 default route with an output interface exists in the main routing table")]
     MissingDefaultRoute,
     #[error("failed to parse tap name: {0}")]
-    ParseValueError(ParseValueError),
+    ParseValueError(#[from] ParseValueError),
     #[error("network interface {0:?} was not found")]
     InterfaceNotFound(String),
     #[error("172.16.0.0/16 overlaps existing host route {0}")]
