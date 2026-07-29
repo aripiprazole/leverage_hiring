@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-linux = ["dep:dashmap", "dep:fctools", "dep:nlink", "dep:rustix", "dep:serde_json", "dep:tempfile", "dep:tokio", "dep:tracing"]
+linux = ["dep:dashmap", "dep:fctools", "dep:loopdev", "dep:nlink", "dep:rustix", "dep:serde_json", "dep:tempfile", "dep:tokio", "dep:tracing"]
 
 [dependencies]
 dashmap = { workspace = true, optional = true }
@@ -18,7 +18,7 @@ fctools = { workspace = true, features = [
     "vm",
 ], optional = true }
 nlink = { workspace = true, features = ["tuntap"], optional = true }
-rustix = { version = "1.0.5", default-features = false, features = ["process"], optional = true }
+rustix = { version = "1.0.5", default-features = false, features = ["mount", "process"], optional = true }
 serde.workspace = true
 nonempty-collections.workspace = true
 serde_json = { workspace = true, optional = true }
@@ -28,6 +28,9 @@ thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 validated.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+loopdev = { package = "loopdev-3", version = "0.5.3", optional = true }
 
 [dev-dependencies]
 barbirolli_derive.workspace = true

@@ -2,6 +2,9 @@ use std::{
     fs,
     net::Ipv4Addr,
     os::unix::{fs::PermissionsExt, net::UnixStream},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use barbirolli::{
@@ -238,7 +241,25 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         Err(LifecycleError::NotFound(id)) if id == missing
     ));
 
-    manager.delete(id).await.expect("failed to delete VM");
+    let (delete_result_tx, delete_result_rx) = mpsc::sync_channel(1);
+    let delete_manager = manager.clone();
+    let delete_thread = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create DELETE test runtime");
+        let result = runtime
+            .block_on(delete_manager.delete(id))
+            .map_err(|error| error.to_string());
+        delete_result_tx
+            .send(result)
+            .expect("DELETE test receiver dropped");
+    });
+    delete_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("VM deletion deadlocked")
+        .expect("failed to delete VM");
+    delete_thread.join().expect("VM deletion thread panicked");
     assert!(manager.list().await.is_empty());
     manager
         .shutdown()

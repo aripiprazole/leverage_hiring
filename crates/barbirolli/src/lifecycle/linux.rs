@@ -14,7 +14,10 @@ use std::{
 
 use dashmap::{
     DashMap,
-    mapref::one::{Ref, RefMut},
+    mapref::{
+        entry::Entry,
+        one::{Ref, RefMut},
+    },
 };
 use nonempty_collections::NEVec;
 use validated::Validated;
@@ -149,11 +152,13 @@ impl Barbirolli {
     #[tracing::instrument(skip(self), fields(%vm_id), err)]
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.accepting_operations()?;
-        let mut vm = self.vm_mut(vm_id)?;
-        Box::pin(vm.shutdown(self)).await?;
-        let spec = vm.spec();
-        self.store.delete(spec)?;
-        self.vms.remove(&vm_id);
+        let Entry::Occupied(mut vm) = self.vms.entry(vm_id) else {
+            return Err(LifecycleError::NotFound(vm_id));
+        };
+        Box::pin(vm.get_mut().shutdown(self)).await?;
+        let spec = vm.get().spec().clone();
+        self.store.delete(&spec)?;
+        vm.remove();
         tracing::info!(
             vm_id = %spec.id,
             user = %spec.user,
