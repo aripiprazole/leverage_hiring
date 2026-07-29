@@ -49,7 +49,7 @@ pub struct Observation {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct IdleTracker {
+pub struct Monitor {
     pub last_sample: Sample,
     pub last_activity: Instant,
     pub strikes: u8,
@@ -63,7 +63,7 @@ impl IdlePolicy {
     }
 }
 
-impl IdleTracker {
+impl Monitor {
     pub fn new(sample: Sample, policy: IdlePolicy) -> Self {
         Self {
             last_sample: sample,
@@ -190,20 +190,20 @@ mod tests {
     fn fixed_timeline_reaches_shutdown() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let mut tracker = IdleTracker::new(sample(origin, 0, 0), policy);
+        let mut monitor = Monitor::new(sample(origin, 0, 0), policy);
         assert_eq!(
-            tracker.observe(sample(origin, 300, 0), policy).0,
+            monitor.observe(sample(origin, 300, 0), policy).0,
             IdleDecision::Strike(1)
         );
         assert_eq!(
-            tracker.observe(sample(origin, 360, 0), policy).0,
+            monitor.observe(sample(origin, 360, 0), policy).0,
             IdleDecision::Strike(2)
         );
         assert_eq!(
-            tracker.observe(sample(origin, 420, 0), policy).0,
+            monitor.observe(sample(origin, 420, 0), policy).0,
             IdleDecision::Strike(3)
         );
-        let observation = tracker.observation(sample(origin, 450, 0), policy);
+        let observation = monitor.observation(sample(origin, 450, 0), policy);
         assert_eq!(observation.decision, IdleDecision::Shutdown);
         assert_eq!(
             observation.sample.sampled_at,
@@ -216,19 +216,19 @@ mod tests {
     fn activity_resets_but_memory_does_not() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let mut tracker = IdleTracker::new(sample(origin, 0, 0), policy);
-        tracker.observe(sample(origin, 300, 0), policy);
+        let mut monitor = Monitor::new(sample(origin, 0, 0), policy);
+        monitor.observe(sample(origin, 300, 0), policy);
         let mut memory = sample(origin, 301, 0);
         memory.memory_bytes = 200;
-        assert_eq!(tracker.observe(memory, policy).0, IdleDecision::None);
+        assert_eq!(monitor.observe(memory, policy).0, IdleDecision::None);
         let mut traffic = sample(origin, 302, 0);
         traffic.memory_bytes = 200;
         traffic.network_bytes = 1;
         assert_eq!(
-            tracker.observe(traffic, policy).0,
+            monitor.observe(traffic, policy).0,
             IdleDecision::ActivityReset
         );
-        assert_eq!(tracker.strikes, 0);
+        assert_eq!(monitor.strikes, 0);
     }
 
     #[test]

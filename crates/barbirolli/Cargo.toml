@@ -21,6 +21,7 @@ fctools = { workspace = true, features = [
     "unrestricted-vmm-executor",
     "vm",
     "metrics-extension",
+    "rustix-syscall-backend",
 ]}
 loopdev = { package = "loopdev-3", version = "0.5.3" }
 nlink = { workspace = true, features = ["tuntap"] }

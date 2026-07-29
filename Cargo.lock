@@ -431,6 +431,7 @@ dependencies = [
  "hyper",
  "hyper-client-sockets",
  "hyper-util",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

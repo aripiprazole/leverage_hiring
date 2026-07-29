@@ -139,7 +139,7 @@ struct ManagedVm {
     cgroup: Option<VmCgroup>,
     metrics_task: JoinHandle<()>,
     latest_metrics: Arc<RwLock<Option<Metrics>>>,
-    idle_tracker: Mutex<Option<IdleTracker>>,
+    monitor: Mutex<Option<Monitor>>,
     failed: bool,
 }
 ```
@@ -415,7 +415,7 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
         cgroup: Some(cgroup),
         metrics_task,
         latest_metrics,
-        idle_tracker: Mutex::new(None),
+        monitor: Mutex::new(None),
         failed: false,
     })
 }

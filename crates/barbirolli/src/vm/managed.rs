@@ -35,7 +35,7 @@ use validated::Validated::{self, Fail, Good};
 
 use crate::{
     Barbirolli, VmSpec,
-    idle::{IdleTracker, Sample},
+    idle::{Monitor, Sample},
     network::{ManagedNetwork, NetworkError},
 };
 
@@ -47,7 +47,7 @@ pub struct ManagedVm {
     pub spec: VmSpec,
     pub failed: bool,
     pub pid: i32,
-    pub idle_tracker: Mutex<Option<IdleTracker>>,
+    pub monitor: Mutex<Option<Monitor>>,
     network: Option<ManagedNetwork>,
     #[debug(skip)]
     vm: FirecrackerVm,
@@ -336,7 +336,7 @@ impl ManagedVm {
             network: Some(network),
             failed: false,
             pid,
-            idle_tracker: Mutex::new(None),
+            monitor: Mutex::new(None),
             cgroup: Some(cgroup),
             latest_metrics,
             metrics_task,
@@ -667,8 +667,8 @@ pub enum HealthError {
     MissingMetrics,
     #[error("the Firecracker metrics lock was poisoned")]
     MetricsLock,
-    #[error("the VM idle tracker lock was poisoned")]
-    TrackerLock,
+    #[error("the VM monitor lock was poisoned")]
+    MonitorLock,
     #[error("cgroup setup failed: {setup}; rollback also failed: {rollback}")]
     CgroupSetupRollback {
         setup: Box<HealthError>,

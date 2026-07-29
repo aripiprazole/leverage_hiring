@@ -45,6 +45,7 @@
             rust
             pkgs.pre-commit
             pkgs.just
+            pkgs.jq
             pkgs.lima
             pkgs.cargo-mutants
           ];

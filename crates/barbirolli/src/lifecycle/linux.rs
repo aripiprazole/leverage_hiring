@@ -25,7 +25,7 @@ use validated::Validated;
 use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
 use crate::{
     StorageError, VmId, VmInput, VmSpec, VmStore,
-    idle::{IdleDecision, IdlePolicy, IdleTracker, Observation},
+    idle::{IdleDecision, IdlePolicy, Monitor, Observation},
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -277,16 +277,16 @@ impl BarbirolliVm {
                 return None;
             }
         };
-        let Ok(mut tracker) = managed.idle_tracker.lock() else {
-            tracing::error!("VM idle tracker lock was poisoned");
+        let Ok(mut monitor) = managed.monitor.lock() else {
+            tracing::error!("VM monitor lock was poisoned");
             return None;
         };
-        let Some(tracker) = tracker.as_mut() else {
-            *tracker = Some(IdleTracker::new(sample, policy));
+        let Some(monitor) = monitor.as_mut() else {
+            *monitor = Some(Monitor::new(sample, policy));
             tracing::debug!("idle baseline established");
             return None;
         };
-        Some(tracker.observation(sample, policy))
+        Some(monitor.observation(sample, policy))
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
