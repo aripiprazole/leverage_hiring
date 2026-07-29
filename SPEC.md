@@ -174,6 +174,8 @@ struct VmId(u16);
 /// deserialization.
 struct VmSpec {
     vm_id: VmId,
+    /// Defaults to false when absent from an older config.
+    deleted: bool,
     artifact_dir: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -315,13 +317,17 @@ all failures.
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
 - Filesystem operations follow normal OS behavior, including following symlinks. Missing or
   unusable paths fail through ordinary I/O errors.
-- A VM gets the lowest free `VmId` in `0..16384`; the ID is persisted and may be reused only
-  after deletion.
+- A VM gets the `VmId` equal to the number of persisted VM directories, starting at `0`. Deleted
+  VM directories remain in that count, so IDs increase monotonically and are never reused.
 - VM creation is serialized and built in a temporary directory, then atomically renamed.
 - Each `$VM_ROOT/<vm_id>` contains:
   - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
   - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
-  - `config.json`: versioned `VmSpec`, including the stable `VmId` and port bindings.
+  - `config.json`: versioned `VmSpec`, including the stable `VmId`, deletion marker, and port
+    bindings.
+- Deletion first shuts down the VM, then sets `deleted: true` in `config.json` and unregisters it.
+  The VM directory, kernel, rootfs, and config remain on disk. There is currently no undelete,
+  garbage collection, or artifact pruning.
 - A nonempty `authorized_keys` request is written directly to
   `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
   file. No key sidecar is written beside the VM artifacts.
@@ -471,10 +477,11 @@ impl VmNetworkSpec {
 
 ### Warmup
 
-The application reads and parses every VM directory in `VM_ROOT`. It fails startup on malformed
-or duplicate configuration, reconciles stale Firecracker processes, sockets, TAPs, and nftables
-tables, and registers every valid VM as `BarbirolliVm::Discovered`. VMs are not started
-automatically.
+The application reads and parses every VM directory in `VM_ROOT` and fails startup on malformed
+configuration. Configurations marked `deleted: true` still count toward future ID allocation but
+are not reconciled or registered. For every active VM, warmup reconciles stale Firecracker
+processes, sockets, TAPs, and nftables tables and registers it as `BarbirolliVm::Discovered`. VMs
+are not started automatically.
 
 ### Shutdown
 

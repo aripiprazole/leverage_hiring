@@ -35,8 +35,6 @@ pub struct VmSummary {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WarmupFailure {
-    #[error("duplicate VM ID {0}")]
-    DuplicateVmId(VmId),
     #[cfg(feature = "linux")]
     #[error(transparent)]
     Reconcile(#[from] crate::vm::managed::LifecycleError),

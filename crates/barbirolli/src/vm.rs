@@ -27,6 +27,8 @@ pub struct VmInput {
 #[serde(deny_unknown_fields)]
 pub struct VmSpec {
     pub id: VmId,
+    #[serde(default)]
+    pub deleted: bool,
     pub artifact_dir: PathBuf,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,

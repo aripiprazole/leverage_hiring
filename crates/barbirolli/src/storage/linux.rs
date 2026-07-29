@@ -1,7 +1,6 @@
 use super::{Result, StorageError};
 
 use std::{
-    collections::HashSet,
     fs::{
         canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
         set_permissions,
@@ -162,6 +161,7 @@ impl VmStore {
 
         let persisted = PersistedVmSpec::new(VmSpec {
             id,
+            deleted: false,
             artifact_dir: final_dir.clone(),
             kernel: final_dir.join("vmlinux"),
             rootfs: final_dir.join("rootfs.ext4"),
@@ -178,8 +178,10 @@ impl VmStore {
 
     #[tracing::instrument(skip(self, spec), fields(vm_id = %spec.id), err)]
     pub fn delete(&self, spec: &VmSpec) -> Result<()> {
-        remove_dir_all(&spec.artifact_dir)
-            .map_err(|error| StorageError::io(&spec.artifact_dir, error))
+        let config = spec.artifact_dir.join("config.json");
+        let mut spec = spec.clone();
+        spec.deleted = true;
+        PersistedVmSpec::new(spec).write_into(config)
     }
 }
 
@@ -493,13 +495,11 @@ impl VmRootFolder {
     }
 
     fn next_id(&self) -> Result<VmId> {
-        let occupied = VmRootFolder::new(&self.dir)?
-            .map(|item| item.map(|item| item.persisted_spec.spec.id))
-            .collect::<Result<HashSet<_>>>()?;
-        (0..=16_383)
-            .map(|id| VmId::try_from(id).expect("the VM ID range is valid"))
-            .find(|id| !occupied.contains(id))
-            .ok_or(StorageError::IdsExhausted)
+        let len = VmRootFolder::new(&self.dir)?.try_fold(0_u16, |len, item| {
+            item?;
+            len.checked_add(1).ok_or(StorageError::IdsExhausted)
+        })?;
+        VmId::try_from(len).map_err(|_| StorageError::IdsExhausted)
     }
 
     fn next_item(&mut self) -> Result<Option<VmRootFolderItem>> {

@@ -1,7 +1,6 @@
 use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
 
 use std::{
-    collections::HashSet,
     fmt::Debug,
     path::PathBuf,
     sync::{
@@ -69,13 +68,11 @@ impl Barbirolli {
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
         }));
-        let mut ids = HashSet::new();
         let mut errors = vec![];
         for spec in specs {
-            if !ids.insert(spec.id) {
-                errors.push(WarmupFailure::DuplicateVmId(spec.id));
+            if spec.deleted {
                 continue;
-            };
+            }
             if let Err(err) = Box::pin(spec.reconcile(&barbirolli)).await {
                 errors.push(WarmupFailure::Reconcile(err));
                 continue;

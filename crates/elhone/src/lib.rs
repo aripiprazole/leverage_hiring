@@ -107,20 +107,17 @@ async fn authorize(
 }
 
 #[derive(Serialize)]
-struct IdResponse {
-    id: VmId,
-}
-
-#[derive(Serialize)]
 struct StatusResponse {
     id: VmId,
     status: VmStatus,
 }
 
+#[tracing::instrument]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
     Json(state.manager.list().await)
 }
 
+#[tracing::instrument]
 async fn create_vm(
     State(state): State<AppState>,
     input: Result<Json<VmInput>, JsonRejection>,
@@ -128,17 +125,26 @@ async fn create_vm(
     let Json(input) = input
         .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.body_text()))?;
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
-    Ok((StatusCode::CREATED, Json(IdResponse { id })))
+    Ok((
+        StatusCode::CREATED,
+        Json(StatusResponse {
+            id,
+            status: VmStatus::Discovered,
+        }),
+    ))
 }
 
+#[tracing::instrument]
 async fn vm_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
-    status_json(&state.manager, id).await
+    let summary = manager.vm_mut(id).map_err(ApiError::from)?.summary();
+    Ok(Json(summary))
 }
 
+#[tracing::instrument]
 async fn start_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -155,6 +161,7 @@ async fn start_vm(
     }))
 }
 
+#[tracing::instrument]
 async fn shutdown_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -171,6 +178,7 @@ async fn shutdown_vm(
     }))
 }
 
+#[tracing::instrument]
 async fn delete_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -180,29 +188,12 @@ async fn delete_vm(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn status_json(manager: &Barbirolli, id: VmId) -> Result<Json<StatusResponse>, ApiError> {
-    let summary = manager.vm_mut(id).map_err(ApiError::from)?.summary();
-    Ok(Json(StatusResponse {
-        id,
-        status: summary.status,
-    }))
-}
-
-fn parse_vm_id(value: String) -> Result<VmId, ApiError> {
-    let raw = value.parse::<u16>().map_err(|_| {
-        ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid VM ID {value:?}"),
-        )
-    })?;
-    VmId::try_from(raw)
-        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))
-}
-
+#[tracing::instrument]
 async fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "route not found")
 }
 
+#[tracing::instrument]
 async fn method_not_allowed() -> ApiError {
     ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
 }
@@ -269,6 +260,17 @@ impl IntoResponse for ApiError {
         )
             .into_response()
     }
+}
+
+fn parse_vm_id(value: String) -> Result<VmId, ApiError> {
+    let raw = value.parse::<u16>().map_err(|_| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid VM ID {value:?}"),
+        )
+    })?;
+    VmId::try_from(raw)
+        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ fn network_allocation_and_authorized_key_parsing_are_stable() {
 }
 
 #[tokio::test]
-async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_sidecars() {
+async fn storage_soft_deletes_and_allocates_monotonic_ids() {
     let temporary = tempfile::tempdir().expect("failed to create temporary storage");
     let vm_root = temporary.path().join("vms");
     let image_root = temporary.path().join("images");
@@ -76,6 +76,7 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         .await
         .expect("failed to create Alice's VM");
     assert_eq!(u16::from(alice.id), 0);
+    assert!(!alice.deleted);
     assert_eq!(alice.artifact_dir, vm_root.join("0"));
     assert_eq!(
         fs::read(&alice.kernel).expect("failed to read copied kernel"),
@@ -104,12 +105,31 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         .await
         .expect("failed to create Bob's VM");
     assert_eq!(u16::from(bob.id), 1);
+    assert!(!bob.deleted);
     assert!(
         !bob.artifact_dir.join("authorized_keys").exists(),
         "authorized keys must not be copied beside VM artifacts"
     );
 
     store.delete(&alice).expect("failed to delete Alice's VM");
+    assert!(alice.artifact_dir.exists());
+    assert!(alice.kernel.exists());
+    assert!(alice.rootfs.exists());
+    let deleted_config =
+        fs::read(alice.artifact_dir.join("config.json")).expect("failed to read deleted VM config");
+    let deleted_config =
+        serde_json::from_slice::<serde_json::Value>(&deleted_config).expect("invalid VM config");
+    assert_eq!(deleted_config["spec"]["deleted"], true);
+
+    let mut legacy_config = deleted_config;
+    legacy_config["spec"]
+        .as_object_mut()
+        .expect("VM spec should be an object")
+        .remove("deleted");
+    let legacy_spec = serde_json::from_value::<barbirolli::VmSpec>(legacy_config["spec"].clone())
+        .expect("VM specs without deleted should remain readable");
+    assert!(!legacy_spec.deleted);
+
     let carol = store
         .create(VmInput {
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
@@ -119,7 +139,8 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         })
         .await
         .expect("failed to create Carol's VM");
-    assert_eq!(u16::from(carol.id), 0);
+    assert_eq!(u16::from(carol.id), 2);
+    assert!(!carol.deleted);
 
     let discovered = VmStore::new(vm_root, image_root)
         .expect("failed to reopen the VM store")
@@ -130,13 +151,23 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
                 .spec
         })
         .collect::<Vec<_>>();
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.iter().any(|spec| u16::from(spec.id) == 0));
+    assert_eq!(discovered.len(), 3);
+    let reopened_alice = discovered
+        .iter()
+        .find(|spec| u16::from(spec.id) == 0)
+        .expect("Alice's persisted VM was not discovered");
+    assert!(reopened_alice.deleted);
     let reopened_bob = discovered
         .iter()
         .find(|spec| u16::from(spec.id) == 1)
         .expect("Bob's persisted VM was not discovered");
+    assert!(!reopened_bob.deleted);
     assert_eq!(reopened_bob.port_bindings, vec![bob_binding]);
+    let reopened_carol = discovered
+        .iter()
+        .find(|spec| u16::from(spec.id) == 2)
+        .expect("Carol's persisted VM was not discovered");
+    assert!(!reopened_carol.deleted);
 }
 
 #[tokio::test]
@@ -160,8 +191,9 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     fs::set_permissions(&firecracker, permissions)
         .expect("failed to make fake Firecracker executable");
 
-    let store = VmStore::new(vm_root, image_root).expect("failed to create the VM store");
-    let manager = Barbirolli::new(store, firecracker)
+    let store =
+        VmStore::new(vm_root.clone(), image_root.clone()).expect("failed to create the VM store");
+    let manager = Barbirolli::new(store, firecracker.clone())
         .await
         .expect("failed to create Barbirolli");
     let id = manager
@@ -227,6 +259,28 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         .expect("failed to delete VM");
     delete_thread.join().expect("VM deletion thread panicked");
     assert!(manager.list().await.is_empty());
+    assert!(vm_root.join(id.to_string()).join("vmlinux").exists());
+    assert!(vm_root.join(id.to_string()).join("rootfs.ext4").exists());
+    let deleted_config = fs::read(vm_root.join(id.to_string()).join("config.json"))
+        .expect("failed to read deleted VM config");
+    let deleted_config =
+        serde_json::from_slice::<serde_json::Value>(&deleted_config).expect("invalid VM config");
+    assert_eq!(deleted_config["spec"]["deleted"], true);
+
+    let reopened_store = VmStore::new(vm_root, image_root).expect("failed to reopen the VM store");
+    let reopened = Barbirolli::new(reopened_store, firecracker)
+        .await
+        .expect("failed to reopen Barbirolli");
+    assert!(reopened.list().await.is_empty());
+    assert!(matches!(
+        reopened.vm(id),
+        Err(LifecycleError::NotFound(missing)) if missing == id
+    ));
+    reopened
+        .shutdown()
+        .await
+        .expect("failed to drain reopened manager");
+
     manager
         .shutdown()
         .await
