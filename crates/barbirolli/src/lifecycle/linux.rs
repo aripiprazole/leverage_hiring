@@ -175,6 +175,7 @@ impl Barbirolli {
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
         for vm in self.vms.iter() {
+            tracing::info!(id = ?vm.id(), "shutting down");
             let Some(mut vm) = self.vms.get_mut(vm.key()) else {
                 continue;
             };

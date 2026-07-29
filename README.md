@@ -71,9 +71,16 @@ VM_ID=$(
         "vcpu_count": 1,
         "memory_mib": 256,
         "authorized_keys": [],
-        "port_bindings": [{"internal": 22, "external": 2201}]
+        "port_bindings": []
       }' |
     jq -r .id
+)
+
+VM_IP=$(
+  limactl shell provisioning \
+    curl --fail-with-body --silent --show-error \
+      "http://127.0.0.1:3000/vms/$VM_ID" |
+    jq -r .network.guest_ip
 )
 
 limactl shell provisioning curl --fail-with-body -X POST \
@@ -81,16 +88,13 @@ limactl shell provisioning curl --fail-with-body -X POST \
 
 limactl shell provisioning ssh \
   -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -p 2201 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  root@127.0.0.1
-
-apt-get update && apt-get install -y sqlite3
-sqlite3 /root/example.db
-CREATE TABLE messages (body TEXT);
-INSERT INTO messages VALUES ('hello');
-SELECT * FROM messages;
-.quit
-exit
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o ConnectionAttempts=30 root@"$VM_IP" \
+  "apt-get update &&
+   apt-get install -y sqlite3 &&
+   sqlite3 /root/example.db 'CREATE TABLE messages (body TEXT);' &&
+   sqlite3 /root/example.db \"INSERT INTO messages VALUES ('hello');\" &&
+   sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
 limactl shell provisioning curl --fail-with-body -X POST \
   "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
@@ -109,11 +113,17 @@ VM_ID=$(
         "memory_mib": 256,
         "authorized_keys": [],
         "port_bindings": [
-          {"internal": 22, "external": 2202},
           {"internal": 80, "external": 8080}
         ]
       }' |
     jq -r .id
+)
+
+VM_IP=$(
+  limactl shell provisioning \
+    curl --fail-with-body --silent --show-error \
+      "http://127.0.0.1:3000/vms/$VM_ID" |
+    jq -r .network.guest_ip
 )
 
 limactl shell provisioning curl --fail-with-body -X POST \
@@ -121,18 +131,22 @@ limactl shell provisioning curl --fail-with-body -X POST \
 
 limactl shell provisioning ssh \
   -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -p 2202 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  root@127.0.0.1
-
-mkdir -p /srv/hello
-echo '<h1>Hello from a microVM</h1>' > /srv/hello/index.html
-python3 -m http.server 80 --directory /srv/hello
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o ConnectionAttempts=30 root@"$VM_IP" \
+  "mkdir -p /srv/hello &&
+   echo '<h1>Hello from a microVM</h1>' > /srv/hello/index.html &&
+   python3 -m http.server 80 --directory /srv/hello"
 ```
 
-Open <http://127.0.0.1:8080>. Press `Ctrl-C`, then run:
+From another macOS terminal:
 
 ```sh
-exit
+limactl shell provisioning curl --fail http://$VM_IP:8080
+```
+
+Press `Ctrl-C` in the HTTP server terminal, then run:
+
+```sh
 limactl shell provisioning curl --fail-with-body -X POST \
   "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
 ```
@@ -150,11 +164,17 @@ VM_ID=$(
         "memory_mib": 512,
         "authorized_keys": [],
         "port_bindings": [
-          {"internal": 22, "external": 2203},
           {"internal": 5432, "external": 5432}
         ]
       }' |
     jq -r .id
+)
+
+VM_IP=$(
+  limactl shell provisioning \
+    curl --fail-with-body --silent --show-error \
+      "http://127.0.0.1:3000/vms/$VM_ID" |
+    jq -r .network.guest_ip
 )
 
 limactl shell provisioning curl --fail-with-body -X POST \
@@ -162,14 +182,13 @@ limactl shell provisioning curl --fail-with-body -X POST \
 
 limactl shell provisioning ssh \
   -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -p 2203 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  root@127.0.0.1
-
-apt-get update && apt-get install -y postgresql
-service postgresql start
-su postgres -c "createdb hello"
-su postgres -c "psql -l"
-exit
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o ConnectionAttempts=30 root@"$VM_IP" \
+  'apt-get update &&
+   apt-get install -y postgresql &&
+   service postgresql start &&
+   su postgres -c "createdb hello" &&
+   su postgres -c "psql -l"'
 
 limactl shell provisioning curl --fail-with-body -X POST \
   "http://127.0.0.1:3000/vms/$VM_ID/shutdown"

@@ -7,7 +7,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use barbirolli::{Barbirolli, LifecycleError, StorageError, VmId, VmInput, VmStatus};
 use serde::Serialize;
@@ -59,7 +59,7 @@ struct AppState {
 pub fn router(manager: Arc<Barbirolli>, auth: Auth) -> Router {
     let app = Router::new()
         .route("/vms", get(list_vms).post(create_vm))
-        .route("/vms/{id}", delete(delete_vm))
+        .route("/vms/{id}", get(vm).delete(delete_vm))
         .route("/vms/{id}/status", get(vm_status))
         .route("/vms/{id}/start", post(start_vm))
         .route("/vms/{id}/shutdown", post(shutdown_vm))
@@ -110,6 +110,18 @@ struct StatusResponse {
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
     tracing::info!("list vms");
     Json(state.manager.list().await)
+}
+
+#[tracing::instrument(skip(state))]
+async fn vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<barbirolli::VmSummary>, ApiError> {
+    tracing::info!("get vm");
+    let id = parse_vm_id(id)?;
+    Ok(Json(
+        state.manager.vm_mut(id).map_err(ApiError::from)?.summary(),
+    ))
 }
 
 #[tracing::instrument(skip(state))]
