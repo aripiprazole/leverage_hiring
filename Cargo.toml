@@ -16,7 +16,6 @@ edition.workspace = true
 [features]
 default = []
 local = ["elhone/local"]
-linux = ["barbirolli/linux", "elhone/linux"]
 
 [workspace.dependencies]
 axum = "0.8.8"

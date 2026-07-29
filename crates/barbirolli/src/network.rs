@@ -8,28 +8,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ParseValueError, VmId};
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 use crate::{Port, PortBinding};
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 const VM_NETWORK_POOL: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 0);
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 mod linux;
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 pub use linux::*;
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Ipv4Network {
     pub network: Ipv4Addr,
     pub prefix: u8,
 }
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PortForward {
     pub external: Port,
@@ -38,14 +38,14 @@ pub(crate) struct PortForward {
     pub destination_exclusion: Ipv4Network,
 }
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FirewallPlan {
     pub port_forwards: Vec<PortForward>,
     pub forward_rules: Vec<ForwardRule>,
 }
 
-#[cfg(any(feature = "linux", test))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardRule {
     /// Reject packets leaving this VM's TAP for any address in the VM
@@ -104,7 +104,7 @@ impl NetworkSpec {
         )
     }
 
-    #[cfg(any(feature = "linux", test))]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn port_forward(&self, binding: PortBinding) -> PortForward {
         PortForward {
             internal: binding.internal,
@@ -117,7 +117,7 @@ impl NetworkSpec {
         }
     }
 
-    #[cfg(any(feature = "linux", test))]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn firewall_plan(&self, bindings: &[PortBinding]) -> FirewallPlan {
         let port_forwards = bindings
             .iter()

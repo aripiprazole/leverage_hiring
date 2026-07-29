@@ -1,13 +1,13 @@
 use std::{io, path::PathBuf};
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(feature = "linux"))]
+#[cfg(not(target_os = "linux"))]
 mod macos;
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 pub use linux::*;
-#[cfg(not(feature = "linux"))]
+#[cfg(not(target_os = "linux"))]
 pub use macos::*;
 
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;
@@ -30,12 +30,12 @@ pub enum StorageError {
     },
     #[error("invalid configuration in {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
-    #[cfg(feature = "linux")]
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     SshAccess(#[from] SshAccessError),
 }
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 impl StorageError {
     fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {

@@ -114,7 +114,7 @@ struct StatusResponse {
 
 #[tracing::instrument(skip(state))]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
-    Json(state.manager.list().await)
+    Json(Box::pin(state.manager.list()).await)
 }
 
 #[tracing::instrument(skip(state))]
@@ -251,17 +251,17 @@ impl From<LifecycleError> for ApiError {
                 tracing::error!(%error, "Elhone request failed");
                 Self::InternalServerError(message)
             }
-            #[cfg(feature = "linux")]
+            #[cfg(target_os = "linux")]
             LifecycleError::Storage(StorageError::SshAccess(_)) => {
                 tracing::error!(%error, "Elhone request failed");
                 Self::InternalServerError(message)
             }
-            #[cfg(not(feature = "linux"))]
+            #[cfg(not(target_os = "linux"))]
             LifecycleError::UnsupportedPlatform => {
                 tracing::error!(%error, "Elhone request failed");
                 Self::InternalServerError(message)
             }
-            #[cfg(feature = "linux")]
+            #[cfg(target_os = "linux")]
             LifecycleError::Vm(_) => {
                 tracing::error!(%error, "Elhone request failed");
                 Self::InternalServerError(message)

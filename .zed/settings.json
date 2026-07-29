@@ -3,7 +3,6 @@
     "rust-analyzer": {
       "initialization_options": {
         "cargo": {
-          "features": ["linux"],
           "target": "aarch64-unknown-linux-gnu",
           "buildScripts": {
             "overrideCommand": [
@@ -11,8 +10,6 @@
               "check",
               "-p",
               "barbirolli",
-              "--features",
-              "linux",
               "--target",
               "aarch64-unknown-linux-gnu",
               "--all-targets",
@@ -26,8 +23,6 @@
             "check",
             "-p",
             "barbirolli",
-            "--features",
-            "linux",
             "--target",
             "aarch64-unknown-linux-gnu",
             "--all-targets",

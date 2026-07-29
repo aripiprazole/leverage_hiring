@@ -23,6 +23,7 @@
         pkgs = import nixpkgs { inherit system overlays; };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nightly-rustfmt = pkgs.rust-bin.nightly.latest.rustfmt;
+        aarch64-linux-headers = pkgs.pkgsCross.aarch64-multiplatform.linuxHeaders;
       in
       {
         checks.pre-commit-check = git-hooks.lib.${system}.run {
@@ -47,6 +48,8 @@
             pkgs.lima
             pkgs.cargo-mutants
           ];
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu =
+            "-I${aarch64-linux-headers}/include";
           RUST_BACKTRACE = "1";
         };
       }

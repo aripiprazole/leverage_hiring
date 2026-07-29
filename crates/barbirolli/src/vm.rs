@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 pub(crate) mod managed;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

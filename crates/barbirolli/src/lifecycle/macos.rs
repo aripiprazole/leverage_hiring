@@ -7,11 +7,11 @@ pub struct BarbirolliVm;
 
 impl BarbirolliVm {
     pub fn spec(&self) -> &VmSpec {
-        unreachable!("Barbirolli VMs require the linux feature")
+        unreachable!("Barbirolli VMs require Linux")
     }
 
     pub fn summary(&self) -> VmSummary {
-        unreachable!("Barbirolli VMs require the linux feature")
+        unreachable!("Barbirolli VMs require Linux")
     }
 
     pub async fn start(&mut self, _barbirolli: &Barbirolli) -> Result<()> {

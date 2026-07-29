@@ -3,14 +3,14 @@ use validated::Validated;
 
 use crate::{NetworkSpec, PortBinding, StorageError, VmId};
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(feature = "linux"))]
+#[cfg(not(target_os = "linux"))]
 mod macos;
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 pub use linux::*;
-#[cfg(not(feature = "linux"))]
+#[cfg(not(target_os = "linux"))]
 pub use macos::*;
 
 pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
@@ -35,7 +35,7 @@ pub struct VmSummary {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WarmupFailure {
-    #[cfg(feature = "linux")]
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Reconcile(#[from] crate::vm::managed::LifecycleError),
 }
@@ -54,14 +54,14 @@ pub enum LifecycleError {
         operation: &'static str,
         status: VmStatus,
     },
-    #[cfg(feature = "linux")]
+    #[cfg(target_os = "linux")]
     #[error(transparent)]
     Vm(#[from] crate::vm::managed::LifecycleError),
     #[error("warmup reconciliation failed: {0:?}")]
     Warmup(Validated<(), WarmupFailure>),
     #[error("application shutdown failed: {0:?}")]
     Shutdown(Validated<(), Box<LifecycleError>>),
-    #[cfg(not(feature = "linux"))]
+    #[cfg(not(target_os = "linux"))]
     #[error("Firecracker lifecycle operations require Linux")]
     UnsupportedPlatform,
 }

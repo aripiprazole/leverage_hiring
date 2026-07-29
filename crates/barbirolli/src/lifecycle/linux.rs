@@ -123,6 +123,7 @@ impl Barbirolli {
         Ok(id)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn list(&self) -> Vec<VmSummary> {
         self.vms
             .iter()

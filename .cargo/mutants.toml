@@ -1,6 +1,5 @@
 no_default_features = true
 test_workspace = true
-features = ["linux"]
 exclude_globs = [
   "crates/barbirolli/src/lifecycle/macos.rs",
   "crates/barbirolli/src/storage/macos.rs",

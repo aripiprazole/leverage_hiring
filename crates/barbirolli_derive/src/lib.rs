@@ -78,8 +78,6 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                             "test",
                             "-p",
                             "barbirolli",
-                            "--features",
-                            "linux",
                             "--test",
                             "firecracker",
                             #function_name,
