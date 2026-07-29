@@ -102,7 +102,7 @@ async fn authorize(
     if authorized {
         Ok(next.run(request).await)
     } else {
-        Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden"))
+        Err(ApiError::Forbidden)
     }
 }
 
@@ -112,18 +112,17 @@ struct StatusResponse {
     status: VmStatus,
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
     Json(state.manager.list().await)
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn create_vm(
     State(state): State<AppState>,
     input: Result<Json<VmInput>, JsonRejection>,
-) -> Result<(StatusCode, Json<IdResponse>), ApiError> {
-    let Json(input) = input
-        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.body_text()))?;
+) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
     Ok((
         StatusCode::CREATED,
@@ -134,17 +133,20 @@ async fn create_vm(
     ))
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn vm_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let id = parse_vm_id(id)?;
-    let summary = manager.vm_mut(id).map_err(ApiError::from)?.summary();
-    Ok(Json(summary))
+    let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
+    Ok(Json(StatusResponse {
+        id,
+        status: summary.status,
+    }))
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn start_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -161,7 +163,7 @@ async fn start_vm(
     }))
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn shutdown_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -178,7 +180,7 @@ async fn shutdown_vm(
     }))
 }
 
-#[tracing::instrument]
+#[tracing::instrument(skip(state))]
 async fn delete_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -190,37 +192,53 @@ async fn delete_vm(
 
 #[tracing::instrument]
 async fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "route not found")
+    ApiError::NotFound("route not found".to_owned())
 }
 
 #[tracing::instrument]
 async fn method_not_allowed() -> ApiError {
-    ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+    ApiError::MethodNotAllowed
 }
 
-struct ApiError {
-    status: StatusCode,
-    message: String,
+#[derive(Debug, thiserror::Error)]
+enum ApiError {
+    #[error("forbidden")]
+    Forbidden,
+    #[error("{0}")]
+    NotFound(String),
+    #[error("method not allowed")]
+    MethodNotAllowed,
+    #[error("{0}")]
+    UnprocessableEntity(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
+    InternalServerError(String),
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
 
 impl From<LifecycleError> for ApiError {
     fn from(error: LifecycleError) -> Self {
-        let status = match &error {
-            LifecycleError::NotFound(_) => StatusCode::NOT_FOUND,
+        let message = error.to_string();
+        match &error {
+            LifecycleError::NotFound(_) => Self::NotFound(message),
             LifecycleError::Storage(StorageError::InvalidInput(_) | StorageError::IdsExhausted) => {
-                StatusCode::UNPROCESSABLE_ENTITY
+                Self::UnprocessableEntity(message)
             }
             LifecycleError::Draining | LifecycleError::InvalidTransition { .. } => {
-                StatusCode::CONFLICT
+                Self::Conflict(message)
             }
             LifecycleError::Storage(
                 StorageError::SocketDirectory
@@ -229,20 +247,26 @@ impl From<LifecycleError> for ApiError {
                 | StorageError::InvalidConfig { .. },
             )
             | LifecycleError::Shutdown(_)
-            | LifecycleError::Warmup(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | LifecycleError::Warmup(_) => {
+                tracing::error!(%error, "Elhone request failed");
+                Self::InternalServerError(message)
+            }
             #[cfg(feature = "linux")]
             LifecycleError::Storage(StorageError::SshAccess(_)) => {
-                StatusCode::INTERNAL_SERVER_ERROR
+                tracing::error!(%error, "Elhone request failed");
+                Self::InternalServerError(message)
             }
             #[cfg(not(feature = "linux"))]
-            LifecycleError::UnsupportedPlatform => StatusCode::INTERNAL_SERVER_ERROR,
+            LifecycleError::UnsupportedPlatform => {
+                tracing::error!(%error, "Elhone request failed");
+                Self::InternalServerError(message)
+            }
             #[cfg(feature = "linux")]
-            LifecycleError::Vm(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        if status.is_server_error() {
-            tracing::error!(%error, "Elhone request failed");
+            LifecycleError::Vm(_) => {
+                tracing::error!(%error, "Elhone request failed");
+                Self::InternalServerError(message)
+            }
         }
-        Self::new(status, error.to_string())
     }
 }
 
@@ -252,25 +276,17 @@ impl IntoResponse for ApiError {
         struct ErrorBody {
             error: String,
         }
-        (
-            self.status,
-            Json(ErrorBody {
-                error: self.message,
-            }),
-        )
-            .into_response()
+        let status = self.status();
+        let message = self.to_string();
+        (status, Json(ErrorBody { error: message })).into_response()
     }
 }
 
 fn parse_vm_id(value: String) -> Result<VmId, ApiError> {
-    let raw = value.parse::<u16>().map_err(|_| {
-        ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("invalid VM ID {value:?}"),
-        )
-    })?;
-    VmId::try_from(raw)
-        .map_err(|error| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))
+    let raw = value
+        .parse::<u16>()
+        .map_err(|_| ApiError::UnprocessableEntity(format!("invalid VM ID {value:?}")))?;
+    VmId::try_from(raw).map_err(|error| ApiError::UnprocessableEntity(error.to_string()))
 }
 
 #[cfg(test)]
