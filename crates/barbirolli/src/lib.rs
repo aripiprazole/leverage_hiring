@@ -1,3 +1,4 @@
+mod idle;
 mod lifecycle;
 mod network;
 mod storage;
@@ -26,6 +27,7 @@ pub mod test_support {
     }
 }
 
+pub use idle::IdlePolicy;
 pub use lifecycle::{Barbirolli, LifecycleError, VmStatus, VmSummary};
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};

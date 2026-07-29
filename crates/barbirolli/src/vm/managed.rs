@@ -1,13 +1,19 @@
-use std::time::Duration;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
+};
 
 use derive_more::Debug;
 use fctools::{
+    extension::metrics::Metrics,
     process_spawner::DirectProcessSpawner,
     runtime::tokio::TokioRuntime,
     vm::{
         Vm, VmError as FctoolsVmError, VmState,
         configuration::{InitMethod, VmConfiguration, VmConfigurationData},
-        models::{BootSource, Drive, MachineConfiguration, NetworkInterface},
+        models::{BootSource, Drive, MachineConfiguration, MetricsSystem, NetworkInterface},
         shutdown::{VmShutdownAction, VmShutdownError, VmShutdownMethod},
     },
     vmm::{
@@ -17,15 +23,17 @@ use fctools::{
         installation::VmmInstallation,
         ownership::VmmOwnershipModel,
         resource::{
-            MovedResourceType, ResourceType,
+            CreatedResourceType, MovedResourceType, ResourceType,
             system::{ResourceSystem, ResourceSystemError},
         },
     },
 };
+use tokio::io::{AsyncBufReadExt, BufReader};
 use validated::Validated::{self, Fail, Good};
 
 use crate::{
     Barbirolli, VmSpec,
+    idle::{IdleTracker, Sample},
     network::{ManagedNetwork, NetworkError},
 };
 
@@ -39,6 +47,17 @@ pub struct ManagedVm {
     pub vm: FirecrackerVm,
     pub network: Option<ManagedNetwork>,
     pub failed: bool,
+    pub(crate) pid: i32,
+    pub(crate) idle_tracker: Mutex<Option<IdleTracker>>,
+    cgroup: Option<VmCgroup>,
+    latest_metrics: Arc<RwLock<Option<Metrics>>>,
+    #[debug(skip)]
+    metrics_task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct VmCgroup {
+    path: PathBuf,
 }
 
 impl VmSpec {
@@ -78,10 +97,12 @@ impl VmSpec {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(ReconcileFailure::Socket(error)),
         };
-        let reconciliation = Validated::from(stale_processes).map3(
+        let stale_health = cleanup_stale_health(self).map_err(ReconcileFailure::Health);
+        let reconciliation = Validated::from(stale_processes).map4(
             Validated::from(stale_network),
             Validated::from(stale_socket),
-            |(), (), ()| (),
+            Validated::from(stale_health),
+            |(), (), (), ()| (),
         );
         match reconciliation {
             Good(()) => Ok(()),
@@ -138,6 +159,10 @@ fn vm_configuration(
         &spec.rootfs,
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
+    let metrics = resources.create_resource(
+        self::metrics_path(spec),
+        ResourceType::Created(CreatedResourceType::Fifo),
+    )?;
 
     Ok(VmConfiguration::New {
         init_method: InitMethod::ViaApiCalls,
@@ -176,7 +201,7 @@ fn vm_configuration(
             balloon_device: None,
             vsock_device: None,
             logger_system: None,
-            metrics_system: None,
+            metrics_system: Some(MetricsSystem { metrics }),
             mmds_configuration: None,
             entropy_device: None,
         },
@@ -224,22 +249,57 @@ impl ManagedVm {
             }
         };
 
-        match vm.start(barbirolli.api_socket_timeout).await {
-            Ok(()) => Ok(Self {
-                spec,
-                vm,
-                network: Some(network),
-                failed: false,
-            }),
-            Err(error) => Err(LifecycleError::StartupRollback {
+        if let Err(error) = vm.start(barbirolli.api_socket_timeout).await {
+            return Err(LifecycleError::StartupRollback {
                 startup_error: Box::new(error.into()),
                 vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
                     .await
                     .err()
                     .map(Box::new),
                 network_rollback_error: network.cleanup().await.err().map(Box::new),
-            }),
+            });
         }
+
+        let pid = match find_firecracker_pid(barbirolli).await {
+            Ok(pid) => pid,
+            Err(error) => {
+                return Err(LifecycleError::StartupRollback {
+                    startup_error: Box::new(error.into()),
+                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
+                        .await
+                        .err()
+                        .map(Box::new),
+                    network_rollback_error: network.cleanup().await.err().map(Box::new),
+                });
+            }
+        };
+        let cgroup = match VmCgroup::create(spec.id.to_string(), pid) {
+            Ok(cgroup) => cgroup,
+            Err(error) => {
+                return Err(LifecycleError::StartupRollback {
+                    startup_error: Box::new(LifecycleError::Health(error)),
+                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
+                        .await
+                        .err()
+                        .map(Box::new),
+                    network_rollback_error: network.cleanup().await.err().map(Box::new),
+                });
+            }
+        };
+        let latest_metrics = Arc::new(RwLock::new(None));
+        let metrics_task = spawn_metrics_reader(metrics_path(&spec), latest_metrics.clone());
+
+        Ok(Self {
+            spec,
+            vm,
+            network: Some(network),
+            failed: false,
+            pid,
+            idle_tracker: Mutex::new(None),
+            cgroup: Some(cgroup),
+            latest_metrics,
+            metrics_task,
+        })
     }
 
     pub async fn shutdown(&mut self, shutdown_timeout: Duration) -> Result<(), LifecycleError> {
@@ -273,6 +333,7 @@ impl ManagedVm {
     }
 
     pub async fn cleanup(&mut self) -> Result<(), LifecycleError> {
+        self.metrics_task.abort();
         let vm = self.vm.cleanup().await.map_err(LifecycleError::from);
         let network = match self.network.as_ref() {
             Some(network) => network.cleanup().await,
@@ -282,16 +343,255 @@ impl ManagedVm {
             self.network = None;
         }
 
-        match (vm, network) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(vm), Ok(())) => Err(vm),
-            (Ok(()), Err(network)) => Err(network.into()),
-            (Err(vm), Err(network)) => Err(LifecycleError::Cleanup {
-                vm: Some(Box::new(vm)),
-                network: Some(Box::new(network)),
+        let cgroup = self
+            .cgroup
+            .take()
+            .map_or(Ok(()), |cgroup| cgroup.cleanup())
+            .map_err(LifecycleError::Health);
+
+        match (vm, network, cgroup) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(()), Ok(())) => Err(error),
+            (Ok(()), Err(error), Ok(())) => Err(error.into()),
+            (Ok(()), Ok(()), Err(error)) => Err(error),
+            (vm, network, cgroup) => Err(LifecycleError::Cleanup {
+                vm: vm.err().map(Box::new),
+                network: network.err().map(Box::new),
+                health: cgroup.err().map(Box::new),
             }),
         }
     }
+
+    pub(crate) fn activity_sample(&self) -> Result<Sample, HealthError> {
+        let cgroup = self.cgroup.as_ref().ok_or(HealthError::MissingCgroup)?;
+        let metrics = self
+            .latest_metrics
+            .read()
+            .map_err(|_| HealthError::MetricsLock)?
+            .clone()
+            .ok_or(HealthError::MissingMetrics)?;
+        let connections = connection_counts(self.spec.network.guest_ip);
+        Ok(Sample {
+            instance_pid: self.pid,
+            sampled_at: Instant::now(),
+            cpu_usage_usec: cgroup.read_key("cpu.stat", "usage_usec")?,
+            memory_bytes: cgroup.read_value("memory.current")?,
+            process_count: cgroup.read_value("pids.current")?,
+            network_bytes: metrics
+                .net
+                .rx_bytes_count
+                .saturating_add(metrics.net.tx_bytes_count),
+            disk_bytes: metrics
+                .block
+                .read_bytes
+                .saturating_add(metrics.block.write_bytes),
+            established_tcp_connections: connections.1,
+            total_connections: connections.0,
+            vcpu_count: self.spec.vcpu_count.into(),
+        })
+    }
+}
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
+
+fn metrics_path(spec: &VmSpec) -> PathBuf {
+    spec.artifact_dir.join("metrics.fifo")
+}
+
+fn cleanup_stale_health(spec: &VmSpec) -> Result<(), HealthError> {
+    let metrics = metrics_path(spec);
+    if let Err(source) = fs::remove_file(&metrics)
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(HealthError::Io {
+            path: metrics,
+            source,
+        });
+    }
+
+    let cgroup = PathBuf::from(CGROUP_ROOT).join(format!("vm-{}", spec.id));
+    if cgroup.exists() {
+        let kill = cgroup.join("cgroup.kill");
+        if kill.exists() {
+            fs::write(&kill, "1").map_err(|source| HealthError::Io { path: kill, source })?;
+        }
+        fs::remove_dir(&cgroup).map_err(|source| HealthError::Io {
+            path: cgroup,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn spawn_metrics_reader(
+    path: PathBuf,
+    latest: Arc<RwLock<Option<Metrics>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::error!(%error, path = %path.display(), "failed to open Firecracker metrics");
+                return;
+            }
+        };
+        let mut lines = BufReader::new(file).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => match serde_json::from_str(&line) {
+                    Ok(metrics) => match latest.write() {
+                        Ok(mut destination) => *destination = Some(metrics),
+                        Err(_) => {
+                            tracing::error!("Firecracker metrics lock was poisoned");
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "discarding invalid Firecracker metrics");
+                    }
+                },
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::error!(%error, "failed to read Firecracker metrics");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+async fn find_firecracker_pid(barbirolli: &Barbirolli) -> Result<i32, HealthError> {
+    let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
+    let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
+    let mut proc = tokio::fs::read_dir("/proc")
+        .await
+        .map_err(|source| HealthError::Io {
+            path: PathBuf::from("/proc"),
+            source,
+        })?;
+    while let Some(entry) = proc.next_entry().await.map_err(|source| HealthError::Io {
+        path: PathBuf::from("/proc"),
+        source,
+    })? {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let command = match tokio::fs::read(entry.path().join("cmdline")).await {
+            Ok(command) => command,
+            Err(_) => continue,
+        };
+        let arguments = command
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .collect::<Vec<_>>();
+        if arguments
+            .first()
+            .is_some_and(|arg| *arg == expected_firecracker)
+            && arguments
+                .windows(2)
+                .any(|args| args[0] == b"--api-sock" && args[1] == expected_socket)
+        {
+            return Ok(pid);
+        }
+    }
+    Err(HealthError::ProcessNotFound)
+}
+
+impl VmCgroup {
+    fn create(id: String, pid: i32) -> Result<Self, HealthError> {
+        let root = PathBuf::from(CGROUP_ROOT);
+        fs::create_dir_all(&root).map_err(|source| HealthError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        let controllers = root.join("cgroup.subtree_control");
+        fs::write(&controllers, "+cpu +memory +pids").map_err(|source| HealthError::Io {
+            path: controllers,
+            source,
+        })?;
+        let path = root.join(format!("vm-{id}"));
+        fs::create_dir(&path).map_err(|source| HealthError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let procs = path.join("cgroup.procs");
+        if let Err(source) = fs::write(&procs, pid.to_string()) {
+            let _ = fs::remove_dir(&path);
+            return Err(HealthError::Io {
+                path: procs,
+                source,
+            });
+        }
+        Ok(Self { path })
+    }
+
+    fn read_value(&self, name: &str) -> Result<u64, HealthError> {
+        let path = self.path.join(name);
+        let value = fs::read_to_string(&path).map_err(|source| HealthError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        value
+            .trim()
+            .parse()
+            .map_err(|_| HealthError::InvalidValue(path))
+    }
+
+    fn read_key(&self, name: &str, key: &str) -> Result<u64, HealthError> {
+        let path = self.path.join(name);
+        let value = fs::read_to_string(&path).map_err(|source| HealthError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        value
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == key).then(|| value.parse().ok()).flatten()
+            })
+            .ok_or(HealthError::InvalidValue(path))
+    }
+
+    fn cleanup(self) -> Result<(), HealthError> {
+        match fs::remove_dir(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(HealthError::Io {
+                path: self.path,
+                source,
+            }),
+        }
+    }
+}
+
+fn connection_counts(guest_ip: std::net::Ipv4Addr) -> (u64, u64) {
+    let contents = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok());
+    let Some(contents) = contents else {
+        return (0, 0);
+    };
+    let address = guest_ip.to_string();
+    contents
+        .lines()
+        .filter(|line| {
+            line.split_ascii_whitespace().any(|field| {
+                field
+                    .strip_prefix("src=")
+                    .or_else(|| field.strip_prefix("dst="))
+                    .is_some_and(|ip| ip == address)
+            })
+        })
+        .fold((0, 0), |(total, established), line| {
+            (
+                total + 1,
+                established + u64::from(line.split_ascii_whitespace().any(|v| v == "ESTABLISHED")),
+            )
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -314,10 +614,11 @@ pub enum LifecycleError {
         vm_rollback_error: Option<Box<LifecycleError>>,
         network_rollback_error: Option<Box<NetworkError>>,
     },
-    #[error("VM cleanup failed (VM: {vm:?}, network: {network:?})")]
+    #[error("VM cleanup failed (VM: {vm:?}, network: {network:?}, health: {health:?})")]
     Cleanup {
         vm: Option<Box<LifecycleError>>,
         network: Option<Box<NetworkError>>,
+        health: Option<Box<LifecycleError>>,
     },
     #[error("VM shutdown/cleanup failed (shutdown: {shutdown:?}, cleanup: {cleanup:?})")]
     ShutdownCleanup {
@@ -326,8 +627,32 @@ pub enum LifecycleError {
     },
     #[error("warmup reconciliation failed: {0:?}")]
     Reconcile(Validated<(), ReconcileFailure>),
+    #[error(transparent)]
+    Health(#[from] HealthError),
     #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
     UnsupportedFirecracker(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HealthError {
+    #[error("failed to access health resource {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid health value in {0}")]
+    InvalidValue(PathBuf),
+    #[error("the Firecracker process could not be identified")]
+    ProcessNotFound,
+    #[error("the VM cgroup is unavailable")]
+    MissingCgroup,
+    #[error("Firecracker has not emitted a metrics sample")]
+    MissingMetrics,
+    #[error("the Firecracker metrics lock was poisoned")]
+    MetricsLock,
+    #[error("the VM idle tracker lock was poisoned")]
+    TrackerLock,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -338,4 +663,6 @@ pub enum ReconcileFailure {
     Network(#[source] NetworkError),
     #[error("failed to remove stale Firecracker API socket")]
     Socket(#[source] std::io::Error),
+    #[error("failed to clean up stale health resources")]
+    Health(#[source] HealthError),
 }

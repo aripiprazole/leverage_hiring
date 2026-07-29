@@ -1,11 +1,15 @@
 use std::path::PathBuf;
 
 use super::{LifecycleError, Result, VmSummary};
-use crate::{VmId, VmInput, VmSpec, VmStore};
+use crate::{IdlePolicy, VmId, VmInput, VmSpec, VmStore};
 
 pub struct BarbirolliVm;
 
 impl BarbirolliVm {
+    pub fn id(&self) -> VmId {
+        self.spec().id
+    }
+
     pub fn spec(&self) -> &VmSpec {
         unreachable!("Barbirolli VMs require Linux")
     }
@@ -32,6 +36,18 @@ impl Barbirolli {
         _firecracker: impl Into<PathBuf>,
     ) -> Result<Self, LifecycleError> {
         Err(LifecycleError::UnsupportedPlatform)
+    }
+
+    pub async fn new_with_idle_policy(
+        store: VmStore,
+        firecracker: impl Into<PathBuf>,
+        _idle_policy: IdlePolicy,
+    ) -> Result<Self, LifecycleError> {
+        Self::new(store, firecracker).await
+    }
+
+    pub async fn run_idle_reaper(&self) {
+        std::future::pending::<()>().await;
     }
 
     pub async fn create(&self, _input: VmInput) -> Result<VmId, LifecycleError> {

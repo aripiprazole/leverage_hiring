@@ -504,6 +504,47 @@ x86_64 and `reboot\n` on aarch64, followed by pause-and-kill and kill fallbacks.
   or 3 times, think before copying and pasting
 - Host networking and Firecracker API operations use Rust libraries, not `ip`, `nft`, or `curl`
   subprocesses. Launching Firecracker itself is expected.
+
+## Idle detection and automatic shutdown
+
+Each running VM is sampled at the Firecracker boundary. CPU, memory, and process usage come from
+the VM's cgroup; network and disk byte counters come from Firecracker's metrics FIFO; connection
+state comes from conntrack entries involving the guest IP. Memory is reported but does not count
+as activity. CPU above its configured threshold, network or disk traffic, a process-count change,
+or any established TCP connection resets the idle timer.
+
+```text
+cpu_percent =
+    100 * delta_usage_usec
+        / (interval_usec * vcpu_count)
+
+cpu_threshold =
+    idle_high + 0.2 * (active_low - idle_high)
+```
+
+The default `idle_high` is `0.5%` and `active_low` is `3.0%`, producing a `1.0%` threshold.
+
+```mermaid
+flowchart TD
+    A["Activity observed"] --> B["Reset strikes and last activity"]
+    B --> C["Wait 5 minutes"]
+    C --> D{"Idle check"}
+    D -- "Active" --> A
+    D -- "Idle: strike 1" --> E["Wait 1 minute"]
+    E --> F{"Idle check"}
+    F -- "Active" --> A
+    F -- "Idle: strike 2" --> G["Wait 1 minute"]
+    G --> H{"Idle check"}
+    H -- "Active" --> A
+    H -- "Idle: strike 3" --> I["Wait 30 seconds"]
+    I --> J{"Final idle check"}
+    J -- "Active" --> A
+    J -- "Still idle" --> K["Graceful VM shutdown"]
+```
+
+The timing and CPU bands are configurable with `IDLE_INITIAL_INTERVAL_SECONDS`,
+`IDLE_STRIKE_INTERVAL_SECONDS`, `IDLE_FINAL_INTERVAL_SECONDS`, `IDLE_CPU_HIGH_PERCENT`, and
+`IDLE_CPU_LOW_PERCENT`. The first sample and any regressed counter establish a new baseline.
 - Every crate must be a member of the root Cargo workspace.
 - The application runs only on Linux, but production code must remain visible to rust-analyzer on
   macOS. Do not hide it behind `#[cfg(target_os = "linux")]`.

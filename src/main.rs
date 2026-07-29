@@ -1,6 +1,6 @@
-use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use barbirolli::{Barbirolli, VmStore};
+use barbirolli::{Barbirolli, IdlePolicy, VmStore};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
@@ -11,10 +11,36 @@ struct Config {
     firecracker: PathBuf,
     #[serde(default = "default_elhone_address")]
     elhone_addr: SocketAddr,
+    #[serde(default = "default_idle_initial_interval")]
+    idle_initial_interval_seconds: u64,
+    #[serde(default = "default_idle_strike_interval")]
+    idle_strike_interval_seconds: u64,
+    #[serde(default = "default_idle_final_interval")]
+    idle_final_interval_seconds: u64,
+    #[serde(default = "default_idle_cpu_high")]
+    idle_cpu_high_percent: f64,
+    #[serde(default = "default_idle_cpu_low")]
+    idle_cpu_low_percent: f64,
 }
 
 fn default_elhone_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 3000))
+}
+
+fn default_idle_initial_interval() -> u64 {
+    300
+}
+fn default_idle_strike_interval() -> u64 {
+    60
+}
+fn default_idle_final_interval() -> u64 {
+    30
+}
+fn default_idle_cpu_high() -> f64 {
+    0.5
+}
+fn default_idle_cpu_low() -> f64 {
+    3.0
 }
 
 #[tokio::main]
@@ -30,7 +56,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = envy::from_env::<Config>()?;
     let store = VmStore::new(config.vm_root, config.image_root)?;
-    let manager = Arc::new(Barbirolli::new(store, config.firecracker).await?);
+    let idle_policy = IdlePolicy {
+        initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
+        strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),
+        final_interval: Duration::from_secs(config.idle_final_interval_seconds),
+        cpu_idle_high_percent: config.idle_cpu_high_percent,
+        cpu_active_low_percent: config.idle_cpu_low_percent,
+    };
+    let manager =
+        Arc::new(Barbirolli::new_with_idle_policy(store, config.firecracker, idle_policy).await?);
 
     let elhone_address = elhone::validate_address(config.elhone_addr)?;
     let elhone_listener = tokio::net::TcpListener::bind(elhone_address).await?;
@@ -43,6 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
+        () = manager.run_idle_reaper() => Ok(()),
     };
     let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
 
@@ -84,5 +119,10 @@ mod tests {
             config.elhone_addr,
             "127.0.0.1:4000".parse().expect("valid Elhone address")
         );
+        assert_eq!(config.idle_initial_interval_seconds, 300);
+        assert_eq!(config.idle_strike_interval_seconds, 60);
+        assert_eq!(config.idle_final_interval_seconds, 30);
+        assert_eq!(config.idle_cpu_high_percent, 0.5);
+        assert_eq!(config.idle_cpu_low_percent, 3.0);
     }
 }

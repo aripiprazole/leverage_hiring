@@ -19,6 +19,7 @@ fctools = { workspace = true, features = [
     "tokio-runtime",
     "unrestricted-vmm-executor",
     "vm",
+    "metrics-extension",
 ]}
 loopdev = { package = "loopdev-3", version = "0.5.3" }
 nlink = { workspace = true, features = ["tuntap"] }

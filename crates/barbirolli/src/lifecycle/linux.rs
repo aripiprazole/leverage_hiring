@@ -21,7 +21,10 @@ use nonempty_collections::NEVec;
 use validated::Validated;
 
 use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
-use crate::{StorageError, VmId, VmInput, VmSpec, VmStore};
+use crate::{
+    StorageError, VmId, VmInput, VmSpec, VmStore,
+    idle::{IdleDecision, IdlePolicy, IdleTracker, Observation},
+};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -39,6 +42,7 @@ pub struct BarbirolliInner {
     pub api_socket_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
+    pub idle_policy: IdlePolicy,
 }
 
 #[derive(derive_more::Deref, Clone, derive_more::Debug)]
@@ -48,8 +52,16 @@ pub struct Barbirolli(Arc<BarbirolliInner>);
 impl Barbirolli {
     #[tracing::instrument(skip_all, err)]
     pub async fn new(
+        store: VmStore,
+        firecracker: impl Into<PathBuf>,
+    ) -> Result<Self, LifecycleError> {
+        Self::new_with_idle_policy(store, firecracker, IdlePolicy::default()).await
+    }
+
+    pub async fn new_with_idle_policy(
         mut store: VmStore,
         firecracker: impl Into<PathBuf>,
+        idle_policy: IdlePolicy,
     ) -> Result<Self, LifecycleError> {
         let firecracker = verify_firecracker(firecracker).await?;
         tracing::info!(?firecracker, "initializing barbirolli");
@@ -67,6 +79,7 @@ impl Barbirolli {
             api_socket_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
+            idle_policy,
         }));
         let mut errors = vec![];
         for spec in specs {
@@ -90,11 +103,15 @@ impl Barbirolli {
         }
     }
 
-    fn accepting_operations(&self) -> Result<()> {
-        if self.draining.load(Ordering::Acquire) {
-            Err(LifecycleError::Draining)
-        } else {
-            Ok(())
+    pub async fn run_idle_reaper(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while self.is_app_alive().is_ok() {
+            interval.tick().await;
+            for mut vm in self.vms.iter_mut() {
+                let vm = vm.value_mut();
+                Box::pin(vm.check_idle(self)).await;
+            }
         }
     }
 
@@ -110,7 +127,7 @@ impl Barbirolli {
 
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
-        self.accepting_operations()?;
+        self.is_app_alive()?;
         let spec = self.store.create(input).await?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
@@ -133,7 +150,7 @@ impl Barbirolli {
 
     #[tracing::instrument(skip(self), fields(%vm_id), err)]
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
-        self.accepting_operations()?;
+        self.is_app_alive()?;
         let Entry::Occupied(mut vm) = self.vms.entry(vm_id) else {
             return Err(LifecycleError::NotFound(vm_id));
         };
@@ -177,6 +194,14 @@ impl Barbirolli {
             }
         }
     }
+
+    fn is_app_alive(&self) -> Result<()> {
+        if self.draining.load(Ordering::Acquire) {
+            Err(LifecycleError::Draining)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[tracing::instrument(skip(firecracker), err)]
@@ -205,6 +230,10 @@ pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathB
 }
 
 impl BarbirolliVm {
+    pub fn id(&self) -> VmId {
+        self.spec().id
+    }
+
     pub fn spec(&self) -> &VmSpec {
         match self {
             Self::Discovered(spec) | Self::Failed(spec) => spec,
@@ -238,6 +267,86 @@ impl BarbirolliVm {
                 port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
             },
+        }
+    }
+
+    #[tracing::instrument(skip(self, policy), fields(vm_id = %self.id()))]
+    fn observation(&self, policy: IdlePolicy) -> Option<Observation> {
+        let Self::Managed(managed) = self else {
+            return None;
+        };
+        let sample = match managed.activity_sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                tracing::debug!(%error, "idle sample unavailable");
+                return None;
+            }
+        };
+        let Ok(mut tracker) = managed.idle_tracker.lock() else {
+            tracing::error!("VM idle tracker lock was poisoned");
+            return None;
+        };
+        let Some(tracker) = tracker.as_mut() else {
+            *tracker = Some(IdleTracker::new(sample, policy));
+            tracing::debug!("idle baseline established");
+            return None;
+        };
+        Some(tracker.observation(sample, policy))
+    }
+
+    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.id()))]
+    async fn check_idle(&mut self, barbirolli: &Barbirolli) {
+        let Some(observation) = self.observation(barbirolli.idle_policy) else {
+            return;
+        };
+        let Observation {
+            sample,
+            decision,
+            activity,
+            last_activity,
+        } = observation;
+        match decision {
+            IdleDecision::None => {}
+            IdleDecision::ActivityReset => tracing::debug!(
+                cpu_percent = activity.cpu_percent,
+                counters_regressed = activity.counters_regressed,
+                memory_bytes = sample.memory_bytes,
+                process_count = sample.process_count,
+                network_bytes = sample.network_bytes,
+                disk_bytes = sample.disk_bytes,
+                established_tcp_connections = sample.established_tcp_connections,
+                total_connections = sample.total_connections,
+                cpu_threshold_percent = barbirolli.idle_policy.cpu_threshold_percent(),
+                "VM idle timer reset"
+            ),
+            IdleDecision::Strike(strike) => tracing::info!(
+                strike,
+                idle_for_seconds = sample.sampled_at.duration_since(last_activity).as_secs(),
+                "VM idle strike"
+            ),
+            IdleDecision::Shutdown => {
+                Box::pin(self.final_idle_check_and_shutdown(sample.instance_pid, barbirolli)).await;
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.id()))]
+    async fn final_idle_check_and_shutdown(&mut self, expected_pid: i32, barbirolli: &Barbirolli) {
+        if !matches!(self, Self::Managed(managed) if managed.pid == expected_pid) {
+            tracing::debug!("VM instance changed before final idle check");
+            return;
+        }
+        let Some(observation) = self.observation(barbirolli.idle_policy) else {
+            tracing::warn!("final idle observation failed; postponing shutdown");
+            return;
+        };
+        if observation.decision != IdleDecision::Shutdown {
+            tracing::info!("final idle check observed activity");
+            return;
+        }
+        tracing::info!("VM remained idle; beginning automatic shutdown");
+        if let Err(error) = Box::pin(self.shutdown(barbirolli)).await {
+            tracing::error!(%error, "automatic VM shutdown failed");
         }
     }
 
