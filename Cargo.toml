@@ -25,6 +25,7 @@ dashmap = "6.2.1"
 envy = "0.4.2"
 nonempty-collections = "1.4.0"
 fctools = { version = "=0.6.0", default-features = false }
+futures = "0.3.32"
 http-body-util = "0.1.3"
 nlink = "0.25.0"
 serde = { version = "1.0.228", features = ["derive"] }

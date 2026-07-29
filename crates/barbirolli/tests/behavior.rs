@@ -208,7 +208,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         .await
         .expect("failed to create VM");
 
-    let listed = Box::pin(manager.list()).await;
+    let listed = manager.list().await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
     assert_eq!(listed[0].status, VmStatus::Discovered);
@@ -226,7 +226,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     }
     {
         let mut vm = manager.vm_mut(id).expect("missing VM");
-        Box::pin(vm.shutdown(&manager))
+        vm.shutdown(&manager)
             .await
             .expect("discovered shutdown should be idempotent");
     }
@@ -260,7 +260,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         .expect("VM deletion deadlocked")
         .expect("failed to delete VM");
     delete_thread.join().expect("VM deletion thread panicked");
-    assert!(Box::pin(manager.list()).await.is_empty());
+    assert!(manager.list().await.is_empty());
     assert!(vm_root.join(id.to_string()).join("vmlinux").exists());
     assert!(vm_root.join(id.to_string()).join("rootfs.ext4").exists());
     let deleted_config = fs::read(vm_root.join(id.to_string()).join("config.json"))
@@ -273,7 +273,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     let reopened = Barbirolli::new(reopened_store, firecracker)
         .await
         .expect("failed to reopen Barbirolli");
-    assert!(Box::pin(reopened.list()).await.is_empty());
+    assert!(reopened.list().await.is_empty());
     assert!(matches!(
         reopened.vm(id),
         Err(LifecycleError::NotFound(missing)) if missing == id

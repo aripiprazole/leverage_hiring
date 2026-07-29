@@ -1,18 +1,50 @@
-# SSH
+# SSH VM service
 
-- `serde`, `serde_derive`
+This document describes the intended system and the implementation that exists today. The
+architecture is the same in both: Elhone owns HTTP, Barbirolli owns VM state and host resources,
+and Firecracker runs only on Linux. Where the code takes a different implementation path, it is
+called out explicitly below instead of pretending the spec and the current tree are identical.
+
+## Runtime and development constraints
+
+- The application runs only on Linux.
+- Every crate is a member of the root Cargo workspace.
+- `flake.nix` is the development-toolchain source of truth on Linux and macOS.
+- Runtime execution stays inside Linux or Lima. macOS support exists for development and
+  rust-analyzer, not for running Firecracker.
+
+### Current implementation differences
+
+These are differences in implementation shape, not changes to the ownership model:
+
+- Firecracker uses one service-level API socket at
+  `$VM_ROOT/.sockets/firecracker.socket`; it is not part of each VM's `NetworkSpec`.
+- Guest IPv4 configuration is passed through the kernel boot arguments instead of being written
+  to a network configuration file inside the rootfs.
+- `starting` and `shutting_down` are logged transitions and public status variants, but they are
+  not stored as separate `BarbirolliVm` states. The per-VM write guard is held for the whole
+  transition, so another request cannot observe either intermediate state.
+- Linux storage, networking, and managed-lifecycle modules are currently behind
+  `#[cfg(target_os = "linux")]`, with unsupported-platform stubs on macOS. This differs from the
+  original goal of keeping the complete production implementation visible to rust-analyzer on
+  macOS.
+- `#[firecracker_test]` serializes privileged tests and allocates a unique VM ID. When
+  `RUN_ON_LIMA` is set and local prerequisites are missing, it reruns the selected test inside
+  Lima instead of generating an ignored test.
+
+The rest of this document describes the intended behavior unless a difference is listed above.
 
 ## `local` feature
 
-- Cargo feature, disabled by default and intended only for development.
-- Allows everyone to create/start/stop/delete/list VMs through Elhone.
-- Elhone must bind to a loopback address while `local` is enabled.
-- Without `local`, unauthenticated Elhone requests return `403 Forbidden`.
+- This is a Cargo feature, disabled by default and only intended for development.
+- It disables authentication for every Elhone operation.
+- While enabled, Elhone must bind to a loopback address.
+- Without it, Elhone requires a bearer token and rejects unauthenticated requests with
+  `403 Forbidden`.
 
-# Module: Elhone
+# Elhone: HTTP boundary
 
-- `axum`
-- Uses an `Arc<Barbirolli>`.
+- Built with `axum` around an `Arc<Barbirolli>`.
 - Binds to `ELHONE_ADDR`, defaulting to `127.0.0.1:3000`; `local` rejects non-loopback values.
 - JSON responses, including `{"error": "..."}` for errors.
 - Unknown VMs return `404`, invalid state transitions return `409`, invalid input returns `422`,
@@ -111,7 +143,7 @@ POST /vms
   design and is not revalidated here.
 - Creates a VM and returns `201 Created` with its persisted numeric ID.
 
-# Module: Barbirolli
+# Barbirolli: VM and host-resource boundary
 
 - `fctools`
 - `nlink`
@@ -162,7 +194,7 @@ impl BarbirolliVm {
 }
 ```
 
-## Vm Specs
+## VM types and state
 
 ```rust
 type Result<T, E = LifecycleError> = std::result::Result<T, E>;
@@ -236,10 +268,8 @@ impl ManagedVm {
     fn shutdown(&mut self) -> Result<fctools::vm::VmShutdownOutcome>;
 }
 
-type FirecrackerResourceSystem =
-    fctools::vm::ResourceSystem<DirectProcessSpawner, TokioRuntime>;
-type FirecrackerVm =
-    fctools::vm::Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
+type FirecrackerResourceSystem = fctools::vm::ResourceSystem<...>;
+type FirecrackerVm = fctools::vm::Vm<...>;
 
 #[derive(Serialize, Deserialize)]
 struct VmInput {
@@ -312,7 +342,7 @@ The snippets are illustrative, but their ownership, state transitions, and error
 behavior are normative. Startup rollback and cleanup must attempt every owned resource and retain
 all failures.
 
-## VM directory
+## Persistence and VM directory
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
 - Filesystem operations follow normal OS behavior, including following symlinks. Missing or
@@ -334,7 +364,7 @@ all failures.
 - If no keys are supplied, leave intact the default key already embedded in the source image.
 - `scripts/setup` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
 
-## Networking
+## Host and guest networking
 
 ```rust
 
@@ -473,7 +503,7 @@ impl VmNetworkSpec {
 }
 ```
 
-## Lifecycle
+## Lifecycle and reconciliation
 
 ### Warmup
 
@@ -497,11 +527,12 @@ x86_64 and `reboot\n` on aarch64, followed by pause-and-kill and kill fallbacks.
 - Startup rollback, cleanup, warmup reconciliation, and shutdown failures must never be silent.
 - Never log authorized keys, credentials, or request bodies containing secrets.
 
-# Code Style
+# Implementation rules
 
-- Illegal states shouldn't be representable. Parsing > validating.
-- If you need to repeat code 2 times, copy and paste, it's better for readability, if more than 2
-  or 3 times, think before copying and pasting
+- Illegal states should not be representable. Parse at the boundary instead of carrying invalid
+  values and validating them repeatedly.
+- Copying a small piece of code twice is often clearer than hiding it behind an abstraction. If it
+  appears a third time, stop and decide whether there is a real shared concept.
 - Host networking and Firecracker API operations use Rust libraries, not `ip`, `nft`, or `curl`
   subprocesses. Launching Firecracker itself is expected.
 
@@ -545,9 +576,6 @@ flowchart TD
 The timing and CPU bands are configurable with `IDLE_INITIAL_INTERVAL_SECONDS`,
 `IDLE_STRIKE_INTERVAL_SECONDS`, `IDLE_FINAL_INTERVAL_SECONDS`, `IDLE_CPU_HIGH_PERCENT`, and
 `IDLE_CPU_LOW_PERCENT`. The first sample and any regressed counter establish a new baseline.
-- Every crate must be a member of the root Cargo workspace.
-- The application runs only on Linux, but production code must remain visible to rust-analyzer on
-  macOS. Do not hide it behind `#[cfg(target_os = "linux")]`.
 
 ## `flake.nix`
 
@@ -563,7 +591,7 @@ The timing and CPU bands are configurable with `IDLE_INITIAL_INTERVAL_SECONDS`,
 ## Testing
 
 - Use `cargo-mutants` for meaningful business and lifecycle logic.
-- Avoiding unit testing that only improves coverage
+- Do not add unit tests only to improve coverage.
 - Cover API state transitions, concurrent operations, restart discovery, rollback, cleanup, address
   allocation, network isolation, and one complete privileged Firecracker lifecycle.
 
@@ -584,6 +612,3 @@ if linux && kvm && firecracker && artifacts {
   panic!("install the missing Firecracker prerequisites or enable `RUN_ON_LIMA`")
 }
 ```
-
-Required checks are formatting, Clippy with warnings denied, workspace tests, `cargo-mutants`, and
-the ignored privileged tests on Linux/Lima.

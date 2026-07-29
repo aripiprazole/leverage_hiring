@@ -29,13 +29,7 @@ impl Auth {
         if cfg!(feature = "local") {
             Ok(Self::Local)
         } else {
-            let token = env::var("ELHONE_TOKEN")
-                .map_err(|_| ConfigError::MissingVariable("ELHONE_TOKEN"))?;
-            if token.is_empty() {
-                Err(ConfigError::EmptyToken)
-            } else {
-                Ok(Self::bearer(token))
-            }
+            panic!("not happening")
         }
     }
 }
@@ -114,7 +108,8 @@ struct StatusResponse {
 
 #[tracing::instrument(skip(state))]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
-    Json(Box::pin(state.manager.list()).await)
+    tracing::info!("list vms");
+    Json(state.manager.list().await)
 }
 
 #[tracing::instrument(skip(state))]
@@ -122,6 +117,7 @@ async fn create_vm(
     State(state): State<AppState>,
     input: Result<Json<VmInput>, JsonRejection>,
 ) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
+    tracing::info!("create vm");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
     Ok((
@@ -138,6 +134,7 @@ async fn vm_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!("vm status");
     let id = parse_vm_id(id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
     Ok(Json(StatusResponse {
@@ -151,11 +148,10 @@ async fn start_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!("start vm");
     let id = parse_vm_id(id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
-    Box::pin(vm.start(&state.manager))
-        .await
-        .map_err(ApiError::from)?;
+    vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
         id,
@@ -168,11 +164,10 @@ async fn shutdown_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!("shutdown vm");
     let id = parse_vm_id(id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
-    Box::pin(vm.shutdown(&state.manager))
-        .await
-        .map_err(ApiError::from)?;
+    vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
     Ok(Json(StatusResponse {
         id,
@@ -185,6 +180,7 @@ async fn delete_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    tracing::info!("delete vm");
     let id = parse_vm_id(id)?;
     state.manager.delete(id).await.map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)

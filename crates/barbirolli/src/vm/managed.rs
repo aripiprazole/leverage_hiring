@@ -28,7 +28,9 @@ use fctools::{
         },
     },
 };
+use futures::{FutureExt, future::BoxFuture};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::{Instrument as _, info_span};
 use validated::Validated::{self, Fail, Good};
 
 use crate::{
@@ -61,7 +63,6 @@ struct VmCgroup {
 }
 
 impl VmSpec {
-    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.id))]
     async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm, LifecycleError> {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
@@ -82,34 +83,43 @@ impl VmSpec {
         Ok(FirecrackerVm::prepare(executor, resources, installation, configuration).await?)
     }
 
-    pub(crate) async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<(), LifecycleError> {
-        let stale_processes = self
-            .kill_stale_processes(barbirolli)
-            .await
-            .map_err(ReconcileFailure::Processes);
-        let stale_network = self
-            .network
-            .cleanup_stale()
-            .await
-            .map_err(ReconcileFailure::Network);
-        let stale_socket = match std::fs::remove_file(&barbirolli.api_socket) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(ReconcileFailure::Socket(error)),
-        };
-        let stale_health = self
-            .cleanup_stale_health()
-            .map_err(ReconcileFailure::Health);
-        let reconciliation = Validated::from(stale_processes).map4(
-            Validated::from(stale_network),
-            Validated::from(stale_socket),
-            Validated::from(stale_health),
-            |(), (), (), ()| (),
-        );
-        match reconciliation {
-            Good(()) => Ok(()),
-            failures @ Fail(_) => Err(LifecycleError::Reconcile(failures)),
+    #[tracing::instrument(skip(self, barbirolli))]
+    pub(crate) fn reconcile<'a>(
+        &'a self,
+        barbirolli: &'a Barbirolli,
+    ) -> BoxFuture<'a, Result<(), LifecycleError>> {
+        let vm_id = self.id;
+        async move {
+            let stale_processes = self
+                .kill_stale_processes(barbirolli)
+                .await
+                .map_err(ReconcileFailure::Processes);
+            let stale_network = self
+                .network
+                .cleanup_stale()
+                .await
+                .map_err(ReconcileFailure::Network);
+            let stale_socket = match std::fs::remove_file(&barbirolli.api_socket) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(ReconcileFailure::Socket(error)),
+            };
+            let stale_health = self
+                .cleanup_stale_health()
+                .map_err(ReconcileFailure::Health);
+            let reconciliation = Validated::from(stale_processes).map4(
+                Validated::from(stale_network),
+                Validated::from(stale_socket),
+                Validated::from(stale_health),
+                |(), (), (), ()| (),
+            );
+            match reconciliation {
+                Good(()) => Ok(()),
+                failures @ Fail(_) => Err(LifecycleError::Reconcile(failures)),
+            }
         }
+        .instrument(info_span!("reconcile_vm", %vm_id, operation = "reconcile"))
+        .boxed()
     }
 
     async fn kill_stale_processes(&self, barbirolli: &Barbirolli) -> Result<(), std::io::Error> {
@@ -436,7 +446,6 @@ fn spawn_metrics_reader(
     })
 }
 
-#[tracing::instrument(skip(latest), fields(path = %path.display()), err)]
 async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
     let file = tokio::fs::File::open(path)
         .await

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::{LifecycleError, Result, VmSummary};
 use crate::{IdlePolicy, VmId, VmInput, VmSpec, VmStore};
+use futures::{FutureExt, future::BoxFuture};
 
 pub struct BarbirolliVm;
 
@@ -18,12 +19,12 @@ impl BarbirolliVm {
         unreachable!("Barbirolli VMs require Linux")
     }
 
-    pub async fn start(&mut self, _barbirolli: &Barbirolli) -> Result<()> {
-        Err(LifecycleError::UnsupportedPlatform)
+    pub fn start(&mut self, _barbirolli: &Barbirolli) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
     }
 
-    pub async fn shutdown(&mut self, _barbirolli: &Barbirolli) -> Result<()> {
-        Err(LifecycleError::UnsupportedPlatform)
+    pub fn shutdown(&mut self, _barbirolli: &Barbirolli) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
     }
 }
 
@@ -54,8 +55,8 @@ impl Barbirolli {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
-    pub async fn list(&self) -> Vec<VmSummary> {
-        Vec::new()
+    pub fn list(&self) -> BoxFuture<'_, Vec<VmSummary>> {
+        async move { Vec::new() }.boxed()
     }
 
     pub fn vm(&self, _vm_id: VmId) -> Result<BarbirolliVm, LifecycleError> {
