@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use barbirolli::{Barbirolli, MemoryMib, UserName, VcpuCount, VmInput, VmStatus, VmStore};
+use barbirolli::{Barbirolli, MemoryMib, VcpuCount, VmInput, VmStatus, VmStore};
 use barbirolli_derive::firecracker_test;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -24,9 +24,6 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
 
     let first = manager
         .create(VmInput {
-            user: "global-socket-first"
-                .parse::<UserName>()
-                .expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
@@ -127,9 +124,6 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
 
     let second = manager
         .create(VmInput {
-            user: "global-socket-second"
-                .parse::<UserName>()
-                .expect("valid user"),
             vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(192).expect("valid memory"),
             authorized_keys: Vec::new(),

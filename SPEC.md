@@ -38,7 +38,6 @@ GET /vms
 [
   {
     "id": 0,
-    "user": "gabrielle",
     "status": "running",
     "port_bindings": [
       {
@@ -92,7 +91,6 @@ POST /vms/:id/shutdown
 POST /vms
 
 {
-  "user": "gabrielle",
   "vcpu_count": 2,
   "memory_mib": 1024,
   "authorized_keys": ["ssh-ed25519 ..."],
@@ -111,7 +109,7 @@ POST /vms
   `{ "internal": 22, "external": 2222 }` forwards host TCP port 2222 to guest TCP port 22.
 - Ports are nonzero `u16` values. External-port uniqueness is guaranteed by the provisioning
   design and is not revalidated here.
-- Creates one VM per user and returns `201 Created` with its persisted numeric ID.
+- Creates a VM and returns `201 Created` with its persisted numeric ID.
 
 # Module: Barbirolli
 
@@ -172,11 +170,10 @@ type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 /// Parsed in the range 0..16384 and persisted in config.json.
 struct VmId(u16);
 
-/// `UserName`, `VcpuCount`, `MemoryMib`, and `AuthorizedKey` parse their constraints during
+/// `VcpuCount`, `MemoryMib`, and `AuthorizedKey` parse their constraints during
 /// deserialization.
 struct VmSpec {
     vm_id: VmId,
-    user: UserName,
     artifact_dir: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
@@ -244,7 +241,6 @@ type FirecrackerVm =
 
 #[derive(Serialize, Deserialize)]
 struct VmInput {
-    user: UserName,
     vcpu_count: VcpuCount, // 1..=31
     memory_mib: MemoryMib, // 1..=2047
     authorized_keys: Vec<AuthorizedKey>,
@@ -300,7 +296,6 @@ fn firecracker_vm_config(
 
 enum LifecycleError {
     InvalidInput,
-    DuplicateUser,
     NotFound,
     InvalidTransition,
     Storage,
@@ -318,14 +313,12 @@ all failures.
 ## VM directory
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
-- One user owns one VM. User names are parsed as non-empty ASCII alphanumeric names plus `_.-`;
-  separators, `..`, and absolute paths are rejected.
 - Filesystem operations follow normal OS behavior, including following symlinks. Missing or
   unusable paths fail through ordinary I/O errors.
 - A VM gets the lowest free `VmId` in `0..16384`; the ID is persisted and may be reused only
   after deletion.
 - VM creation is serialized and built in a temporary directory, then atomically renamed.
-- Each `$VM_ROOT/<user>` contains:
+- Each `$VM_ROOT/<vm_id>` contains:
   - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
   - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
   - `config.json`: versioned `VmSpec`, including the stable `VmId` and port bindings.
@@ -493,8 +486,7 @@ x86_64 and `reboot\n` on aarch64, followed by pause-and-kill and kill fallbacks.
 
 - Use `tracing` and a formatted `tracing_subscriber`.
 - `RUST_LOG` controls filtering, with `info` as the fallback.
-- Log HTTP method/path/status/latency and every VM state transition with `vm_id`, `user`, and
-  operation.
+- Log HTTP method/path/status/latency and every VM state transition with `vm_id` and operation.
 - Startup rollback, cleanup, warmup reconciliation, and shutdown failures must never be silent.
 - Never log authorized keys, credentials, or request bodies containing secrets.
 

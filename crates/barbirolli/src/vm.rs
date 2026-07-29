@@ -15,7 +15,6 @@ pub(crate) mod managed;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmInput {
-    pub user: UserName,
     pub vcpu_count: VcpuCount,
     pub memory_mib: MemoryMib,
     #[serde(default)]
@@ -28,7 +27,6 @@ pub struct VmInput {
 #[serde(deny_unknown_fields)]
 pub struct VmSpec {
     pub id: VmId,
-    pub user: UserName,
     pub artifact_dir: PathBuf,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
@@ -74,44 +72,6 @@ impl<'de> Deserialize<'de> for Port {
         D: Deserializer<'de>,
     {
         Self::try_from(u16::deserialize(deserializer)?).map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
-#[serde(transparent)]
-#[display("{_0}")]
-pub struct UserName(String);
-
-impl FromStr for UserName {
-    type Err = ParseValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let is_safe = !value.is_empty()
-            && value != "."
-            && value != ".."
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-        is_safe
-            .then(|| Self(value.to_owned()))
-            .ok_or_else(|| ParseValueError::new("user name", value))
-    }
-}
-
-impl AsRef<str> for UserName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for UserName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
     }
 }
 

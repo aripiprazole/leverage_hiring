@@ -1,7 +1,7 @@
 use serde::Serialize;
 use validated::Validated;
 
-use crate::{NetworkSpec, PortBinding, StorageError, UserName, VmId};
+use crate::{NetworkSpec, PortBinding, StorageError, VmId};
 
 #[cfg(feature = "linux")]
 mod linux;
@@ -28,7 +28,6 @@ pub enum VmStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VmSummary {
     pub id: VmId,
-    pub user: UserName,
     pub status: VmStatus,
     pub port_bindings: Vec<PortBinding>,
     pub network: NetworkSpec,

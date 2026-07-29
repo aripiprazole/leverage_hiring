@@ -42,10 +42,7 @@ pub struct ManagedVm {
 }
 
 impl VmSpec {
-    #[tracing::instrument(
-        skip(self, barbirolli),
-        fields(vm_id = %self.id, user = %self.user)
-    )]
+    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.id))]
     async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm, LifecycleError> {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,

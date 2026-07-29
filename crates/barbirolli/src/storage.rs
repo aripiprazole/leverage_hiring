@@ -1,7 +1,5 @@
 use std::{io, path::PathBuf};
 
-use crate::UserName;
-
 #[cfg(feature = "linux")]
 mod linux;
 #[cfg(not(feature = "linux"))]
@@ -18,8 +16,6 @@ pub type Result<T, E = StorageError> = std::result::Result<T, E>;
 pub enum StorageError {
     #[error("invalid VM input: {0}")]
     InvalidInput(String),
-    #[error("user {0} already owns a VM")]
-    DuplicateUser(UserName),
     #[error("no VM IDs remain")]
     IdsExhausted,
     #[error("socket directory")]

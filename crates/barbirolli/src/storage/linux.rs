@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{NetworkSpec, VmId, VmInput, VmSpec};
 
-const CONFIG_VERSION: u16 = 1;
+const CONFIG_VERSION: u16 = 2;
 const SOCKET_DIRECTORY: &str = ".sockets";
 
 #[cfg(target_os = "linux")]
@@ -132,20 +132,12 @@ impl VmStore {
         })
     }
 
-    #[tracing::instrument(
-        skip(self, input),
-        fields(user = %input.user),
-        err
-    )]
+    #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmSpec, StorageError> {
-        let final_dir = self.vm_root.dir.join(input.user.as_ref());
-        if final_dir.exists() {
-            return Err(StorageError::DuplicateUser(input.user));
-        }
-
         let source_kernel = self.image_root.join("vmlinux");
         let source_rootfs = self.image_root.join("alpine.ext4");
         let id = self.vm_root.next_id()?;
+        let final_dir = self.vm_root.dir.join(id.to_string());
 
         let tmp = tempfile::Builder::new()
             .prefix(".creating-")
@@ -170,7 +162,6 @@ impl VmStore {
 
         let persisted = PersistedVmSpec::new(VmSpec {
             id,
-            user: input.user,
             artifact_dir: final_dir.clone(),
             kernel: final_dir.join("vmlinux"),
             rootfs: final_dir.join("rootfs.ext4"),
@@ -185,11 +176,7 @@ impl VmStore {
         Ok(persisted.spec)
     }
 
-    #[tracing::instrument(
-        skip(self, spec),
-        fields(vm_id = %spec.id, user = %spec.user),
-        err
-    )]
+    #[tracing::instrument(skip(self, spec), fields(vm_id = %spec.id), err)]
     pub fn delete(&self, spec: &VmSpec) -> Result<()> {
         remove_dir_all(&spec.artifact_dir)
             .map_err(|error| StorageError::io(&spec.artifact_dir, error))
@@ -443,10 +430,11 @@ impl VmRootFolderItem {
         let directory = &descriptor.directory;
         let config = &descriptor.config;
         let spec = &persisted_spec.spec;
-        if directory.file_name().and_then(|name| name.to_str()) != Some(spec.user.as_ref()) {
+        let expected_name = spec.id.to_string();
+        if directory.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
             return Err(StorageError::InvalidConfig {
                 path: directory.to_owned(),
-                message: "directory name does not match configured user".to_owned(),
+                message: "directory name does not match configured VM ID".to_owned(),
             });
         }
         let expected = [
@@ -569,7 +557,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::{MountedRootfs, VmStore};
     #[cfg(target_os = "linux")]
-    use crate::{AuthorizedKey, MemoryMib, UserName, VcpuCount, VmInput};
+    use crate::{AuthorizedKey, MemoryMib, VcpuCount, VmInput};
 
     #[test]
     fn authorized_keys_are_installed_for_root_with_strict_permissions() {
@@ -621,7 +609,6 @@ mod tests {
         let store = VmStore::new(vm_root, image_root).expect("failed to create VM store");
         let spec = store
             .create(VmInput {
-                user: "root-vm".parse::<UserName>().expect("valid user"),
                 authorized_keys: vec![
                     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com"
                         .parse::<AuthorizedKey>()

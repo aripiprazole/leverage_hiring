@@ -225,7 +225,6 @@ impl From<LifecycleError> for ApiError {
     fn from(error: LifecycleError) -> Self {
         let status = match &error {
             LifecycleError::NotFound(_) => StatusCode::NOT_FOUND,
-            LifecycleError::Storage(StorageError::DuplicateUser(_)) => StatusCode::CONFLICT,
             LifecycleError::Storage(StorageError::InvalidInput(_) | StorageError::IdsExhausted) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -274,16 +273,13 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use barbirolli::{
-        NetworkSpec, Port, PortBinding, UserName, VmId, VmInput, VmStatus, VmSummary,
-    };
+    use barbirolli::{NetworkSpec, Port, PortBinding, VmId, VmInput, VmStatus, VmSummary};
     use serde_json::json;
 
     #[test]
     fn vm_input_rejects_artifact_selection() {
         for (field, value) in [("kernel", "vmlinux"), ("rootfs", "alpine.ext4")] {
             let mut input = json!({
-                "user": "alice",
                 "vcpu_count": 1,
                 "memory_mib": 128
             });
@@ -300,9 +296,20 @@ mod tests {
     }
 
     #[test]
+    fn vm_input_rejects_user() {
+        let error = serde_json::from_value::<VmInput>(json!({
+            "user": "alice",
+            "vcpu_count": 1,
+            "memory_mib": 128
+        }))
+        .expect_err("user must not be accepted");
+
+        assert!(error.to_string().contains("unknown field `user`"));
+    }
+
+    #[test]
     fn vm_input_accepts_typed_port_bindings_and_defaults_to_none() {
         let without_bindings = serde_json::from_value::<VmInput>(json!({
-            "user": "alice",
             "vcpu_count": 1,
             "memory_mib": 128
         }))
@@ -310,7 +317,6 @@ mod tests {
         assert!(without_bindings.port_bindings.is_empty());
 
         let with_bindings = serde_json::from_value::<VmInput>(json!({
-            "user": "alice",
             "vcpu_count": 1,
             "memory_mib": 128,
             "port_bindings": [
@@ -340,7 +346,6 @@ mod tests {
             binding[field] = 0.into();
 
             let error = serde_json::from_value::<VmInput>(json!({
-                "user": "alice",
                 "vcpu_count": 1,
                 "memory_mib": 128,
                 "port_bindings": [binding]
@@ -355,7 +360,6 @@ mod tests {
         let id = VmId::try_from(0).expect("valid VM ID");
         let summary = VmSummary {
             id,
-            user: "alice".parse::<UserName>().expect("valid user"),
             status: VmStatus::Running,
             network: NetworkSpec::new(id).expect("valid network"),
             port_bindings: vec![PortBinding {
@@ -368,7 +372,6 @@ mod tests {
             serde_json::to_value(summary).expect("summary should serialize"),
             json!({
                 "id": 0,
-                "user": "alice",
                 "status": "running",
                 "port_bindings": [
                     {

@@ -111,20 +111,14 @@ impl Barbirolli {
             .ok_or(LifecycleError::NotFound(vm_id))
     }
 
-    #[tracing::instrument(
-        skip(self, input),
-        fields(user = %input.user),
-        err
-    )]
+    #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.accepting_operations()?;
         let spec = self.store.create(input).await?;
         let id = spec.id;
-        let user = spec.user.clone();
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
         tracing::info!(
             vm_id = %id,
-            user = %user,
             operation = "create",
             status = "discovered",
             "VM state transition"
@@ -147,7 +141,6 @@ impl Barbirolli {
         };
         tracing::info!(
             vm_id = %vm_id,
-            user = %vm.get().spec().user,
             operation = "delete",
             status = "deleting",
             "VM state transition"
@@ -158,7 +151,6 @@ impl Barbirolli {
         vm.remove();
         tracing::info!(
             vm_id = %spec.id,
-            user = %spec.user,
             operation = "delete",
             status = "deleted",
             "VM state transition"
@@ -226,28 +218,24 @@ impl BarbirolliVm {
         match self {
             Self::Discovered(spec) => VmSummary {
                 id: spec.id,
-                user: spec.user.clone(),
                 status: VmStatus::Discovered,
                 port_bindings: spec.port_bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Failed(spec) => VmSummary {
                 id: spec.id,
-                user: spec.user.clone(),
                 status: VmStatus::Failed,
                 port_bindings: spec.port_bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Managed(vm) if vm.failed => VmSummary {
                 id: vm.spec.id,
-                user: vm.spec.user.clone(),
                 status: VmStatus::Failed,
                 port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
             },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
-                user: vm.spec.user.clone(),
                 status: VmStatus::Running,
                 port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
@@ -255,10 +243,7 @@ impl BarbirolliVm {
         }
     }
 
-    #[tracing::instrument(
-        skip(self, barbirolli),
-        fields(vm_id = %self.spec().id, user = %self.spec().user)
-    )]
+    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.spec().id))]
     pub async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
         let spec = match self {
             BarbirolliVm::Discovered(spec) => spec.clone(),
@@ -277,7 +262,6 @@ impl BarbirolliVm {
         };
         tracing::info!(
             vm_id = %spec.id,
-            user = %spec.user,
             operation = "start",
             status = "starting",
             "VM state transition"
@@ -286,7 +270,6 @@ impl BarbirolliVm {
             Ok(managed) => {
                 tracing::info!(
                     vm_id = %spec.id,
-                    user = %spec.user,
                     operation = "start",
                     status = "running",
                     "VM state transition"
@@ -297,7 +280,6 @@ impl BarbirolliVm {
             Err(error) => {
                 tracing::error!(
                     vm_id = %spec.id,
-                    user = %spec.user,
                     operation = "start",
                     status = "failed",
                     %error,
@@ -309,10 +291,7 @@ impl BarbirolliVm {
         }
     }
 
-    #[tracing::instrument(
-        skip(self, barbirolli),
-        fields(vm_id = %self.spec().id, user = %self.spec().user)
-    )]
+    #[tracing::instrument(skip(self, barbirolli), fields(vm_id = %self.spec().id))]
     pub async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
         match self {
             Self::Discovered(_) => Ok(()),
@@ -324,7 +303,6 @@ impl BarbirolliVm {
             Self::Managed(managed) => {
                 tracing::info!(
                     vm_id = %managed.spec.id,
-                    user = %managed.spec.user,
                     operation = "shutdown",
                     status = "shutting_down",
                     "VM state transition"
@@ -335,7 +313,6 @@ impl BarbirolliVm {
                     let spec = managed.spec.clone();
                     tracing::info!(
                         vm_id = %spec.id,
-                        user = %spec.user,
                         operation = "shutdown",
                         status = "discovered",
                         "VM state transition"
@@ -346,7 +323,6 @@ impl BarbirolliVm {
                     managed.failed = true;
                     tracing::error!(
                         vm_id = %managed.spec.id,
-                        user = %managed.spec.user,
                         operation = "shutdown",
                         status = "failed",
                         "VM shutdown failed"

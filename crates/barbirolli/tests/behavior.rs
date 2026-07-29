@@ -9,7 +9,7 @@ use std::{
 
 use barbirolli::{
     AuthorizedKey, Barbirolli, LifecycleError, MemoryMib, NetworkSpec, Port, PortBinding,
-    StorageError, UserName, VcpuCount, VmId, VmInput, VmStatus, VmStore,
+    VcpuCount, VmId, VmInput, VmStatus, VmStore,
 };
 
 const AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
@@ -68,7 +68,6 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         VmStore::new(vm_root.clone(), image_root.clone()).expect("failed to create the VM store");
     let alice = store
         .create(VmInput {
-            user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
@@ -77,6 +76,7 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         .await
         .expect("failed to create Alice's VM");
     assert_eq!(u16::from(alice.id), 0);
+    assert_eq!(alice.artifact_dir, vm_root.join("0"));
     assert_eq!(
         fs::read(&alice.kernel).expect("failed to read copied kernel"),
         b"kernel"
@@ -90,24 +90,12 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
         "authorized keys must not be copied beside VM artifacts"
     );
 
-    let duplicate = store
-        .create(VmInput {
-            user: "alice".parse::<UserName>().expect("valid user"),
-            vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
-            memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            authorized_keys: Vec::new(),
-            port_bindings: Vec::new(),
-        })
-        .await;
-    assert!(matches!(duplicate, Err(StorageError::DuplicateUser(_))));
-
     let bob_binding = PortBinding {
         internal: Port::try_from(80).expect("valid internal port"),
         external: Port::try_from(8080).expect("valid external port"),
     };
     let bob = store
         .create(VmInput {
-            user: "bob".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(192).expect("valid memory"),
             authorized_keys: Vec::new(),
@@ -124,7 +112,6 @@ async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_side
     store.delete(&alice).expect("failed to delete Alice's VM");
     let carol = store
         .create(VmInput {
-            user: "carol".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
@@ -179,19 +166,17 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         .expect("failed to create Barbirolli");
     let id = manager
         .create(VmInput {
-            user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
             port_bindings: Vec::new(),
         })
         .await
-        .expect("failed to create Alice's VM");
+        .expect("failed to create VM");
 
     let listed = manager.list().await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
-    assert_eq!(listed[0].user.as_ref(), "alice");
     assert_eq!(listed[0].status, VmStatus::Discovered);
     assert_eq!(
         listed[0].network,
@@ -248,7 +233,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         .expect("failed to drain an empty manager");
     let drained = manager
         .create(VmInput {
-            user: "after-drain".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),

@@ -20,7 +20,6 @@ limactl shell provisioning \
     -X POST http://127.0.0.1:3000/vms \
     -H 'Content-Type: application/json' \
     -d '{
-      "user": "alice",
       "vcpu_count": 1,
       "memory_mib": 256,
       "authorized_keys": [],
