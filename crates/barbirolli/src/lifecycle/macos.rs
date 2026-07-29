@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use super::{LifecycleError, Result, VmSummary};
-use crate::{IdlePolicy, VmId, VmInput, VmSpec, VmStore};
+use crate::{IdlePolicy, LifecycleError, Result, VmId, VmInput, VmSpec, VmStore, VmSummary};
 use futures::{FutureExt, future::BoxFuture};
 
 pub struct BarbirolliVm;

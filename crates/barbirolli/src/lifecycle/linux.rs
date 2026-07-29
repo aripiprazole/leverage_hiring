@@ -22,10 +22,10 @@ use nonempty_collections::NEVec;
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
-use crate::vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm};
 use crate::{
     StorageError, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
+    vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
 };
 
 #[allow(clippy::large_enum_variant)]
