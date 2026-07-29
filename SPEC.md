@@ -35,7 +35,21 @@ GET /vms
 ```
 
 ```json
-[{ "id": 0, "user": "gabrielle", "status": "running" }]
+[
+  {
+    "id": 0,
+    "user": "gabrielle",
+    "status": "running",
+    "network": {
+      "vm_id": 0,
+      "tap": "fc-tap0",
+      "subnet": "172.16.0.0",
+      "host_ip": "172.16.0.1",
+      "guest_ip": "172.16.0.2",
+      "guest_mac": "06:00:ac:10:00:02"
+    }
+  }
+]
 ```
 
 ## GET `/vms/:id/status`
@@ -75,13 +89,12 @@ POST /vms
   "user": "gabrielle",
   "vcpu_count": 2,
   "memory_mib": 1024,
-  "kernel": "vmlinux",
-  "rootfs": "alpine.ext4",
   "authorized_keys": ["ssh-ed25519 ..."]
 }
 ```
 
-- `kernel` and `rootfs` are artifact names resolved inside `IMAGE_ROOT`, never arbitrary host paths.
+- The service always copies `IMAGE_ROOT/vmlinux` and `IMAGE_ROOT/alpine.ext4`.
+- Requests containing `kernel` or `rootfs` are invalid input.
 - Creates one VM per user and returns `201 Created` with its persisted numeric ID.
 
 # Module: Barbirolli
@@ -144,8 +157,8 @@ type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 /// Parsed in the range 0..16384 and persisted in config.json.
 struct VmId(u16);
 
-/// `UserName`, `VcpuCount`, `MemoryMib`, `ArtifactName`, and `AuthorizedKey` parse their
-/// constraints during deserialization.
+/// `UserName`, `VcpuCount`, `MemoryMib`, and `AuthorizedKey` parse their constraints during
+/// deserialization.
 struct VmSpec {
     vm_id: VmId,
     user: UserName,
@@ -219,8 +232,6 @@ struct VmInput {
     user: UserName,
     vcpu_count: VcpuCount, // 1..=31
     memory_mib: MemoryMib, // 1..=2047
-    kernel: ArtifactName,
-    rootfs: ArtifactName,
     authorized_keys: Vec<AuthorizedKey>,
 }
 
@@ -285,19 +296,21 @@ all failures.
 
 ## VM directory
 
-- `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds allowed source artifacts.
+- `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
 - One user owns one VM. User names are parsed as non-empty ASCII alphanumeric names plus `_.-`;
-  separators, `..`, absolute paths, and symlinks are rejected.
+  separators, `..`, and absolute paths are rejected.
+- Filesystem operations follow normal OS behavior, including following symlinks. Missing or
+  unusable paths fail through ordinary I/O errors.
 - A VM gets the lowest free `VmId` in `0..16384`; the ID is persisted and may be reused only
   after deletion.
 - VM creation is serialized and built in a temporary directory, then atomically renamed.
 - Each `$VM_ROOT/<user>` contains:
-  - `vmlinux`: hard-linked or copied kernel.
-  - `rootfs.ext4`: private writable copy of the rootfs.
+  - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
+  - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
   - `config.json`: versioned `VmSpec`, including the stable `VmId`.
   - `authorized_keys`: OpenSSH public keys.
 - If no keys are supplied, copy the file named by `DEFAULT_AUTHORIZED_KEYS`.
-- Artifact names are resolved and canonicalized below `IMAGE_ROOT`.
+- `scripts/setup` writes the prepared rootfs directly to `IMAGE_ROOT/alpine.ext4`.
 
 ## Networking
 

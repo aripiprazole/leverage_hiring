@@ -18,8 +18,6 @@ pub struct VmInput {
     pub user: UserName,
     pub vcpu_count: VcpuCount,
     pub memory_mib: MemoryMib,
-    pub kernel: ArtifactName,
-    pub rootfs: ArtifactName,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
 }
@@ -65,44 +63,6 @@ impl AsRef<str> for UserName {
 }
 
 impl<'de> Deserialize<'de> for UserName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
-#[serde(transparent)]
-#[display("{_0}")]
-pub struct ArtifactName(String);
-
-impl FromStr for ArtifactName {
-    type Err = ParseValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let is_safe = !value.is_empty()
-            && value != "."
-            && value != ".."
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-        is_safe
-            .then(|| Self(value.to_owned()))
-            .ok_or_else(|| ParseValueError::new("artifact name", value))
-    }
-}
-
-impl AsRef<str> for ArtifactName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for ArtifactName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,

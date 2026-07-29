@@ -1,7 +1,7 @@
 use serde::Serialize;
 use validated::Validated;
 
-use crate::{StorageError, UserName, VmId};
+use crate::{NetworkSpec, StorageError, UserName, VmId};
 
 #[cfg(feature = "linux")]
 mod linux;
@@ -30,6 +30,7 @@ pub struct VmSummary {
     pub id: VmId,
     pub user: UserName,
     pub status: VmStatus,
+    pub network: NetworkSpec,
 }
 
 #[derive(Debug, thiserror::Error)]

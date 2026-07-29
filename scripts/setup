@@ -28,7 +28,7 @@ fi
 
 require_linux
 require_commands \
-    basename cmp curl grep id install ln mkdir mkfs.ext4 mktemp mv readlink rm \
+    basename cmp curl grep id install mkdir mkfs.ext4 mktemp mv rm \
     sha256sum ssh-keygen sudo tar truncate uname unsquashfs
 
 ARCH="$(normalize_arch "$(uname -m)")"
@@ -133,7 +133,7 @@ prepare_rootfs() {
     fi
 
     ROOTFS_WORK="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.rootfs.XXXXXX")"
-    ROOTFS_TEMP="$IMAGE_ROOT/.ubuntu-$ROOTFS_VERSION.ext4.$$"
+    ROOTFS_TEMP="$IMAGE_ROOT/.alpine.ext4.$$"
     trap 'cleanup_rootfs' EXIT
     trap 'cleanup_rootfs; exit 130' INT TERM
 
@@ -156,21 +156,10 @@ prepare_rootfs() {
     trap - EXIT INT TERM
 }
 
-prepare_test_rootfs_name() {
-    if [[ -e "$TEST_ROOTFS_IMAGE" ]]; then
-        return
-    fi
-    if [[ -L "$TEST_ROOTFS_IMAGE" ]]; then
-        die "$TEST_ROOTFS_IMAGE is a broken symbolic link"
-    fi
-    ln -s "$(basename "$ROOTFS_IMAGE")" "$TEST_ROOTFS_IMAGE"
-}
-
 prepare_firecracker
 prepare_key
 prepare_kernel
 prepare_rootfs
-prepare_test_rootfs_name
 
 runtime_is_prepared || die "setup finished without producing all required artifacts"
 info "runtime prepared at $BARBIROLLI_RUNTIME_DIR"

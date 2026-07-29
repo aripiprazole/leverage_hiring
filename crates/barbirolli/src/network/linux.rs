@@ -24,7 +24,12 @@ pub struct ManagedNetwork {
 impl ManagedNetwork {
     pub async fn cleanup(&self) -> Result<()> {
         self.spec.cleanup(&self.table).await?;
-        tracing::info!("VM network cleaned up");
+        tracing::info!(
+            vm_id = %self.spec.vm_id,
+            tap = %self.spec.tap,
+            table = %self.table,
+            "VM network cleaned up"
+        );
         Ok(())
     }
 }
@@ -57,9 +62,17 @@ impl NetworkSpec {
         self.install_rules(nftables_conn, host, table).await
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            vm_id = %self.vm_id,
+            tap = %self.tap,
+            subnet = %self.subnet_cidr(),
+            host_ip = %self.host_ip,
+            guest_ip = %self.guest_ip
+        )
+    )]
     pub async fn prepare(&self) -> Result<ManagedNetwork> {
-        tracing::info!("preparing network");
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -120,7 +133,10 @@ impl NetworkSpec {
         }
     }
 
-    #[tracing::instrument(skip(route, nftables))]
+    #[tracing::instrument(
+        skip(self, route, nftables),
+        fields(vm_id = %self.vm_id, tap = %self.tap, %table)
+    )]
     async fn cleanup_with_connections(
         &self,
         route: &Connection<Route>,
@@ -173,6 +189,11 @@ impl NetworkSpec {
     }
 
     pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
+        tracing::info!(
+            vm_id = %self.vm_id,
+            tap = %self.tap,
+            "cleaning up stale VM network"
+        );
         self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
     }
 

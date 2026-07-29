@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     fs::{
         canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
-        set_permissions, symlink_metadata,
+        set_permissions,
     },
     io,
     os::unix::fs::PermissionsExt,
@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ArtifactName, AuthorizedKey, NetworkSpec, VmId, VmInput, VmSpec};
+use crate::{AuthorizedKey, NetworkSpec, VmId, VmInput, VmSpec};
 
 const CONFIG_VERSION: u16 = 1;
 const SOCKET_DIRECTORY: &str = ".sockets";
@@ -123,20 +123,12 @@ impl VmStore {
         image_root: PathBuf,
         default_authorized_keys: PathBuf,
     ) -> Result<Self> {
-        tracing::info!("creating new vm store");
+        tracing::info!("creating VM store");
         create_dir_all(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let vm_root = canonicalize(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let socket_dir = vm_root.join(SOCKET_DIRECTORY);
         if !socket_dir.exists() {
             create_dir(&socket_dir).map_err(|error| StorageError::io(&socket_dir, error))?;
-        }
-        let socket_metadata =
-            symlink_metadata(&socket_dir).map_err(|error| StorageError::io(&socket_dir, error))?;
-        if !socket_metadata.file_type().is_dir() {
-            return Err(StorageError::InvalidConfig {
-                path: socket_dir,
-                message: "socket path must be a real directory".to_owned(),
-            });
         }
         Ok(Self {
             vm_root: VmRootFolder::new(vm_root)?,
@@ -153,14 +145,13 @@ impl VmStore {
         err
     )]
     pub async fn create(&self, input: VmInput) -> Result<VmSpec, StorageError> {
-        tracing::info!("creating info");
         let final_dir = self.vm_root.dir.join(input.user.as_ref());
         if final_dir.exists() {
             return Err(StorageError::DuplicateUser(input.user));
         }
 
-        let source_kernel = self.resolve_artifact(&input.kernel)?;
-        let source_rootfs = self.resolve_artifact(&input.rootfs)?;
+        let source_kernel = self.image_root.join("vmlinux");
+        let source_rootfs = self.image_root.join("alpine.ext4");
         let id = self.vm_root.next_id()?;
 
         let tmp = tempfile::Builder::new()
@@ -188,25 +179,7 @@ impl VmStore {
         });
         persisted.write_into(tmp.path().join("config.json"))?;
         rename(tmp.path(), &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
-        tracing::info!(vm_id = %persisted.spec.id, user = %persisted.spec.user, operation = "create", "VM state transition");
         Ok(persisted.spec)
-    }
-
-    pub fn resolve_artifact(&self, artifact: &ArtifactName) -> Result<PathBuf> {
-        let requested = self.image_root.join(artifact.as_ref());
-        let canonical =
-            canonicalize(&requested).map_err(|error| StorageError::io(&requested, error))?;
-        if !canonical.starts_with(&self.image_root) {
-            return Err(StorageError::InvalidInput(format!(
-                "artifact {artifact} resolves outside IMAGE_ROOT"
-            )));
-        }
-        if !canonical.is_file() {
-            return Err(StorageError::InvalidInput(format!(
-                "artifact {artifact} is not a file"
-            )));
-        }
-        Ok(canonical)
     }
 
     fn write_authorized_keys(&self, directory: &Path, keys: &[AuthorizedKey]) -> Result<()> {
@@ -318,7 +291,7 @@ fn install_authorized_keys(rootfs: &Path, authorized_keys: &Path) -> Result<(), 
 impl MountedRootfs {
     #[tracing::instrument(err)]
     fn open(rootfs: &Path) -> Result<Self, SshAccessError> {
-        tracing::info!("opening rootfs");
+        tracing::info!("attaching rootfs loop device");
         let parent = rootfs.parent().unwrap_or_else(|| Path::new("."));
         let mountpoint = tempfile::Builder::new()
             .prefix(".rootfs-mount-")
@@ -364,7 +337,7 @@ impl MountedRootfs {
             flags,
             None::<&std::ffi::CStr>,
         ) {
-            tracing::error!(?error, "failed to mount");
+            tracing::error!(?error, "failed to mount rootfs");
             let setup =
                 SshAccessError::operation("mount rootfs", mounted.mountpoint.path(), error.into());
             return Err(match mounted.cleanup() {
@@ -376,7 +349,7 @@ impl MountedRootfs {
             });
         }
         mounted.mounted = true;
-        tracing::info!("mounted");
+        tracing::info!("rootfs mounted");
         Ok(mounted)
     }
 
@@ -390,7 +363,7 @@ impl MountedRootfs {
 
     #[tracing::instrument(skip(self), err)]
     fn cleanup(&mut self) -> Result<(), RootfsCleanupError> {
-        tracing::info!("cleanup");
+        tracing::info!("cleaning up rootfs mount");
         let unmount = if self.mounted {
             match mount::unmount(self.mountpoint.path(), mount::UnmountFlags::NOFOLLOW) {
                 Ok(()) => {
@@ -443,15 +416,6 @@ impl Drop for MountedRootfs {
 
 impl PathDescriptor {
     fn config(&self) -> Result<Vec<u8>> {
-        let metadata = std::fs::symlink_metadata(&self.config)
-            .map_err(|error| StorageError::io(&self.config, error))?;
-        if !metadata.is_file() {
-            return Err(StorageError::InvalidConfig {
-                path: self.config.clone(),
-                message: "config.json must be a real file".to_owned(),
-            });
-        }
-
         std::fs::read(&self.config).map_err(|error| StorageError::io(&self.config, error))
     }
 
@@ -515,18 +479,6 @@ impl VmRootFolderItem {
                 message: "configured network does not match VM ID".to_owned(),
             });
         }
-        for required in ["vmlinux", "rootfs.ext4", "authorized_keys"] {
-            let path = directory.join(required);
-            let is_file = symlink_metadata(&path)
-                .map(|metadata| metadata.file_type().is_file())
-                .unwrap_or(false);
-            if !is_file {
-                return Err(StorageError::InvalidConfig {
-                    path,
-                    message: "required artifact must be a real file".to_owned(),
-                });
-            }
-        }
         Ok(VmRootFolderItem {
             directory: descriptor.directory,
             config: descriptor.config,
@@ -544,14 +496,6 @@ impl VmRootFolder {
         for entry in directory {
             let entry = entry.map_err(|error| StorageError::io(vm_root, error))?;
             let directory = entry.path();
-            let metadata = symlink_metadata(&directory)
-                .map_err(|error| StorageError::io(&directory, error))?;
-            if !metadata.file_type().is_dir() {
-                return Err(StorageError::InvalidConfig {
-                    path: directory,
-                    message: "VM entry must be a real directory".to_owned(),
-                });
-            }
             paths.push(PathDescriptor {
                 config: directory.join("config.json"),
                 directory,

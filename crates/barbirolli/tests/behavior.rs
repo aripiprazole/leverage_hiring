@@ -8,8 +8,8 @@ use std::{
 };
 
 use barbirolli::{
-    ArtifactName, AuthorizedKey, Barbirolli, LifecycleError, MemoryMib, NetworkSpec, StorageError,
-    UserName, VcpuCount, VmId, VmInput, VmStatus, VmStore,
+    AuthorizedKey, Barbirolli, LifecycleError, MemoryMib, NetworkSpec, StorageError, UserName,
+    VcpuCount, VmId, VmInput, VmStatus, VmStore,
 };
 
 const AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
@@ -51,13 +51,19 @@ fn network_allocation_and_authorized_key_parsing_are_stable() {
 }
 
 #[tokio::test]
-async fn storage_persists_keys_reuses_ids_and_rejects_artifact_escape() {
+async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() {
     let temporary = tempfile::tempdir().expect("failed to create temporary storage");
     let vm_root = temporary.path().join("vms");
     let image_root = temporary.path().join("images");
     fs::create_dir(&image_root).expect("failed to create IMAGE_ROOT");
-    fs::write(image_root.join("vmlinux"), b"kernel").expect("failed to create kernel");
-    fs::write(image_root.join("alpine.ext4"), b"rootfs").expect("failed to create rootfs");
+    let source_kernel = temporary.path().join("source-vmlinux");
+    let source_rootfs = temporary.path().join("source-alpine.ext4");
+    fs::write(&source_kernel, b"kernel").expect("failed to create kernel");
+    fs::write(&source_rootfs, b"rootfs").expect("failed to create rootfs");
+    std::os::unix::fs::symlink(&source_kernel, image_root.join("vmlinux"))
+        .expect("failed to link kernel");
+    std::os::unix::fs::symlink(&source_rootfs, image_root.join("alpine.ext4"))
+        .expect("failed to link rootfs");
     let default_authorized_keys = temporary.path().join("default_authorized_keys");
     fs::write(&default_authorized_keys, format!("{AUTHORIZED_KEY}\n"))
         .expect("failed to create default authorized keys");
@@ -73,13 +79,19 @@ async fn storage_persists_keys_reuses_ids_and_rejects_artifact_escape() {
             user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: Vec::new(),
         })
         .await
         .expect("failed to create Alice's VM");
     assert_eq!(u16::from(alice.id), 0);
+    assert_eq!(
+        fs::read(&alice.kernel).expect("failed to read copied kernel"),
+        b"kernel"
+    );
+    assert_eq!(
+        fs::read(&alice.rootfs).expect("failed to read copied rootfs"),
+        b"rootfs"
+    );
     assert_eq!(
         fs::read_to_string(alice.artifact_dir.join("authorized_keys"))
             .expect("failed to read copied authorized keys"),
@@ -91,8 +103,6 @@ async fn storage_persists_keys_reuses_ids_and_rejects_artifact_escape() {
             user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: Vec::new(),
         })
         .await;
@@ -103,8 +113,6 @@ async fn storage_persists_keys_reuses_ids_and_rejects_artifact_escape() {
             user: "bob".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(192).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: vec![
                 AUTHORIZED_KEY
                     .parse::<AuthorizedKey>()
@@ -126,24 +134,11 @@ async fn storage_persists_keys_reuses_ids_and_rejects_artifact_escape() {
             user: "carol".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: Vec::new(),
         })
         .await
         .expect("failed to create Carol's VM");
     assert_eq!(u16::from(carol.id), 0);
-
-    let outside = temporary.path().join("outside");
-    fs::write(&outside, b"outside").expect("failed to create outside artifact");
-    std::os::unix::fs::symlink(&outside, image_root.join("escape"))
-        .expect("failed to create escaping symlink");
-    let escape = store.resolve_artifact(
-        &"escape"
-            .parse::<ArtifactName>()
-            .expect("valid artifact name"),
-    );
-    assert!(matches!(escape, Err(StorageError::InvalidInput(_))));
 
     let discovered = VmStore::new(vm_root, image_root, default_authorized_keys)
         .expect("failed to reopen the VM store")
@@ -196,8 +191,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
             user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: Vec::new(),
         })
         .await
@@ -208,6 +201,13 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     assert_eq!(listed[0].id, id);
     assert_eq!(listed[0].user.as_ref(), "alice");
     assert_eq!(listed[0].status, VmStatus::Discovered);
+    assert_eq!(
+        listed[0].network,
+        NetworkSpec::new(id).expect("valid network")
+    );
+    let listed_json = serde_json::to_value(&listed[0]).expect("summary should serialize");
+    assert_eq!(listed_json["network"]["tap"], "fc-tap0");
+    assert_eq!(listed_json["network"]["guest_ip"], "172.16.0.2");
     {
         let vm = manager.vm_mut(id).expect("missing VM");
         assert_eq!(vm.summary().status, VmStatus::Discovered);
@@ -270,8 +270,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
             user: "after-drain".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            kernel: "vmlinux".parse::<ArtifactName>().expect("valid kernel"),
-            rootfs: "alpine.ext4".parse::<ArtifactName>().expect("valid rootfs"),
             authorized_keys: Vec::new(),
         })
         .await;

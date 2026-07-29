@@ -121,7 +121,15 @@ impl Barbirolli {
         self.accepting_operations()?;
         let spec = self.store.create(input).await?;
         let id = spec.id;
+        let user = spec.user.clone();
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
+        tracing::info!(
+            vm_id = %id,
+            user = %user,
+            operation = "create",
+            status = "discovered",
+            "VM state transition"
+        );
         Ok(id)
     }
 
@@ -155,6 +163,13 @@ impl Barbirolli {
         let Entry::Occupied(mut vm) = self.vms.entry(vm_id) else {
             return Err(LifecycleError::NotFound(vm_id));
         };
+        tracing::info!(
+            vm_id = %vm_id,
+            user = %vm.get().spec().user,
+            operation = "delete",
+            status = "deleting",
+            "VM state transition"
+        );
         Box::pin(vm.get_mut().shutdown(self)).await?;
         let spec = vm.get().spec().clone();
         self.store.delete(&spec)?;
@@ -175,7 +190,7 @@ impl Barbirolli {
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
         for vm in self.vms.iter() {
-            let Some(mut vm) = self.vms.get_mut(&vm.key()) else {
+            let Some(mut vm) = self.vms.get_mut(vm.key()) else {
                 continue;
             };
             if let Err(err) = Box::pin(vm.shutdown(self)).await {
@@ -231,21 +246,25 @@ impl BarbirolliVm {
                 id: spec.id,
                 user: spec.user.clone(),
                 status: VmStatus::Discovered,
+                network: spec.network.clone(),
             },
             Self::Failed(spec) => VmSummary {
                 id: spec.id,
                 user: spec.user.clone(),
                 status: VmStatus::Failed,
+                network: spec.network.clone(),
             },
             Self::Managed(vm) if vm.failed => VmSummary {
                 id: vm.spec.id,
                 user: vm.spec.user.clone(),
                 status: VmStatus::Failed,
+                network: vm.spec.network.clone(),
             },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
                 user: vm.spec.user.clone(),
                 status: VmStatus::Running,
+                network: vm.spec.network.clone(),
             },
         }
     }

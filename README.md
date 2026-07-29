@@ -22,8 +22,9 @@ limactl shell provisioning \
     -d '{
       "user": "alice",
       "vcpu_count": 1,
-      "memory_mib": 256,
-      "kernel": "vmlinux",
-      "rootfs": "alpine.ext4"
+      "memory_mib": 256
     }'
 ```
+
+VM creation always copies `IMAGE_ROOT/vmlinux` and `IMAGE_ROOT/alpine.ext4`.
+`GET /vms` includes each VM's allocated network.
