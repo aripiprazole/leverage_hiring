@@ -121,7 +121,9 @@ cleanup_rootfs() {
 }
 
 prepare_rootfs() {
-    if [[ -s "$ROOTFS_IMAGE" ]] && rootfs_key_matches; then
+    if [[ -s "$ROOTFS_IMAGE" ]] &&
+        rootfs_key_matches &&
+        rootfs_resolver_matches; then
         info "guest rootfs is already prepared"
         return
     fi
@@ -142,6 +144,8 @@ prepare_rootfs() {
     sudo install -D -m 0600 \
         "$DEFAULT_AUTHORIZED_KEYS" \
         "$ROOTFS_WORK/rootfs/root/.ssh/authorized_keys"
+    printf 'nameserver 1.1.1.1\n' |
+        sudo tee "$ROOTFS_WORK/rootfs/etc/resolv.conf" >/dev/null
     sudo chown -R root:root "$ROOTFS_WORK/rootfs"
 
     truncate -s 1G "$ROOTFS_TEMP"
@@ -150,6 +154,7 @@ prepare_rootfs() {
     mv -f -- "$ROOTFS_TEMP" "$ROOTFS_IMAGE"
     ROOTFS_TEMP=""
     install -m 0644 "$DEFAULT_AUTHORIZED_KEYS" "$ROOTFS_KEY_MARKER"
+    printf 'nameserver 1.1.1.1\n' >"$ROOTFS_RESOLVER_MARKER"
 
     sudo rm -rf -- "$ROOTFS_WORK"
     ROOTFS_WORK=""

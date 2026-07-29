@@ -213,6 +213,12 @@ impl NetworkSpec {
             .priority(Priority::DstNat)
             .chain_type(ChainType::Nat)
             .policy(Policy::Accept);
+        let output_chain = Chain::new(table, "output")?
+            .family(Family::Ip)
+            .hook(Hook::Output)
+            .priority(Priority::DstNat)
+            .chain_type(ChainType::Nat)
+            .policy(Policy::Accept);
         let forward_chain = Chain::new(table, "forward")?
             .family(Family::Ip)
             .hook(Hook::Forward)
@@ -236,6 +242,7 @@ impl NetworkSpec {
             .transaction()
             .add_table(table, Family::Ip)
             .add_chain(prerouting_chain)
+            .add_chain(output_chain)
             .add_chain(forward_chain)
             .add_chain(postrouting_chain)
             .add_rule(masquerade);
@@ -252,6 +259,17 @@ impl NetworkSpec {
                     .match_tcp_dport(forward.external.into())
                     .dnat(forward.guest_ip, Some(forward.internal.into()))
                     .comment("published-tcp-dnat"),
+            );
+            transaction = transaction.add_rule(
+                Rule::new(table, "output")
+                    .family(Family::Ip)
+                    .match_daddr_v4_not(
+                        forward.destination_exclusion.network,
+                        forward.destination_exclusion.prefix,
+                    )
+                    .match_tcp_dport(forward.external.into())
+                    .dnat(forward.guest_ip, Some(forward.internal.into()))
+                    .comment("published-tcp-output-dnat"),
             );
         }
 
@@ -457,7 +475,10 @@ mod tests {
             .map(|chain| chain.name.as_str())
             .collect::<Vec<_>>();
         chain_names.sort_unstable();
-        assert_eq!(chain_names, ["forward", "postrouting", "prerouting"]);
+        assert_eq!(
+            chain_names,
+            ["forward", "output", "postrouting", "prerouting"]
+        );
 
         let mut comments = rules
             .iter()
@@ -470,6 +491,7 @@ mod tests {
                 "drop-unpublished-inbound",
                 "published-tcp-dnat",
                 "published-tcp-forward",
+                "published-tcp-output-dnat",
                 "vm-egress",
                 "vm-established",
                 "vm-isolation",

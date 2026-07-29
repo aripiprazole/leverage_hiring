@@ -71,7 +71,7 @@ impl VmSpec {
             2,
         );
         let configuration = vm_configuration(&mut resources, self)?;
-        let arguments = VmmArguments::new(VmmApiSocket::Enabled(barbirolli.api_socket.clone()));
+        let arguments = VmmArguments::new(VmmApiSocket::Enabled(barbirolli.api_socket(self.id)));
         let executor = UnrestrictedVmmExecutor::new(arguments)
             .id(VmmId::new(format!("barbirolli-{}", self.id))?);
         let installation = VmmInstallation::new(
@@ -99,11 +99,9 @@ impl VmSpec {
                 .cleanup_stale()
                 .await
                 .map_err(ReconcileFailure::Network);
-            let stale_socket = match std::fs::remove_file(&barbirolli.api_socket) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(ReconcileFailure::Socket(error)),
-            };
+            let stale_socket = self
+                .remove_stale_api_sockets(barbirolli)
+                .map_err(ReconcileFailure::Socket);
             let stale_health = self
                 .cleanup_stale_health()
                 .map_err(ReconcileFailure::Health);
@@ -122,9 +120,27 @@ impl VmSpec {
         .boxed()
     }
 
+    fn remove_stale_api_sockets(&self, barbirolli: &Barbirolli) -> Result<(), std::io::Error> {
+        for socket in [
+            barbirolli.api_socket(self.id),
+            barbirolli.legacy_api_socket(),
+        ] {
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     async fn kill_stale_processes(&self, barbirolli: &Barbirolli) -> Result<(), std::io::Error> {
-        let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
         let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
+        let api_socket = barbirolli.api_socket(self.id);
+        let expected_socket = api_socket.as_os_str().as_encoded_bytes();
+        let legacy_api_socket = barbirolli.legacy_api_socket();
+        let legacy_expected_socket = legacy_api_socket.as_os_str().as_encoded_bytes();
+        let expected_id = format!("barbirolli-{}", self.id);
         let mut proc = tokio::fs::read_dir("/proc").await?;
         while let Some(entry) = proc.next_entry().await? {
             let Some(pid) = entry
@@ -145,10 +161,15 @@ impl VmSpec {
             let is_firecracker = arguments
                 .first()
                 .is_some_and(|argument| *argument == expected_firecracker);
-            let has_socket = arguments
+            let has_id = arguments
                 .windows(2)
-                .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
+                .any(|arguments| arguments[0] == b"--id" && arguments[1] == expected_id.as_bytes());
+            let has_socket = arguments.windows(2).any(|arguments| {
+                arguments[0] == b"--api-sock"
+                    && (arguments[1] == expected_socket || arguments[1] == legacy_expected_socket)
+            });
             if is_firecracker
+                && has_id
                 && has_socket
                 && let Some(pid) = rustix::process::Pid::from_raw(pid)
             {
@@ -301,7 +322,7 @@ impl ManagedVm {
             });
         }
 
-        let pid = match find_firecracker_pid(barbirolli).await {
+        let pid = match find_firecracker_pid(barbirolli, spec.id).await {
             Ok(pid) => pid,
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
@@ -470,9 +491,14 @@ async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Resul
     Ok(())
 }
 
-async fn find_firecracker_pid(barbirolli: &Barbirolli) -> Result<i32, HealthError> {
-    let expected_socket = barbirolli.api_socket.as_os_str().as_encoded_bytes();
+async fn find_firecracker_pid(
+    barbirolli: &Barbirolli,
+    vm_id: crate::VmId,
+) -> Result<i32, HealthError> {
+    let api_socket = barbirolli.api_socket(vm_id);
+    let expected_socket = api_socket.as_os_str().as_encoded_bytes();
     let expected_firecracker = barbirolli.firecracker.as_os_str().as_encoded_bytes();
+    let expected_id = format!("barbirolli-{vm_id}");
     let mut proc = tokio::fs::read_dir("/proc")
         .await
         .map_err(|source| HealthError::Io {
@@ -504,6 +530,9 @@ async fn find_firecracker_pid(barbirolli: &Barbirolli) -> Result<i32, HealthErro
             && arguments
                 .windows(2)
                 .any(|args| args[0] == b"--api-sock" && args[1] == expected_socket)
+            && arguments
+                .windows(2)
+                .any(|args| args[0] == b"--id" && args[1] == expected_id.as_bytes())
         {
             return Ok(pid);
         }

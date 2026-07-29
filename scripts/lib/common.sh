@@ -25,6 +25,7 @@ KERNEL_IMAGE="$IMAGE_ROOT/vmlinux"
 ROOTFS_IMAGE="$IMAGE_ROOT/alpine.ext4"
 ROOTFS_SQUASHFS="$DOWNLOAD_DIR/ubuntu-$ROOTFS_VERSION.squashfs"
 ROOTFS_KEY_MARKER="$ROOTFS_IMAGE.authorized_key"
+ROOTFS_RESOLVER_MARKER="$ROOTFS_IMAGE.resolver"
 
 export BARBIROLLI_RUNTIME_DIR
 export CARGO_TARGET_DIR
@@ -89,13 +90,19 @@ rootfs_key_matches() {
         cmp -s "$DEFAULT_AUTHORIZED_KEYS" "$ROOTFS_KEY_MARKER"
 }
 
+rootfs_resolver_matches() {
+    [[ -s "$ROOTFS_RESOLVER_MARKER" ]] &&
+        grep -qx 'nameserver 1.1.1.1' "$ROOTFS_RESOLVER_MARKER"
+}
+
 runtime_is_prepared() {
     firecracker_is_compatible &&
         [[ -s "$KERNEL_IMAGE" ]] &&
         [[ -s "$ROOTFS_IMAGE" ]] &&
         [[ -s "$SSH_PRIVATE_KEY" ]] &&
         [[ -s "$DEFAULT_AUTHORIZED_KEYS" ]] &&
-        rootfs_key_matches
+        rootfs_key_matches &&
+        rootfs_resolver_matches
 }
 
 require_runtime_artifacts() {

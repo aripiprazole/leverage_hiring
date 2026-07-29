@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use barbirolli::{Barbirolli, MemoryMib, VcpuCount, VmInput, VmStatus, VmStore};
 use barbirolli_derive::firecracker_test;
@@ -10,14 +14,13 @@ use tokio::{
 
 #[firecracker_test]
 #[ignore = "requires Linux, KVM, Firecracker, and VM artifacts"]
-async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
+async fn per_vm_api_sockets_support_concurrent_vms_and_repeated_lifecycle_calls() {
     let temporary = tempfile::tempdir().expect("failed to create temporary storage");
     let vm_root = temporary.path().join("vms");
     let image_root = PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
     let firecracker =
         PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
-    let api_socket = vm_root.join(".sockets/firecracker.socket");
-    let store = VmStore::new(vm_root, image_root).expect("failed to create the VM store");
+    let store = VmStore::new(vm_root.clone(), image_root).expect("failed to create the VM store");
     let manager = Barbirolli::new(store, firecracker)
         .await
         .expect("failed to create Barbirolli");
@@ -68,22 +71,26 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         VmStatus::Running
     );
 
-    let mut socket = UnixStream::connect(&api_socket)
+    let first_api_socket = vm_root.join(format!(".sockets/firecracker-{first}.socket"));
+    assert_machine_configuration(&first_api_socket, 1, 128).await;
+
+    let second = manager
+        .create(VmInput {
+            vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
+            memory_mib: MemoryMib::try_from(192).expect("valid memory"),
+            authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
+        })
         .await
-        .expect("failed to connect to the global API socket");
-    socket
-        .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .expect("failed to query the first VM");
-    let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
-        .await
-        .expect("the first Firecracker API query timed out")
-        .expect("failed to read the first Firecracker response");
-    let response = String::from_utf8(response).expect("Firecracker returned non-UTF-8 HTTP");
-    assert!(response.starts_with("HTTP/1.1 200"));
-    assert!(response.contains("\"vcpu_count\":1"));
-    assert!(response.contains("\"mem_size_mib\":128"));
+        .expect("failed to create the second VM");
+    {
+        let mut vm = manager.vm_mut(second).expect("missing second VM");
+        vm.start(&manager)
+            .await
+            .expect("failed to start the second VM");
+    }
+    let second_api_socket = vm_root.join(format!(".sockets/firecracker-{second}.socket"));
+    assert_machine_configuration(&second_api_socket, 2, 192).await;
 
     let shutdown_barrier = Arc::new(Barrier::new(3));
     let first_shutdown = {
@@ -121,40 +128,25 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
             .status,
         VmStatus::Discovered
     );
+    assert!(!first_api_socket.exists());
 
-    let second = manager
-        .create(VmInput {
-            vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
-            memory_mib: MemoryMib::try_from(192).expect("valid memory"),
-            authorized_keys: Vec::new(),
-            port_bindings: Vec::new(),
-        })
-        .await
-        .expect("failed to create the second VM");
+    assert_machine_configuration(&second_api_socket, 2, 192).await;
+
     {
-        let mut vm = manager.vm_mut(second).expect("missing second VM");
+        let mut vm = manager.vm_mut(first).expect("missing first VM");
         vm.start(&manager)
             .await
-            .expect("failed to start the second VM");
+            .expect("failed to restart the first VM");
     }
+    assert_machine_configuration(&first_api_socket, 1, 128).await;
+    assert_machine_configuration(&second_api_socket, 2, 192).await;
 
-    let mut socket = UnixStream::connect(&api_socket)
-        .await
-        .expect("failed to reconnect to the global API socket");
-    socket
-        .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await
-        .expect("failed to query the second VM");
-    let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
-        .await
-        .expect("the second Firecracker API query timed out")
-        .expect("failed to read the second Firecracker response");
-    let response = String::from_utf8(response).expect("Firecracker returned non-UTF-8 HTTP");
-    assert!(response.starts_with("HTTP/1.1 200"));
-    assert!(response.contains("\"vcpu_count\":2"));
-    assert!(response.contains("\"mem_size_mib\":192"));
-
+    {
+        let mut vm = manager.vm_mut(first).expect("missing first VM");
+        vm.shutdown(&manager)
+            .await
+            .expect("failed to shut down the restarted first VM");
+    }
     {
         let mut vm = manager.vm_mut(second).expect("missing second VM");
         vm.shutdown(&manager)
@@ -169,4 +161,23 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
         .delete(second)
         .await
         .expect("failed to delete the second VM");
+}
+
+async fn assert_machine_configuration(api_socket: &Path, vcpu_count: u8, memory_mib: u16) {
+    let mut socket = UnixStream::connect(api_socket)
+        .await
+        .expect("failed to connect to the per-VM API socket");
+    socket
+        .write_all(b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("failed to query the VM");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+        .await
+        .expect("the Firecracker API query timed out")
+        .expect("failed to read the Firecracker response");
+    let response = String::from_utf8(response).expect("Firecracker returned non-UTF-8 HTTP");
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains(&format!("\"vcpu_count\":{vcpu_count}")));
+    assert!(response.contains(&format!("\"mem_size_mib\":{memory_mib}")));
 }

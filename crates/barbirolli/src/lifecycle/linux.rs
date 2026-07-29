@@ -40,7 +40,7 @@ pub struct BarbirolliInner {
     pub(crate) vms: DashMap<VmId, BarbirolliVm>,
     pub store: VmStore,
     pub firecracker: PathBuf,
-    pub api_socket: PathBuf,
+    pub api_socket_dir: PathBuf,
     pub api_socket_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
@@ -71,12 +71,12 @@ impl Barbirolli {
             .by_ref()
             .map(|item| item.map(|item| item.persisted_spec.spec))
             .collect::<Result<Vec<_>, StorageError>>()?;
-        let api_socket = store.vm_root.dir.join(".sockets/firecracker.socket");
+        let api_socket_dir = store.vm_root.dir.join(".sockets");
         let barbirolli = Self(Arc::new(BarbirolliInner {
             vms: DashMap::default(),
             store,
             firecracker,
-            api_socket,
+            api_socket_dir,
             api_socket_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
@@ -114,6 +114,15 @@ impl Barbirolli {
                 vm.check_idle(self).await;
             }
         }
+    }
+
+    pub(crate) fn api_socket(&self, vm_id: VmId) -> PathBuf {
+        self.api_socket_dir
+            .join(format!("firecracker-{vm_id}.socket"))
+    }
+
+    pub(crate) fn legacy_api_socket(&self) -> PathBuf {
+        self.api_socket_dir.join("firecracker.socket")
     }
 
     pub fn vm(&self, vm_id: VmId) -> Result<Ref<'_, VmId, BarbirolliVm>> {
