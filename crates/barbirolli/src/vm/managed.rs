@@ -45,12 +45,12 @@ type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRunt
 #[derive(Debug)]
 pub struct ManagedVm {
     pub spec: VmSpec,
-    #[debug(skip)]
-    pub vm: FirecrackerVm,
-    pub network: Option<ManagedNetwork>,
     pub failed: bool,
-    pub(crate) pid: i32,
-    pub(crate) idle_tracker: Mutex<Option<IdleTracker>>,
+    pub pid: i32,
+    pub idle_tracker: Mutex<Option<IdleTracker>>,
+    network: Option<ManagedNetwork>,
+    #[debug(skip)]
+    vm: FirecrackerVm,
     cgroup: Option<VmCgroup>,
     latest_metrics: Arc<RwLock<Option<Metrics>>>,
     #[debug(skip)]

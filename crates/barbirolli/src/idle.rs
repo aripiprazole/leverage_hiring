@@ -11,25 +11,6 @@ pub struct IdlePolicy {
     pub cpu_active_low_percent: f64,
 }
 
-impl Default for IdlePolicy {
-    fn default() -> Self {
-        Self {
-            initial_interval: Duration::from_secs(300),
-            strike_interval: Duration::from_secs(60),
-            final_interval: Duration::from_secs(30),
-            cpu_idle_high_percent: 0.5,
-            cpu_active_low_percent: 3.0,
-        }
-    }
-}
-
-impl IdlePolicy {
-    pub fn cpu_threshold_percent(self) -> f64 {
-        self.cpu_idle_high_percent
-            + 0.2 * (self.cpu_active_low_percent - self.cpu_idle_high_percent)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     pub instance_pid: i32,
@@ -42,36 +23,6 @@ pub struct Sample {
     pub established_tcp_connections: u64,
     pub total_connections: u64,
     pub vcpu_count: u8,
-}
-
-impl Sample {
-    fn cpu_percent_since(self, previous: Self) -> Option<f64> {
-        let elapsed_usec = self
-            .sampled_at
-            .checked_duration_since(previous.sampled_at)?
-            .as_micros() as u64;
-        let usage = self.cpu_usage_usec.checked_sub(previous.cpu_usage_usec)?;
-        (elapsed_usec != 0 && self.vcpu_count != 0)
-            .then(|| 100.0 * usage as f64 / (elapsed_usec as f64 * f64::from(self.vcpu_count)))
-    }
-
-    fn activity_since(self, previous: Self, policy: IdlePolicy) -> Activity {
-        let counters_regressed = self.instance_pid != previous.instance_pid
-            || self.cpu_usage_usec < previous.cpu_usage_usec
-            || self.network_bytes < previous.network_bytes
-            || self.disk_bytes < previous.disk_bytes;
-        let cpu_percent = self.cpu_percent_since(previous);
-        Activity {
-            active: counters_regressed
-                || cpu_percent.is_some_and(|cpu| cpu > policy.cpu_threshold_percent())
-                || self.network_bytes > previous.network_bytes
-                || self.disk_bytes > previous.disk_bytes
-                || self.process_count != previous.process_count
-                || self.established_tcp_connections > 0,
-            counters_regressed,
-            cpu_percent,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +54,13 @@ pub struct IdleTracker {
     pub last_activity: Instant,
     pub strikes: u8,
     pub next_check: Instant,
+}
+
+impl IdlePolicy {
+    pub fn cpu_threshold_percent(self) -> f64 {
+        self.cpu_idle_high_percent
+            + 0.2 * (self.cpu_active_low_percent - self.cpu_idle_high_percent)
+    }
 }
 
 impl IdleTracker {
@@ -148,6 +106,48 @@ impl IdleTracker {
             decision,
             activity,
             last_activity: self.last_activity,
+        }
+    }
+}
+
+impl Sample {
+    fn cpu_percent_since(self, previous: Self) -> Option<f64> {
+        let elapsed_usec = self
+            .sampled_at
+            .checked_duration_since(previous.sampled_at)?
+            .as_micros() as u64;
+        let usage = self.cpu_usage_usec.checked_sub(previous.cpu_usage_usec)?;
+        (elapsed_usec != 0 && self.vcpu_count != 0)
+            .then(|| 100.0 * usage as f64 / (elapsed_usec as f64 * f64::from(self.vcpu_count)))
+    }
+
+    fn activity_since(self, previous: Self, policy: IdlePolicy) -> Activity {
+        let counters_regressed = self.instance_pid != previous.instance_pid
+            || self.cpu_usage_usec < previous.cpu_usage_usec
+            || self.network_bytes < previous.network_bytes
+            || self.disk_bytes < previous.disk_bytes;
+        let cpu_percent = self.cpu_percent_since(previous);
+        Activity {
+            active: counters_regressed
+                || cpu_percent.is_some_and(|cpu| cpu > policy.cpu_threshold_percent())
+                || self.network_bytes > previous.network_bytes
+                || self.disk_bytes > previous.disk_bytes
+                || self.process_count != previous.process_count
+                || self.established_tcp_connections > 0,
+            counters_regressed,
+            cpu_percent,
+        }
+    }
+}
+
+impl Default for IdlePolicy {
+    fn default() -> Self {
+        Self {
+            initial_interval: Duration::from_secs(300),
+            strike_interval: Duration::from_secs(60),
+            final_interval: Duration::from_secs(30),
+            cpu_idle_high_percent: 0.5,
+            cpu_active_low_percent: 3.0,
         }
     }
 }
