@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 #![cfg(target_os = "linux")]
 
 use std::{
