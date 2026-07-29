@@ -97,7 +97,9 @@ impl VmSpec {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(ReconcileFailure::Socket(error)),
         };
-        let stale_health = cleanup_stale_health(self).map_err(ReconcileFailure::Health);
+        let stale_health = self
+            .cleanup_stale_health()
+            .map_err(ReconcileFailure::Health);
         let reconciliation = Validated::from(stale_processes).map4(
             Validated::from(stale_network),
             Validated::from(stale_socket),
@@ -145,6 +147,35 @@ impl VmSpec {
         }
         Ok(())
     }
+
+    fn metrics_path(&self) -> PathBuf {
+        self.artifact_dir.join("metrics.fifo")
+    }
+
+    fn cleanup_stale_health(&self) -> Result<(), HealthError> {
+        let metrics = self.metrics_path();
+        if let Err(source) = fs::remove_file(&metrics)
+            && source.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(HealthError::Io {
+                path: metrics,
+                source,
+            });
+        }
+
+        let cgroup = PathBuf::from(CGROUP_ROOT).join(format!("vm-{}", self.id));
+        if cgroup.exists() {
+            let kill = cgroup.join("cgroup.kill");
+            if kill.exists() {
+                fs::write(&kill, "1").map_err(|source| HealthError::Io { path: kill, source })?;
+            }
+            fs::remove_dir(&cgroup).map_err(|source| HealthError::Io {
+                path: cgroup,
+                source,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 fn vm_configuration(
@@ -160,7 +191,7 @@ fn vm_configuration(
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
     let metrics = resources.create_resource(
-        self::metrics_path(spec),
+        spec.metrics_path(),
         ResourceType::Created(CreatedResourceType::Fifo),
     )?;
 
@@ -287,7 +318,7 @@ impl ManagedVm {
             }
         };
         let latest_metrics = Arc::new(RwLock::new(None));
-        let metrics_task = spawn_metrics_reader(metrics_path(&spec), latest_metrics.clone());
+        let metrics_task = spawn_metrics_reader(spec.metrics_path(), latest_metrics.clone());
 
         Ok(Self {
             spec,
@@ -394,70 +425,40 @@ impl ManagedVm {
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
 
-fn metrics_path(spec: &VmSpec) -> PathBuf {
-    spec.artifact_dir.join("metrics.fifo")
-}
-
-fn cleanup_stale_health(spec: &VmSpec) -> Result<(), HealthError> {
-    let metrics = metrics_path(spec);
-    if let Err(source) = fs::remove_file(&metrics)
-        && source.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(HealthError::Io {
-            path: metrics,
-            source,
-        });
-    }
-
-    let cgroup = PathBuf::from(CGROUP_ROOT).join(format!("vm-{}", spec.id));
-    if cgroup.exists() {
-        let kill = cgroup.join("cgroup.kill");
-        if kill.exists() {
-            fs::write(&kill, "1").map_err(|source| HealthError::Io { path: kill, source })?;
-        }
-        fs::remove_dir(&cgroup).map_err(|source| HealthError::Io {
-            path: cgroup,
-            source,
-        })?;
-    }
-    Ok(())
-}
-
 fn spawn_metrics_reader(
     path: PathBuf,
     latest: Arc<RwLock<Option<Metrics>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::error!(%error, path = %path.display(), "failed to open Firecracker metrics");
-                return;
-            }
-        };
-        let mut lines = BufReader::new(file).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => match serde_json::from_str(&line) {
-                    Ok(metrics) => match latest.write() {
-                        Ok(mut destination) => *destination = Some(metrics),
-                        Err(_) => {
-                            tracing::error!("Firecracker metrics lock was poisoned");
-                            return;
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(%error, "discarding invalid Firecracker metrics");
-                    }
-                },
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::error!(%error, "failed to read Firecracker metrics");
-                    return;
-                }
-            }
+        if let Err(error) = read_metrics(&path, &latest).await {
+            tracing::error!(%error, path = %path.display(), "Firecracker metrics reader stopped");
         }
     })
+}
+
+#[tracing::instrument(skip(latest), fields(path = %path.display()), err)]
+async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| HealthError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let mut lines = BufReader::new(file).lines();
+    while let Some(line) = lines.next_line().await.map_err(|source| HealthError::Io {
+        path: path.clone(),
+        source,
+    })? {
+        let metrics = match serde_json::from_str(&line) {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::warn!(%error, "discarding invalid Firecracker metrics");
+                continue;
+            }
+        };
+        *latest.write().map_err(|_| HealthError::MetricsLock)? = Some(metrics);
+    }
+    Ok(())
 }
 
 async fn find_firecracker_pid(barbirolli: &Barbirolli) -> Result<i32, HealthError> {
@@ -520,11 +521,17 @@ impl VmCgroup {
         })?;
         let procs = path.join("cgroup.procs");
         if let Err(source) = fs::write(&procs, pid.to_string()) {
-            let _ = fs::remove_dir(&path);
-            return Err(HealthError::Io {
+            let setup = HealthError::Io {
                 path: procs,
                 source,
-            });
+            };
+            return match fs::remove_dir(&path) {
+                Ok(()) => Err(setup),
+                Err(source) => Err(HealthError::CgroupSetupRollback {
+                    setup: Box::new(setup),
+                    rollback: Box::new(HealthError::Io { path, source }),
+                }),
+            };
         }
         Ok(Self { path })
     }
@@ -569,10 +576,10 @@ impl VmCgroup {
 }
 
 fn connection_counts(guest_ip: std::net::Ipv4Addr) -> (u64, u64) {
-    let contents = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
+    let Some(contents) = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
         .into_iter()
-        .find_map(|path| fs::read_to_string(path).ok());
-    let Some(contents) = contents else {
+        .find_map(|path| fs::read_to_string(path).ok())
+    else {
         return (0, 0);
     };
     let address = guest_ip.to_string();
@@ -653,6 +660,11 @@ pub enum HealthError {
     MetricsLock,
     #[error("the VM idle tracker lock was poisoned")]
     TrackerLock,
+    #[error("cgroup setup failed: {setup}; rollback also failed: {rollback}")]
+    CgroupSetupRollback {
+        setup: Box<HealthError>,
+        rollback: Box<HealthError>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
