@@ -40,6 +40,12 @@ GET /vms
     "id": 0,
     "user": "gabrielle",
     "status": "running",
+    "port_bindings": [
+      {
+        "internal": 22,
+        "external": 2222
+      }
+    ],
     "network": {
       "vm_id": 0,
       "tap": "fc-tap0",
@@ -89,12 +95,22 @@ POST /vms
   "user": "gabrielle",
   "vcpu_count": 2,
   "memory_mib": 1024,
-  "authorized_keys": ["ssh-ed25519 ..."]
+  "authorized_keys": ["ssh-ed25519 ..."],
+  "port_bindings": [
+    {
+      "internal": 22,
+      "external": 2222
+    }
+  ]
 }
 ```
 
 - The service always copies `IMAGE_ROOT/vmlinux` and `IMAGE_ROOT/alpine.ext4`.
 - Requests containing `kernel` or `rootfs` are invalid input.
+- `port_bindings` uses `internal:external` semantics and publishes TCP only. For example,
+  `{ "internal": 22, "external": 2222 }` forwards host TCP port 2222 to guest TCP port 22.
+- Ports are nonzero `u16` values. External-port uniqueness is guaranteed by the provisioning
+  design and is not revalidated here.
 - Creates one VM per user and returns `201 Created` with its persisted numeric ID.
 
 # Module: Barbirolli
@@ -104,8 +120,7 @@ POST /vms
 - `validated`
 - The first milestone owns persistence, Firecracker lifecycle, and VM networking.
 - Support Firecracker 1.13 on x86_64 and aarch64 Linux; `FIRECRACKER` names its executable.
-- Use `UnrestrictedVmmExecutor` initially. Jailer, cgroups, and external port publishing are out of
-  scope.
+- Use `UnrestrictedVmmExecutor` initially. Jailer and cgroups are out of scope.
 
 ```rust
 // to be used with Arc
@@ -233,6 +248,12 @@ struct VmInput {
     vcpu_count: VcpuCount, // 1..=31
     memory_mib: MemoryMib, // 1..=2047
     authorized_keys: Vec<AuthorizedKey>,
+    port_bindings: Vec<PortBinding>,
+}
+
+struct PortBinding {
+    internal: Port,
+    external: Port,
 }
 
 impl VmConfig {
@@ -307,10 +328,12 @@ all failures.
 - Each `$VM_ROOT/<user>` contains:
   - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
   - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
-  - `config.json`: versioned `VmSpec`, including the stable `VmId`.
-  - `authorized_keys`: OpenSSH public keys.
-- If no keys are supplied, copy the file named by `DEFAULT_AUTHORIZED_KEYS`.
-- `scripts/setup` writes the prepared rootfs directly to `IMAGE_ROOT/alpine.ext4`.
+  - `config.json`: versioned `VmSpec`, including the stable `VmId` and port bindings.
+- A nonempty `authorized_keys` request is written directly to
+  `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
+  file. No key sidecar is written beside the VM artifacts.
+- If no keys are supplied, leave intact the default key already embedded in the source image.
+- `scripts/setup` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
 
 ## Networking
 
@@ -329,8 +352,18 @@ struct NetworkSpec {
 }
 
 impl NetworkSpec {
+    /// One table is installed per VM in a single nlink transaction:
     ///
     /// table ip fc_vm_0 {
+    ///     chain prerouting {
+    ///         type nat hook prerouting priority dstnat;
+    ///         policy accept;
+    ///
+    ///         # external 2222 -> internal 22
+    ///         iifname "eth0" ip daddr != 172.16.0.0/16 tcp dport 2222 \
+    ///             dnat to 172.16.0.2:22 comment "published-tcp-dnat"
+    ///     }
+    ///
     ///     chain forward {
     ///         type filter hook forward priority filter;
     ///         policy accept;
@@ -340,11 +373,20 @@ impl NetworkSpec {
     ///             drop comment "vm-isolation"
     ///
     ///         # Allow the VM to send traffic through the host's external interface.
-    ///         iifname "fc-tap0" oifname "eth0" accept
+    ///         iifname "fc-tap0" oifname "eth0" \
+    ///             accept comment "vm-egress"
     ///
     ///         # Allow return traffic belonging to existing VM connections.
     ///         iifname "eth0" oifname "fc-tap0" \
-    ///             ct state established,related accept
+    ///             ct state established,related accept comment "vm-established"
+    ///
+    ///         # Allow only traffic DNAT translated for this published port.
+    ///         iifname "eth0" oifname "fc-tap0" \
+    ///             ip daddr 172.16.0.2 tcp dport 22 \
+    ///             accept comment "published-tcp-forward"
+    ///
+    ///         # Default-deny all remaining forwarded traffic into this VM.
+    ///         oifname "fc-tap0" drop comment "drop-unpublished-inbound"
     ///     }
     ///
     ///     chain postrouting {
@@ -360,54 +402,13 @@ impl NetworkSpec {
         conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
+        port_bindings: &[PortBinding],
     ) -> Result<()>;
 
-    /// sudo nft delete table ip fc_vm_0 2>/dev/null || true
-    ///
-    ///  sudo ip link delete dev fc-tap0 2>/dev/null || true
-    ///
-    ///  sudo ip tuntap add dev fc-tap0 mode tap
-    ///
-    ///  sudo ip address add 172.16.0.1/30 dev fc-tap0
-    ///
-    ///  sudo ip link set dev fc-tap0 up
-    ///
-    ///  sudo sysctl -w net.ipv4.ip_forward=1
-    ///
-    ///  sudo nft add table ip fc_vm_0
-    ///
-    ///  sudo nft 'add chain ip fc_vm_0 forward {
-    ///      type filter hook forward priority filter;
-    ///      policy accept;
-    ///  }'
-    ///
-    ///  sudo nft 'add chain ip fc_vm_0 postrouting {
-    ///      type nat hook postrouting priority srcnat;
-    ///      policy accept;
-    ///  }'
-    ///
-    ///  sudo nft 'add rule ip fc_vm_0 forward
-    ///      iifname "fc-tap0"
-    ///      ip daddr 172.16.0.0/16
-    ///      drop
-    ///      comment "vm-isolation"'
-    ///
-    ///  sudo nft 'add rule ip fc_vm_0 forward
-    ///      iifname "fc-tap0"
-    ///      oifname "eth0"
-    ///      accept'
-    ///
-    ///  sudo nft 'add rule ip fc_vm_0 forward
-    ///      iifname "eth0"
-    ///      oifname "fc-tap0"
-    ///      ct state established,related
-    ///      accept'
-    ///
-    ///  sudo nft 'add rule ip fc_vm_0 postrouting
-    ///      ip saddr 172.16.0.0/30
-    ///      oifname "eth0"
-    ///      masquerade'
-    fn prepare_managed_network(&self) -> Result<PreparedNetwork> {
+    fn prepare_managed_network(
+        &self,
+        port_bindings: &[PortBinding],
+    ) -> Result<PreparedNetwork> {
         let nft_table = format!("fc_vm_{}", self.vm_id);
         // Create TAP, enable forwarding, and atomically install nftables rules.
     }
@@ -433,11 +434,20 @@ impl TryFrom<&str> for InterfaceName {
 }
 ```
 
-- Allocate 2^32 `/30` networks from `172.16.0.0/16`: network, host, guest, broadcast.
+- Allocate 2^14 `/30` networks from `172.16.0.0/16`: network, host, guest, broadcast.
 - Fail startup if the pool overlaps an existing host route.
 - Select the lowest-metric IPv4 default route in the main routing table.
-- Allow host-to-VM traffic and unrestricted VM internet egress; deny VM-to-VM traffic.
-- IPv6, inbound port publishing, guest-to-host isolation, and egress filtering are out of scope.
+- Publish every binding as TCP from the host's selected default interface to the VM guest address.
+- Permit established replies and configured published ports into a VM; deny all other forwarded
+  inbound traffic to that VM's TAP.
+- Keep each base-chain policy at `accept` because every VM owns an independent table. The final
+  output-TAP-specific drop supplies default deny without one VM's base chain dropping another VM's
+  packets.
+- Exclude `172.16.0.0/16` destinations from DNAT. After one table translates a packet into the VM
+  pool, later per-VM prerouting chains cannot translate it again when an internal port happens to
+  equal another VM's external port.
+- Allow unrestricted VM internet egress and established replies; deny VM-to-VM traffic.
+- IPv6, guest-to-host isolation, and egress filtering are out of scope.
 - IPv4 forwarding is shared host state and remains enabled after per-VM cleanup.
 - Guest static IP, gateway, and DNS configuration must be written before boot.
 

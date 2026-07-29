@@ -140,13 +140,6 @@ impl Barbirolli {
             .collect()
     }
 
-    pub async fn authorized_keys_path(&self, user: &str) -> Option<PathBuf> {
-        self.vms.iter().find_map(|entry| {
-            let spec = entry.value().spec();
-            (spec.user.as_ref() == user).then(|| spec.artifact_dir.join("authorized_keys"))
-        })
-    }
-
     pub async fn ssh_address(&self, user: &str) -> Option<Ipv4Addr> {
         self.vms.iter().find_map(|entry| {
             let BarbirolliVm::Managed(managed) = entry.value() else {
@@ -246,24 +239,28 @@ impl BarbirolliVm {
                 id: spec.id,
                 user: spec.user.clone(),
                 status: VmStatus::Discovered,
+                port_bindings: spec.port_bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Failed(spec) => VmSummary {
                 id: spec.id,
                 user: spec.user.clone(),
                 status: VmStatus::Failed,
+                port_bindings: spec.port_bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Managed(vm) if vm.failed => VmSummary {
                 id: vm.spec.id,
                 user: vm.spec.user.clone(),
                 status: VmStatus::Failed,
+                port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
             },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
                 user: vm.spec.user.clone(),
                 status: VmStatus::Running,
+                port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
             },
         }

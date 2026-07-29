@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthorizedKey, NetworkSpec, VmId, VmInput, VmSpec};
+use crate::{NetworkSpec, VmId, VmInput, VmSpec};
 
 const CONFIG_VERSION: u16 = 1;
 const SOCKET_DIRECTORY: &str = ".sockets";
@@ -79,7 +79,6 @@ struct MountedRootfs {
 pub struct VmStore {
     pub vm_root: VmRootFolder,
     pub image_root: PathBuf,
-    pub default_authorized_keys: PathBuf,
 }
 
 #[derive(Debug)]
@@ -118,11 +117,7 @@ impl VmStore {
         ),
         err
     )]
-    pub fn new(
-        vm_root: PathBuf,
-        image_root: PathBuf,
-        default_authorized_keys: PathBuf,
-    ) -> Result<Self> {
+    pub fn new(vm_root: PathBuf, image_root: PathBuf) -> Result<Self> {
         tracing::info!("creating VM store");
         create_dir_all(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let vm_root = canonicalize(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
@@ -134,8 +129,6 @@ impl VmStore {
             vm_root: VmRootFolder::new(vm_root)?,
             image_root: canonicalize(&image_root)
                 .map_err(|error| StorageError::io(&image_root, error))?,
-            default_authorized_keys: canonicalize(&default_authorized_keys)
-                .map_err(|error| StorageError::io(&default_authorized_keys, error))?,
         })
     }
 
@@ -164,7 +157,16 @@ impl VmStore {
 
         copy(&source_kernel, &kernel).map_err(|error| StorageError::io(&kernel, error))?;
         copy(&source_rootfs, &rootfs).map_err(|error| StorageError::io(&rootfs, error))?;
-        self.write_authorized_keys(tmp.path(), &input.authorized_keys)?;
+        if !input.authorized_keys.is_empty() {
+            let mut authorized_keys = input
+                .authorized_keys
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join("\n");
+            authorized_keys.push('\n');
+            install_authorized_keys_into_rootfs(&rootfs, authorized_keys.as_bytes())?;
+        }
 
         let persisted = PersistedVmSpec::new(VmSpec {
             id,
@@ -174,30 +176,13 @@ impl VmStore {
             rootfs: final_dir.join("rootfs.ext4"),
             vcpu_count: input.vcpu_count,
             memory_mib: input.memory_mib,
+            port_bindings: input.port_bindings,
             network: NetworkSpec::new(id)
                 .map_err(|error| StorageError::InvalidInput(error.to_string()))?,
         });
         persisted.write_into(tmp.path().join("config.json"))?;
         rename(tmp.path(), &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
         Ok(persisted.spec)
-    }
-
-    fn write_authorized_keys(&self, directory: &Path, keys: &[AuthorizedKey]) -> Result<()> {
-        let destination = directory.join("authorized_keys");
-        if keys.is_empty() {
-            copy(&self.default_authorized_keys, &destination)
-                .map_err(|error| StorageError::io(&destination, error))?;
-        } else {
-            let mut contents = keys
-                .iter()
-                .map(AsRef::as_ref)
-                .collect::<Vec<_>>()
-                .join("\n");
-            contents.push('\n');
-            std::fs::write(&destination, contents)
-                .map_err(|error| StorageError::io(&destination, error))?;
-        }
-        Ok(())
     }
 
     #[tracing::instrument(
@@ -216,31 +201,6 @@ impl PersistedVmSpec {
         Self {
             version: CONFIG_VERSION,
             spec,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tracing::instrument(
-        skip(self),
-        fields(vm_id = %self.spec.id, user = %self.spec.user, rootfs = %self.spec.rootfs.display()),
-        err
-    )]
-    pub fn setup_ssh_access(&self) -> std::result::Result<(), SshAccessError> {
-        let mounted = MountedRootfs::open(&self.spec.rootfs)?;
-        let setup = install_authorized_keys(
-            mounted.path(),
-            &self.spec.artifact_dir.join("authorized_keys"),
-        );
-        let cleanup = mounted.finish();
-
-        match (setup, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(setup), Ok(())) => Err(setup),
-            (Ok(()), Err(cleanup)) => Err(cleanup.into()),
-            (Err(setup), Err(cleanup)) => Err(SshAccessError::SetupCleanup {
-                setup: Box::new(setup),
-                cleanup,
-            }),
         }
     }
 
@@ -266,7 +226,7 @@ impl SshAccessError {
 }
 
 #[tracing::instrument(err)]
-fn install_authorized_keys(rootfs: &Path, authorized_keys: &Path) -> Result<(), SshAccessError> {
+fn install_authorized_keys(rootfs: &Path, authorized_keys: &[u8]) -> Result<(), SshAccessError> {
     tracing::info!("installing authorized keys");
     let ssh_directory = rootfs.join("root/.ssh");
     create_dir_all(&ssh_directory).map_err(|error| {
@@ -277,7 +237,7 @@ fn install_authorized_keys(rootfs: &Path, authorized_keys: &Path) -> Result<(), 
     })?;
 
     let destination = ssh_directory.join("authorized_keys");
-    copy(authorized_keys, &destination).map_err(|error| {
+    std::fs::write(&destination, authorized_keys).map_err(|error| {
         SshAccessError::operation("install authorized keys", &destination, error)
     })?;
     set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
@@ -285,6 +245,43 @@ fn install_authorized_keys(rootfs: &Path, authorized_keys: &Path) -> Result<(), 
     })?;
     tracing::info!("installed authorized keys");
     Ok(())
+}
+
+#[tracing::instrument(skip(authorized_keys), err)]
+#[cfg(not(target_os = "linux"))]
+fn install_authorized_keys_into_rootfs(
+    rootfs: &Path,
+    authorized_keys: &[u8],
+) -> Result<(), SshAccessError> {
+    return Err(SshAccessError::operation(
+        "mount rootfs",
+        rootfs,
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ext4 rootfs installation requires Linux",
+        ),
+    ));
+}
+
+#[tracing::instrument(skip(authorized_keys), err)]
+#[cfg(target_os = "linux")]
+fn install_authorized_keys_into_rootfs(
+    rootfs: &Path,
+    authorized_keys: &[u8],
+) -> Result<(), SshAccessError> {
+    let mounted = MountedRootfs::open(rootfs)?;
+    let setup = install_authorized_keys(mounted.path(), authorized_keys);
+    let cleanup = mounted.finish();
+
+    match (setup, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(setup), Ok(())) => Err(setup),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Err(setup), Err(cleanup)) => Err(SshAccessError::SetupCleanup {
+            setup: Box::new(setup),
+            cleanup,
+        }),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -570,18 +567,15 @@ mod tests {
 
     use super::install_authorized_keys;
     #[cfg(target_os = "linux")]
-    use super::{MountedRootfs, PersistedVmSpec};
+    use super::{MountedRootfs, VmStore};
     #[cfg(target_os = "linux")]
-    use crate::{MemoryMib, NetworkSpec, UserName, VcpuCount, VmId, VmSpec};
+    use crate::{AuthorizedKey, MemoryMib, UserName, VcpuCount, VmInput};
 
     #[test]
     fn authorized_keys_are_installed_for_root_with_strict_permissions() {
         let rootfs = tempfile::tempdir().expect("failed to create fake rootfs");
-        let authorized_keys = rootfs.path().parent().unwrap().join("authorized_keys");
-        fs::write(&authorized_keys, b"ssh-ed25519 test-key root@example.com\n")
-            .expect("failed to create authorized keys");
 
-        install_authorized_keys(rootfs.path(), &authorized_keys)
+        install_authorized_keys(rootfs.path(), b"ssh-ed25519 test-key root@example.com\n")
             .expect("failed to install authorized keys");
 
         assert_eq!(
@@ -608,46 +602,48 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
+    #[tokio::test]
     #[ignore = "requires root, loop devices, and BARBIROLLI_TEST_ROOTFS"]
-    fn persisted_vm_spec_mounts_rootfs_and_installs_authorized_keys() {
+    async fn vm_store_writes_explicit_authorized_keys_directly_into_rootfs() {
         let source_rootfs =
             env::var_os("BARBIROLLI_TEST_ROOTFS").expect("BARBIROLLI_TEST_ROOTFS is required");
         let temporary_root =
             env::var_os("BARBIROLLI_TEST_TMPDIR").expect("BARBIROLLI_TEST_TMPDIR is required");
         let temporary =
             tempfile::tempdir_in(temporary_root).expect("failed to create temporary VM directory");
-        let artifact_dir = temporary.path().join("vm");
-        fs::create_dir(&artifact_dir).expect("failed to create VM artifact directory");
-        let rootfs = artifact_dir.join("rootfs.ext4");
-        fs::copy(source_rootfs, &rootfs).expect("failed to copy rootfs");
-        fs::write(
-            artifact_dir.join("authorized_keys"),
-            b"ssh-ed25519 test-key root@example.com\n",
-        )
-        .expect("failed to create authorized keys");
+        let vm_root = temporary.path().join("vms");
+        let image_root = temporary.path().join("images");
+        fs::create_dir(&image_root).expect("failed to create image directory");
+        fs::write(image_root.join("vmlinux"), b"kernel").expect("failed to create kernel");
+        fs::copy(source_rootfs, image_root.join("alpine.ext4"))
+            .expect("failed to copy source rootfs");
 
-        let persisted = PersistedVmSpec::new(VmSpec {
-            id: VmId::try_from(1).expect("valid VM ID"),
-            user: "root-vm".parse::<UserName>().expect("valid user"),
-            artifact_dir: artifact_dir.clone(),
-            kernel: artifact_dir.join("vmlinux"),
-            rootfs: rootfs.clone(),
-            vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
-            memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            network: NetworkSpec::new(VmId::try_from(1).expect("valid VM ID"))
-                .expect("valid network"),
-        });
+        let store = VmStore::new(vm_root, image_root).expect("failed to create VM store");
+        let spec = store
+            .create(VmInput {
+                user: "root-vm".parse::<UserName>().expect("valid user"),
+                authorized_keys: vec![
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com"
+                        .parse::<AuthorizedKey>()
+                        .expect("valid authorized key"),
+                ],
+                port_bindings: Vec::new(),
+                vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
+                memory_mib: MemoryMib::try_from(128).expect("valid memory"),
+            })
+            .await
+            .expect("failed to create VM");
 
-        persisted
-            .setup_ssh_access()
-            .expect("failed to set up SSH access");
+        assert!(
+            !spec.artifact_dir.join("authorized_keys").exists(),
+            "authorized keys must not be persisted beside the VM artifacts"
+        );
 
-        let mounted = MountedRootfs::open(&rootfs).expect("failed to remount rootfs");
+        let mounted = MountedRootfs::open(&spec.rootfs).expect("failed to remount rootfs");
         assert_eq!(
             fs::read(mounted.path().join("root/.ssh/authorized_keys"))
                 .expect("failed to read authorized keys from rootfs"),
-            b"ssh-ed25519 test-key root@example.com\n"
+            b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com\n"
         );
         mounted.finish().expect("failed to unmount rootfs");
     }

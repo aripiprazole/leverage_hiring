@@ -10,8 +10,6 @@ use nlink::{
 
 const NETWORK_PREFIX: u8 = 30;
 const MAIN_ROUTE_TABLE: u32 = 254;
-const VM_NETWORK_POOL: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 0);
-const VM_NETWORK_POOL_PREFIX: u8 = 16;
 
 pub type Result<T, E = NetworkError> = std::result::Result<T, E>;
 
@@ -49,6 +47,7 @@ impl NetworkSpec {
         nftables_conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
+        port_bindings: &[PortBinding],
     ) -> Result<()> {
         let tap = route
             .get_link_by_name(self.tap.as_ref())
@@ -59,7 +58,8 @@ impl NetworkSpec {
             .await?;
         route.set_link_up_by_index(tap.ifindex()).await?;
         tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await?;
-        self.install_rules(nftables_conn, host, table).await
+        self.install_rules(nftables_conn, host, table, port_bindings)
+            .await
     }
 
     #[tracing::instrument(
@@ -72,7 +72,7 @@ impl NetworkSpec {
             guest_ip = %self.guest_ip
         )
     )]
-    pub async fn prepare(&self) -> Result<ManagedNetwork> {
+    pub async fn prepare(&self, port_bindings: &[PortBinding]) -> Result<ManagedNetwork> {
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -110,7 +110,10 @@ impl NetworkSpec {
             .mode(Mode::Tap)
             .create_persistent()?;
 
-        match self.setup(&route_conn, &nftables_conn, &host, &table).await {
+        match self
+            .setup(&route_conn, &nftables_conn, &host, &table, port_bindings)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(host_interface = %host, "VM network prepared");
                 Ok(ManagedNetwork {
@@ -202,7 +205,14 @@ impl NetworkSpec {
         conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
+        port_bindings: &[PortBinding],
     ) -> Result<(), NetworkError> {
+        let prerouting_chain = Chain::new(table, "prerouting")?
+            .family(Family::Ip)
+            .hook(Hook::Prerouting)
+            .priority(Priority::DstNat)
+            .chain_type(ChainType::Nat)
+            .policy(Policy::Accept);
         let forward_chain = Chain::new(table, "forward")?
             .family(Family::Ip)
             .hook(Hook::Forward)
@@ -215,39 +225,75 @@ impl NetworkSpec {
             .priority(Priority::SrcNat)
             .chain_type(ChainType::Nat)
             .policy(Policy::Accept);
-        let isolate = Rule::new(table, "forward")
-            .family(Family::Ip)
-            .match_iif(self.tap.as_ref())
-            .match_daddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
-            .drop()
-            .comment("vm-isolation");
-        let outbound = Rule::new(table, "forward")
-            .family(Family::Ip)
-            .match_iif(self.tap.as_ref())
-            .match_oif(host.as_ref())
-            .accept();
-        let established = Rule::new(table, "forward")
-            .family(Family::Ip)
-            .match_iif(host.as_ref())
-            .match_oif(self.tap.as_ref())
-            .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
-            .accept();
         let masquerade = Rule::new(table, "postrouting")
             .family(Family::Ip)
             .match_saddr_v4(self.subnet, NETWORK_PREFIX)
             .match_oif(host.as_ref())
             .masquerade();
 
-        conn.transaction()
+        let plan = self.firewall_plan(port_bindings);
+        let mut transaction = conn
+            .transaction()
             .add_table(table, Family::Ip)
+            .add_chain(prerouting_chain)
             .add_chain(forward_chain)
             .add_chain(postrouting_chain)
-            .add_rule(isolate)
-            .add_rule(outbound)
-            .add_rule(established)
-            .add_rule(masquerade)
-            .commit(conn)
-            .await?;
+            .add_rule(masquerade);
+
+        for forward in &plan.port_forwards {
+            transaction = transaction.add_rule(
+                Rule::new(table, "prerouting")
+                    .family(Family::Ip)
+                    .match_iif(host.as_ref())
+                    .match_daddr_v4_not(
+                        forward.destination_exclusion.network,
+                        forward.destination_exclusion.prefix,
+                    )
+                    .match_tcp_dport(forward.external.into())
+                    .dnat(forward.guest_ip, Some(forward.internal.into()))
+                    .comment("published-tcp-dnat"),
+            );
+        }
+
+        for rule in plan.forward_rules {
+            let rule = match rule {
+                ForwardRule::DropVmToVm => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_iif(self.tap.as_ref())
+                    .match_daddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
+                    .drop()
+                    .comment("vm-isolation"),
+                ForwardRule::AllowVmEgress => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_iif(self.tap.as_ref())
+                    .match_oif(host.as_ref())
+                    .accept()
+                    .comment("vm-egress"),
+                ForwardRule::AllowEstablishedToVm => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_iif(host.as_ref())
+                    .match_oif(self.tap.as_ref())
+                    .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
+                    .accept()
+                    .comment("vm-established"),
+                ForwardRule::AllowPublishedTcp(forward) => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_iif(host.as_ref())
+                    .match_oif(self.tap.as_ref())
+                    .match_daddr_v4(forward.guest_ip, 32)
+                    .match_tcp_dport(forward.internal.into())
+                    .accept()
+                    .comment("published-tcp-forward"),
+                ForwardRule::DropUnmatchedToVm => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_oif(self.tap.as_ref())
+                    .drop()
+                    .comment("drop-unpublished-inbound"),
+            };
+            transaction = transaction.add_rule(rule);
+        }
+
+        transaction.commit(conn).await?;
         Ok(())
     }
 }
@@ -334,7 +380,12 @@ pub enum NetworkError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DefaultRouteCandidate, overlaps_vm_pool, select_default_route};
+    use super::{
+        Connection, DefaultRouteCandidate, Family, NetworkError, NetworkSpec, Nftables,
+        overlaps_vm_pool, select_default_route,
+    };
+    use crate::{Port, PortBinding, test_support};
+    use nlink::netlink::nftables::{CmpOp, RuleExpr};
     use std::net::Ipv4Addr;
 
     #[test]
@@ -368,5 +419,77 @@ mod tests {
         assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 16));
         assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 12));
         assert!(!overlaps_vm_pool(Ipv4Addr::new(10, 0, 0, 0), 8));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Linux root privileges and nftables"]
+    #[allow(clippy::await_holding_lock)]
+    async fn installs_published_port_and_default_deny_rules() {
+        let _guard = test_support::lock_firecracker_tests();
+        let network =
+            NetworkSpec::new(test_support::next_firecracker_vm_id()).expect("valid network");
+        let binding = PortBinding {
+            internal: Port::try_from(22).expect("valid internal port"),
+            external: Port::try_from(25_222).expect("valid external port"),
+        };
+        let table = format!("fc_vm_{}", network.vm_id);
+        let managed = network
+            .prepare(&[binding])
+            .await
+            .expect("failed to prepare VM network");
+
+        let inspection = async {
+            let connection = Connection::<Nftables>::new()?;
+            let chains = connection
+                .list_chains_in(table.as_str(), Family::Ip)
+                .await?;
+            let rules = connection.list_rules(&table, Family::Ip).await?;
+            Ok::<_, NetworkError>((chains, rules))
+        }
+        .await;
+        let cleanup = managed.cleanup().await;
+
+        let (chains, rules) = inspection.expect("failed to inspect installed nftables rules");
+        cleanup.expect("failed to clean up VM network");
+
+        let mut chain_names = chains
+            .iter()
+            .map(|chain| chain.name.as_str())
+            .collect::<Vec<_>>();
+        chain_names.sort_unstable();
+        assert_eq!(chain_names, ["forward", "postrouting", "prerouting"]);
+
+        let mut comments = rules
+            .iter()
+            .filter_map(|rule| rule.comment.as_deref())
+            .collect::<Vec<_>>();
+        comments.sort_unstable();
+        assert_eq!(
+            comments,
+            [
+                "drop-unpublished-inbound",
+                "published-tcp-dnat",
+                "published-tcp-forward",
+                "vm-egress",
+                "vm-established",
+                "vm-isolation",
+            ]
+        );
+
+        let dnat = rules
+            .iter()
+            .find(|rule| rule.comment.as_deref() == Some("published-tcp-dnat"))
+            .expect("missing published TCP DNAT rule");
+        assert!(
+            dnat.expressions().iter().any(|expression| matches!(
+                expression,
+                RuleExpr::Cmp {
+                    op: CmpOp::Neq,
+                    data,
+                    ..
+                } if data == &[172, 16, 0, 0]
+            )),
+            "DNAT must exclude destinations already translated into the VM pool"
+        );
     }
 }

@@ -13,15 +13,11 @@ use tokio::{
 async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
     let temporary = tempfile::tempdir().expect("failed to create temporary storage");
     let vm_root = temporary.path().join("vms");
-    let default_authorized_keys = temporary.path().join("default_authorized_keys");
-    std::fs::write(&default_authorized_keys, b"")
-        .expect("failed to create DEFAULT_AUTHORIZED_KEYS");
     let image_root = PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
     let firecracker =
         PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
     let api_socket = vm_root.join(".sockets/firecracker.socket");
-    let store = VmStore::new(vm_root, image_root, default_authorized_keys)
-        .expect("failed to create the VM store");
+    let store = VmStore::new(vm_root, image_root).expect("failed to create the VM store");
     let manager = Barbirolli::new(store, firecracker)
         .await
         .expect("failed to create Barbirolli");
@@ -34,6 +30,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await
         .expect("failed to create the first VM");
@@ -136,6 +133,7 @@ async fn global_api_socket_supports_repeated_and_concurrent_lifecycle_calls() {
             vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(192).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await
         .expect("failed to create the second VM");

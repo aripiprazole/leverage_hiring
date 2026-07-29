@@ -6,11 +6,7 @@ use super::{Result, StorageError};
 pub struct VmStore;
 
 impl VmStore {
-    pub fn new(
-        _vm_root: PathBuf,
-        _image_root: PathBuf,
-        _default_authorized_keys: PathBuf,
-    ) -> Result<Self, StorageError> {
+    pub fn new(_vm_root: PathBuf, _image_root: PathBuf) -> Result<Self, StorageError> {
         Ok(Self)
     }
 }

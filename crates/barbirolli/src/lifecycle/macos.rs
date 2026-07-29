@@ -50,10 +50,6 @@ impl Barbirolli {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
-    pub async fn authorized_keys_path(&self, _user: &str) -> Option<PathBuf> {
-        None
-    }
-
     pub async fn ssh_address(&self, _user: &str) -> Option<Ipv4Addr> {
         None
     }

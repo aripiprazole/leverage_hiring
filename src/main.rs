@@ -8,7 +8,6 @@ use tracing_subscriber::EnvFilter;
 struct Config {
     vm_root: PathBuf,
     image_root: PathBuf,
-    default_authorized_keys: PathBuf,
     firecracker: PathBuf,
     #[serde(default = "default_elhone_address")]
     elhone_addr: SocketAddr,
@@ -30,11 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
-    let store = VmStore::new(
-        config.vm_root,
-        config.image_root,
-        config.default_authorized_keys,
-    )?;
+    let store = VmStore::new(config.vm_root, config.image_root)?;
     let manager = Arc::new(Barbirolli::new(store, config.firecracker).await?);
 
     let elhone_address = elhone::validate_address(config.elhone_addr)?;
@@ -72,10 +67,6 @@ mod tests {
             ("VM_ROOT".to_owned(), "/var/lib/vms".to_owned()),
             ("IMAGE_ROOT".to_owned(), "/var/lib/images".to_owned()),
             (
-                "DEFAULT_AUTHORIZED_KEYS".to_owned(),
-                "/etc/ssh/authorized_keys".to_owned(),
-            ),
-            (
                 "FIRECRACKER".to_owned(),
                 "/usr/local/bin/firecracker".to_owned(),
             ),
@@ -85,10 +76,6 @@ mod tests {
 
         assert_eq!(config.vm_root, PathBuf::from("/var/lib/vms"));
         assert_eq!(config.image_root, PathBuf::from("/var/lib/images"));
-        assert_eq!(
-            config.default_authorized_keys,
-            PathBuf::from("/etc/ssh/authorized_keys")
-        );
         assert_eq!(
             config.firecracker,
             PathBuf::from("/usr/local/bin/firecracker")

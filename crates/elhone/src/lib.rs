@@ -240,6 +240,10 @@ impl From<LifecycleError> for ApiError {
             )
             | LifecycleError::Shutdown(_)
             | LifecycleError::Warmup(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            #[cfg(feature = "linux")]
+            LifecycleError::Storage(StorageError::SshAccess(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             #[cfg(not(feature = "linux"))]
             LifecycleError::UnsupportedPlatform => StatusCode::INTERNAL_SERVER_ERROR,
             #[cfg(feature = "linux")]
@@ -270,7 +274,9 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use barbirolli::{NetworkSpec, UserName, VmId, VmInput, VmStatus, VmSummary};
+    use barbirolli::{
+        NetworkSpec, Port, PortBinding, UserName, VmId, VmInput, VmStatus, VmSummary,
+    };
     use serde_json::json;
 
     #[test]
@@ -294,6 +300,57 @@ mod tests {
     }
 
     #[test]
+    fn vm_input_accepts_typed_port_bindings_and_defaults_to_none() {
+        let without_bindings = serde_json::from_value::<VmInput>(json!({
+            "user": "alice",
+            "vcpu_count": 1,
+            "memory_mib": 128
+        }))
+        .expect("port bindings should be optional");
+        assert!(without_bindings.port_bindings.is_empty());
+
+        let with_bindings = serde_json::from_value::<VmInput>(json!({
+            "user": "alice",
+            "vcpu_count": 1,
+            "memory_mib": 128,
+            "port_bindings": [
+                {
+                    "internal": 22,
+                    "external": 2222
+                }
+            ]
+        }))
+        .expect("valid port bindings should deserialize");
+        assert_eq!(
+            with_bindings.port_bindings,
+            vec![PortBinding {
+                internal: Port::try_from(22).expect("valid internal port"),
+                external: Port::try_from(2222).expect("valid external port"),
+            }]
+        );
+    }
+
+    #[test]
+    fn vm_input_rejects_zero_port_bindings() {
+        for field in ["internal", "external"] {
+            let mut binding = json!({
+                "internal": 22,
+                "external": 2222
+            });
+            binding[field] = 0.into();
+
+            let error = serde_json::from_value::<VmInput>(json!({
+                "user": "alice",
+                "vcpu_count": 1,
+                "memory_mib": 128,
+                "port_bindings": [binding]
+            }))
+            .expect_err("port zero must be rejected");
+            assert!(error.to_string().contains("invalid network port"));
+        }
+    }
+
+    #[test]
     fn vm_summary_serializes_network() {
         let id = VmId::try_from(0).expect("valid VM ID");
         let summary = VmSummary {
@@ -301,6 +358,10 @@ mod tests {
             user: "alice".parse::<UserName>().expect("valid user"),
             status: VmStatus::Running,
             network: NetworkSpec::new(id).expect("valid network"),
+            port_bindings: vec![PortBinding {
+                internal: Port::try_from(22).expect("valid internal port"),
+                external: Port::try_from(2222).expect("valid external port"),
+            }],
         };
 
         assert_eq!(
@@ -309,6 +370,12 @@ mod tests {
                 "id": 0,
                 "user": "alice",
                 "status": "running",
+                "port_bindings": [
+                    {
+                        "internal": 22,
+                        "external": 2222
+                    }
+                ],
                 "network": {
                     "vm_id": 0,
                     "tap": "fc-tap0",

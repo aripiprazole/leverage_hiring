@@ -215,7 +215,7 @@ async fn rollback_vm(
 
 impl ManagedVm {
     pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self, LifecycleError> {
-        let network = spec.network.prepare().await?;
+        let network = spec.network.prepare(&spec.port_bindings).await?;
         let mut vm = match spec.prepare_vm(barbirolli).await {
             Ok(vm) => vm,
             Err(startup) => {

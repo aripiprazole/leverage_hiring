@@ -34,6 +34,9 @@ pub enum StorageError {
     },
     #[error("invalid configuration in {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
+    #[cfg(feature = "linux")]
+    #[error(transparent)]
+    SshAccess(#[from] SshAccessError),
 }
 
 #[cfg(feature = "linux")]

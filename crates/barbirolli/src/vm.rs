@@ -20,6 +20,8 @@ pub struct VmInput {
     pub memory_mib: MemoryMib,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
+    #[serde(default)]
+    pub port_bindings: Vec<PortBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +34,47 @@ pub struct VmSpec {
     pub rootfs: PathBuf,
     pub vcpu_count: VcpuCount,
     pub memory_mib: MemoryMib,
+    #[serde(default)]
+    pub port_bindings: Vec<PortBinding>,
     pub network: NetworkSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortBinding {
+    pub internal: Port,
+    pub external: Port,
+}
+
+/// TCP only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[serde(transparent)]
+#[display("{_0}")]
+pub struct Port(u16);
+
+impl TryFrom<u16> for Port {
+    type Error = ParseValueError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or_else(|| ParseValueError::new("network port", value.to_string()))
+    }
+}
+
+impl From<Port> for u16 {
+    fn from(value: Port) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Port {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_from(u16::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]

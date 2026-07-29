@@ -30,5 +30,6 @@ pub use lifecycle::{Barbirolli, LifecycleError, VmStatus, VmSummary};
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};
 pub use vm::{
-    AuthorizedKey, MemoryMib, ParseValueError, UserName, VcpuCount, VmId, VmInput, VmSpec,
+    AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, UserName, VcpuCount, VmId,
+    VmInput, VmSpec,
 };

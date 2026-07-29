@@ -8,8 +8,8 @@ use std::{
 };
 
 use barbirolli::{
-    AuthorizedKey, Barbirolli, LifecycleError, MemoryMib, NetworkSpec, StorageError, UserName,
-    VcpuCount, VmId, VmInput, VmStatus, VmStore,
+    AuthorizedKey, Barbirolli, LifecycleError, MemoryMib, NetworkSpec, Port, PortBinding,
+    StorageError, UserName, VcpuCount, VmId, VmInput, VmStatus, VmStore,
 };
 
 const AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
@@ -51,7 +51,7 @@ fn network_allocation_and_authorized_key_parsing_are_stable() {
 }
 
 #[tokio::test]
-async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() {
+async fn storage_reuses_ids_and_follows_fixed_artifact_symlinks_without_key_sidecars() {
     let temporary = tempfile::tempdir().expect("failed to create temporary storage");
     let vm_root = temporary.path().join("vms");
     let image_root = temporary.path().join("images");
@@ -64,22 +64,15 @@ async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() 
         .expect("failed to link kernel");
     std::os::unix::fs::symlink(&source_rootfs, image_root.join("alpine.ext4"))
         .expect("failed to link rootfs");
-    let default_authorized_keys = temporary.path().join("default_authorized_keys");
-    fs::write(&default_authorized_keys, format!("{AUTHORIZED_KEY}\n"))
-        .expect("failed to create default authorized keys");
-
-    let store = VmStore::new(
-        vm_root.clone(),
-        image_root.clone(),
-        default_authorized_keys.clone(),
-    )
-    .expect("failed to create the VM store");
+    let store =
+        VmStore::new(vm_root.clone(), image_root.clone()).expect("failed to create the VM store");
     let alice = store
         .create(VmInput {
             user: "alice".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await
         .expect("failed to create Alice's VM");
@@ -92,10 +85,9 @@ async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() 
         fs::read(&alice.rootfs).expect("failed to read copied rootfs"),
         b"rootfs"
     );
-    assert_eq!(
-        fs::read_to_string(alice.artifact_dir.join("authorized_keys"))
-            .expect("failed to read copied authorized keys"),
-        format!("{AUTHORIZED_KEY}\n")
+    assert!(
+        !alice.artifact_dir.join("authorized_keys").exists(),
+        "authorized keys must not be copied beside VM artifacts"
     );
 
     let duplicate = store
@@ -104,28 +96,29 @@ async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() 
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await;
     assert!(matches!(duplicate, Err(StorageError::DuplicateUser(_))));
 
+    let bob_binding = PortBinding {
+        internal: Port::try_from(80).expect("valid internal port"),
+        external: Port::try_from(8080).expect("valid external port"),
+    };
     let bob = store
         .create(VmInput {
             user: "bob".parse::<UserName>().expect("valid user"),
             vcpu_count: VcpuCount::try_from(2).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(192).expect("valid memory"),
-            authorized_keys: vec![
-                AUTHORIZED_KEY
-                    .parse::<AuthorizedKey>()
-                    .expect("valid authorized key"),
-            ],
+            authorized_keys: Vec::new(),
+            port_bindings: vec![bob_binding],
         })
         .await
         .expect("failed to create Bob's VM");
     assert_eq!(u16::from(bob.id), 1);
-    assert_eq!(
-        fs::read_to_string(bob.artifact_dir.join("authorized_keys"))
-            .expect("failed to read explicit authorized keys"),
-        format!("{AUTHORIZED_KEY}\n")
+    assert!(
+        !bob.artifact_dir.join("authorized_keys").exists(),
+        "authorized keys must not be copied beside VM artifacts"
     );
 
     store.delete(&alice).expect("failed to delete Alice's VM");
@@ -135,26 +128,28 @@ async fn storage_persists_keys_reuses_ids_and_follows_fixed_artifact_symlinks() 
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await
         .expect("failed to create Carol's VM");
     assert_eq!(u16::from(carol.id), 0);
 
-    let discovered = VmStore::new(vm_root, image_root, default_authorized_keys)
+    let discovered = VmStore::new(vm_root, image_root)
         .expect("failed to reopen the VM store")
         .vm_root
         .map(|item| {
-            u16::from(
-                item.expect("failed to discover a persisted VM")
-                    .persisted_spec
-                    .spec
-                    .id,
-            )
+            item.expect("failed to discover a persisted VM")
+                .persisted_spec
+                .spec
         })
         .collect::<Vec<_>>();
     assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&0));
-    assert!(discovered.contains(&1));
+    assert!(discovered.iter().any(|spec| u16::from(spec.id) == 0));
+    let reopened_bob = discovered
+        .iter()
+        .find(|spec| u16::from(spec.id) == 1)
+        .expect("Bob's persisted VM was not discovered");
+    assert_eq!(reopened_bob.port_bindings, vec![bob_binding]);
 }
 
 #[tokio::test]
@@ -165,9 +160,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     fs::create_dir(&image_root).expect("failed to create IMAGE_ROOT");
     fs::write(image_root.join("vmlinux"), b"kernel").expect("failed to create kernel");
     fs::write(image_root.join("alpine.ext4"), b"rootfs").expect("failed to create rootfs");
-    let default_authorized_keys = temporary.path().join("default_authorized_keys");
-    fs::write(&default_authorized_keys, format!("{AUTHORIZED_KEY}\n"))
-        .expect("failed to create default authorized keys");
     let firecracker = temporary.path().join("firecracker");
     fs::write(
         &firecracker,
@@ -181,8 +173,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
     fs::set_permissions(&firecracker, permissions)
         .expect("failed to make fake Firecracker executable");
 
-    let store = VmStore::new(vm_root, image_root, default_authorized_keys)
-        .expect("failed to create the VM store");
+    let store = VmStore::new(vm_root, image_root).expect("failed to create the VM store");
     let manager = Barbirolli::new(store, firecracker)
         .await
         .expect("failed to create Barbirolli");
@@ -192,6 +183,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await
         .expect("failed to create Alice's VM");
@@ -213,16 +205,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         assert_eq!(vm.summary().status, VmStatus::Discovered);
         assert_eq!(vm.spec().id, id);
     }
-    assert_eq!(
-        manager
-            .authorized_keys_path("alice")
-            .await
-            .expect("missing authorized_keys path")
-            .file_name()
-            .and_then(|name| name.to_str()),
-        Some("authorized_keys")
-    );
-    assert!(manager.authorized_keys_path("missing").await.is_none());
     assert!(manager.ssh_address("alice").await.is_none());
     {
         let mut vm = manager.vm_mut(id).expect("missing VM");
@@ -271,6 +253,7 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
             vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
             memory_mib: MemoryMib::try_from(128).expect("valid memory"),
             authorized_keys: Vec::new(),
+            port_bindings: Vec::new(),
         })
         .await;
     assert!(matches!(drained, Err(LifecycleError::Draining)));
