@@ -10,7 +10,7 @@ examine_re = [
   "is_authorized_key",
   "VmStore::",
   "NetworkSpec::",
-  "Barbirolli::(vm|create|list|authorized_keys_path|ssh_address|delete|shutdown_all)",
+  "Barbirolli::(vm|create|list|authorized_keys_path|delete|shutdown_all)",
   "BarbirolliVm::",
   "ManagedVm::",
 ]

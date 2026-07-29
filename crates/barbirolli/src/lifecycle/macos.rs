@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::path::PathBuf;
 
 use super::{LifecycleError, Result, VmSummary};
 use crate::{VmId, VmInput, VmSpec, VmStore};
@@ -48,10 +48,6 @@ impl Barbirolli {
 
     pub fn vm_mut(&self, _vm_id: VmId) -> Result<BarbirolliVm, LifecycleError> {
         Err(LifecycleError::UnsupportedPlatform)
-    }
-
-    pub async fn ssh_address(&self, _user: &str) -> Option<Ipv4Addr> {
-        None
     }
 
     pub async fn delete(&self, _vm_id: VmId) -> Result<(), LifecycleError> {

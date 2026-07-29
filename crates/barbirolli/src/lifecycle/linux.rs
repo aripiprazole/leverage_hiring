@@ -3,7 +3,6 @@ use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
 use std::{
     collections::HashSet,
     fmt::Debug,
-    net::Ipv4Addr,
     path::PathBuf,
     sync::{
         Arc,
@@ -138,16 +137,6 @@ impl Barbirolli {
             .iter()
             .map(|entry| entry.value().summary())
             .collect()
-    }
-
-    pub async fn ssh_address(&self, user: &str) -> Option<Ipv4Addr> {
-        self.vms.iter().find_map(|entry| {
-            let BarbirolliVm::Managed(managed) = entry.value() else {
-                return None;
-            };
-            (!managed.failed && managed.spec.user.as_ref() == user)
-                .then_some(managed.spec.network.guest_ip)
-        })
     }
 
     #[tracing::instrument(skip(self), fields(%vm_id), err)]

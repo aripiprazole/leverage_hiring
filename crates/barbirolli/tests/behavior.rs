@@ -205,7 +205,6 @@ async fn manager_exposes_discovered_state_and_drains_operations() {
         assert_eq!(vm.summary().status, VmStatus::Discovered);
         assert_eq!(vm.spec().id, id);
     }
-    assert!(manager.ssh_address("alice").await.is_none());
     {
         let mut vm = manager.vm_mut(id).expect("missing VM");
         Box::pin(vm.shutdown(&manager))
