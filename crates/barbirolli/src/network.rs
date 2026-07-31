@@ -186,6 +186,30 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
+    fn network_allocation_is_stable() {
+        let first = NetworkSpec::new(VmId::try_from(0).expect("valid VM ID"))
+            .expect("failed to allocate the first network");
+        assert_eq!(first.tap.as_ref(), "fc-tap0");
+        assert_eq!(first.subnet, Ipv4Addr::new(172, 16, 0, 0));
+        assert_eq!(first.host_ip, Ipv4Addr::new(172, 16, 0, 1));
+        assert_eq!(first.guest_ip, Ipv4Addr::new(172, 16, 0, 2));
+        assert_eq!(first.guest_mac, "06:00:ac:10:00:02");
+        assert_eq!(first.subnet_cidr(), "172.16.0.0/30");
+        assert_eq!(
+            first.kernel_boot_args(),
+            "keep_bootcon console=ttyS0 reboot=k panic=1 ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off nameserver=1.1.1.1"
+        );
+
+        let last = NetworkSpec::new(VmId::try_from(16_383).expect("valid VM ID"))
+            .expect("failed to allocate the last network");
+        assert_eq!(last.tap.as_ref(), "fc-tap16383");
+        assert_eq!(last.subnet, Ipv4Addr::new(172, 16, 255, 252));
+        assert_eq!(last.host_ip, Ipv4Addr::new(172, 16, 255, 253));
+        assert_eq!(last.guest_ip, Ipv4Addr::new(172, 16, 255, 254));
+        assert_eq!(last.guest_mac, "06:00:ac:10:ff:fe");
+    }
+
+    #[test]
     fn external_port_is_forwarded_to_the_internal_guest_port() {
         let network =
             NetworkSpec::new(VmId::try_from(0).expect("valid VM ID")).expect("valid network");

@@ -12,7 +12,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
     let function_name = signature.ident.to_string();
     let vm_id = match signature.inputs.len() {
         0 => quote!(let _firecracker_test_vm_id =
-            barbirolli::test_support::next_firecracker_vm_id();),
+            crate::support::next_firecracker_vm_id();),
         1 => {
             let Some(FnArg::Typed(argument)) = signature.inputs.first() else {
                 return syn::Error::new_spanned(
@@ -23,7 +23,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                 .into();
             };
             let pattern = &argument.pat;
-            quote!(let #pattern = barbirolli::test_support::next_firecracker_vm_id();)
+            quote!(let #pattern = crate::support::next_firecracker_vm_id();)
         }
         _ => {
             return syn::Error::new_spanned(
@@ -44,9 +44,10 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
     quote! {
         #(#attributes)*
         #test_attribute
+        #[ignore = "requires Linux, KVM, Firecracker, and VM artifacts"]
         #[allow(clippy::await_holding_lock)]
         #visibility #signature {
-            let _firecracker_test_guard = barbirolli::test_support::lock_firecracker_tests();
+            let _firecracker_test_guard = crate::support::lock_firecracker_tests();
             #vm_id
             let firecracker = std::env::var_os("FIRECRACKER")
                 .is_some_and(|path| std::path::Path::new(&path).is_file());
@@ -73,17 +74,15 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                         .args([
                             "env",
                             "BARBIROLLI_LIMA_GUEST=1",
-                            "CARGO_TARGET_DIR=/tmp/barbirolli-target",
+                            "CARGO_TARGET_DIR=/var/tmp/barbirolli-target",
                             "cargo",
                             "test",
                             "-p",
                             "barbirolli",
-                            "--test",
-                            "firecracker",
+                            "--lib",
                             #function_name,
                             "--",
                             "--ignored",
-                            "--exact",
                         ])
                         .status()
                         .expect("failed to launch the privileged test through Lima");

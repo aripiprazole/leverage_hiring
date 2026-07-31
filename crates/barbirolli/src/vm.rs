@@ -228,3 +228,25 @@ impl ParseValueError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use barbirolli::AuthorizedKey;
+
+    const AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
+
+    #[test]
+    fn authorized_key_parsing_is_strict() {
+        assert!(AUTHORIZED_KEY.parse::<AuthorizedKey>().is_ok());
+        assert!(
+            "not an OpenSSH public key"
+                .parse::<AuthorizedKey>()
+                .is_err()
+        );
+        assert!(
+            format!("{AUTHORIZED_KEY}\n")
+                .parse::<AuthorizedKey>()
+                .is_err()
+        );
+    }
+}

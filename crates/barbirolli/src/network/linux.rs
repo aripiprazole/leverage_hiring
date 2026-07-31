@@ -402,7 +402,7 @@ mod tests {
         Connection, DefaultRouteCandidate, Family, NetworkError, NetworkSpec, Nftables,
         overlaps_vm_pool, select_default_route,
     };
-    use crate::{Port, PortBinding, test_support};
+    use crate::{Port, PortBinding, support};
     use nlink::netlink::nftables::{CmpOp, RuleExpr};
     use std::net::Ipv4Addr;
 
@@ -443,9 +443,8 @@ mod tests {
     #[ignore = "requires Linux root privileges and nftables"]
     #[allow(clippy::await_holding_lock)]
     async fn installs_published_port_and_default_deny_rules() {
-        let _guard = test_support::lock_firecracker_tests();
-        let network =
-            NetworkSpec::new(test_support::next_firecracker_vm_id()).expect("valid network");
+        let _guard = support::lock_firecracker_tests();
+        let network = NetworkSpec::new(support::next_firecracker_vm_id()).expect("valid network");
         let binding = PortBinding {
             internal: Port::try_from(22).expect("valid internal port"),
             external: Port::try_from(25_222).expect("valid external port"),

@@ -396,7 +396,9 @@ impl MountedRootfs {
 #[cfg(target_os = "linux")]
 impl Drop for MountedRootfs {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if let Err(err) = self.cleanup() {
+            tracing::error!(?err, "failed to drop mounted rootfs");
+        }
     }
 }
 
