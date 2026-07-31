@@ -5,6 +5,7 @@
 - Unrestricted firecracker vmm: It's only running trusted binary / root fs, and it's not running in production.
 - Secret Management using Firecracker MDS: not implemented
 - UDP port bindings: not implemented
+- Memory/Resources limiting: not implemented
 
 ## Dependencies
 
@@ -32,7 +33,7 @@ cargo --version
 ## Booting
 
 ```bash
-$(pwd)/scripts/setup # or lima limactl shell provisioning ~/ $(pwd)/scripts/setup
+$(pwd)/scripts/setup # or lima limactl shell --workdir ~/ provisioning $(pwd)/scripts/setup
 $(pwd)/scripts/run
 ```
 
