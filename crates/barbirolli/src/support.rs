@@ -10,6 +10,9 @@ pub mod behavior;
 pub mod config;
 pub mod firecracker;
 pub mod lifecycle;
+pub mod network;
+pub mod ssh;
+pub mod storage;
 
 static FIRECRACKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_FIRECRACKER_VM_ID: AtomicU16 = AtomicU16::new(12_000);

@@ -48,17 +48,17 @@ pub(crate) struct FirewallPlan {
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForwardRule {
-    /// Reject packets leaving this VM's TAP for any address in the VM
-    /// network pool, isolating the Micro VMs.
-    DropVmToVm,
     /// Permit packets initiated by this VM to leave its TAP through the host's
     /// default external interface.
     AllowVmEgress,
-    /// Permit reply traffic from the host's external interface back to this
-    /// VM's TAP.
+    /// Permit established reply traffic from the host's external interface
+    /// back to this VM's TAP.
     AllowEstablishedToVm,
-    /// Permit TCP traffic that prerouting DNAT translated from the published
-    /// external port to this VM's guest address and internal port.
+    /// Permit established reply traffic from the VM address pool after this
+    /// VM initiated a connection to a peer's published port.
+    AllowEstablishedFromPeer,
+    /// Permit TCP traffic to a published internal port from either the host's
+    /// external interface or another VM.
     AllowPublishedTcp(PortForward),
     /// Reject every other forwarded packet targeting this VM's TAP.
     DropUnmatchedToVm,
@@ -125,9 +125,9 @@ impl NetworkSpec {
             .map(|binding| self.port_forward(binding))
             .collect::<Vec<_>>();
         let mut forward_rules = vec![
-            ForwardRule::DropVmToVm,
             ForwardRule::AllowVmEgress,
             ForwardRule::AllowEstablishedToVm,
+            ForwardRule::AllowEstablishedFromPeer,
         ];
         forward_rules.extend(
             port_forwards
@@ -255,9 +255,9 @@ mod tests {
             FirewallPlan {
                 port_forwards: vec![forward],
                 forward_rules: vec![
-                    ForwardRule::DropVmToVm,
                     ForwardRule::AllowVmEgress,
                     ForwardRule::AllowEstablishedToVm,
+                    ForwardRule::AllowEstablishedFromPeer,
                     ForwardRule::AllowPublishedTcp(forward),
                     ForwardRule::DropUnmatchedToVm,
                 ],

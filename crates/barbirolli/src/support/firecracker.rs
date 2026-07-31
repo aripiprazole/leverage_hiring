@@ -1,32 +1,42 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use barbirolli::{Barbirolli, VmId, VmStore};
+use barbirolli::{Barbirolli, VmId, VmStore, VmSummary};
+use futures::future::try_join_all;
 use serde::Deserialize;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
+    sync::Barrier,
 };
 
-use super::{config::TestVmConfig, lifecycle::VmLifecycleFixture};
+use super::{
+    config::TestVmConfig, lifecycle::VmLifecycleFixture, network::VmNetworkFixture,
+    ssh::SshFixture, storage::VmStorageFixture,
+};
 
 pub struct FirecrackerFixture {
     manager: Barbirolli,
     temporary: TempDir,
     vm_root: PathBuf,
+    image_root: PathBuf,
+    firecracker: PathBuf,
+    ssh_private_key: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct FirecrackerVmFixture {
     pub id: VmId,
     pub lifecycle: VmLifecycleFixture,
     pub api: FirecrackerApiFixture,
+    pub network: VmNetworkFixture,
+    pub ssh: SshFixture,
+    pub storage: VmStorageFixture,
 }
 
+#[derive(Clone)]
 pub struct FirecrackerApiFixture {
-    socket: PathBuf,
+    pub socket: PathBuf,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -55,9 +65,17 @@ impl FirecrackerFixture {
             PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
         let firecracker =
             PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
-        let store =
-            VmStore::new(vm_root.clone(), image_root).expect("failed to create the VM store");
-        let manager = Barbirolli::new(store, firecracker)
+        let ssh_private_key = std::env::var_os("SSH_PRIVATE_KEY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                image_root
+                    .parent()
+                    .expect("IMAGE_ROOT should have a parent")
+                    .join("ssh/id_ed25519")
+            });
+        let store = VmStore::new(vm_root.clone(), image_root.clone())
+            .expect("failed to create the VM store");
+        let manager = Barbirolli::new(store, firecracker.clone())
             .await
             .expect("failed to create Barbirolli");
 
@@ -65,6 +83,9 @@ impl FirecrackerFixture {
             manager,
             temporary,
             vm_root,
+            image_root,
+            firecracker,
+            ssh_private_key,
         }
     }
 
@@ -74,6 +95,40 @@ impl FirecrackerFixture {
             .create(config.into_input())
             .await
             .expect("failed to create fixture VM");
+        self.vm(id)
+    }
+
+    pub async fn create_vms_concurrently<const N: usize>(
+        &self,
+        configs: [TestVmConfig; N],
+        inspect: impl FnOnce(&[FirecrackerVmFixture; N]),
+    ) -> [FirecrackerVmFixture; N] {
+        let barrier = Arc::new(Barrier::new(N.max(1)));
+        let ids = try_join_all(configs.map(|config| {
+            let manager = self.manager.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                manager.create(config.into_input()).await
+            }
+        }))
+        .await
+        .expect("a concurrent create failed");
+        let ids: [VmId; N] = ids
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one VM ID is returned per config"));
+        let vms = ids.map(|id| self.vm(id));
+        inspect(&vms);
+        vms
+    }
+
+    pub fn vm(&self, id: VmId) -> FirecrackerVmFixture {
+        let spec = self
+            .manager
+            .vm(id)
+            .expect("missing fixture VM")
+            .spec()
+            .clone();
         FirecrackerVmFixture {
             id,
             lifecycle: VmLifecycleFixture::new(self.manager.clone(), id),
@@ -82,7 +137,48 @@ impl FirecrackerFixture {
                     .vm_root
                     .join(format!(".sockets/firecracker-{id}.socket")),
             },
+            network: VmNetworkFixture::new(spec.network.clone()),
+            ssh: SshFixture::new(spec.network.guest_ip, self.ssh_private_key.clone()),
+            storage: VmStorageFixture::new(&spec),
         }
+    }
+
+    pub async fn delete_vms_concurrently(
+        &self,
+        ids: &[VmId],
+        inspect: impl FnOnce(&[VmSummary]),
+    ) -> Vec<VmSummary> {
+        let barrier = Arc::new(Barrier::new(ids.len().max(1)));
+        try_join_all(ids.iter().copied().map(|id| {
+            let manager = self.manager.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                manager.delete(id).await
+            }
+        }))
+        .await
+        .expect("a concurrent delete failed");
+        let remaining = self.manager.list().await;
+        inspect(&remaining);
+        remaining
+    }
+
+    pub async fn restart_manager(&mut self, inspect: impl FnOnce(&Self)) {
+        self.manager
+            .shutdown()
+            .await
+            .expect("failed to stop Barbirolli before restart");
+        let store = VmStore::new(self.vm_root.clone(), self.image_root.clone())
+            .expect("failed to reopen the VM store");
+        self.manager = Barbirolli::new(store, self.firecracker.clone())
+            .await
+            .expect("failed to restart Barbirolli");
+        inspect(self);
+    }
+
+    pub async fn list(&self) -> Vec<VmSummary> {
+        self.manager.list().await
     }
 
     pub async fn finish(self) {
@@ -101,10 +197,6 @@ impl FirecrackerFixture {
 }
 
 impl FirecrackerApiFixture {
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
     pub async fn machine_config(&self, inspect: impl FnOnce(&MachineConfig)) -> MachineConfig {
         let mut socket = UnixStream::connect(&self.socket)
             .await

@@ -25,6 +25,11 @@ impl TestVmConfig {
         self
     }
 
+    pub fn authorized_key(mut self, key: AuthorizedKey) -> Self {
+        self.authorized_keys.push(key);
+        self
+    }
+
     pub fn into_input(self) -> VmInput {
         VmInput {
             vcpu_count: VcpuCount::try_from(self.vcpu_count).expect("valid vCPU count"),

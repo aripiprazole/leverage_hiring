@@ -1,14 +1,19 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
 use barbirolli::{Barbirolli, LifecycleError, VmId, VmSpec, VmStore, VmSummary};
+use derive_more::{Deref, DerefMut};
+use futures::future::try_join_all;
 use tempfile::TempDir;
+use tokio::sync::Barrier;
 
 use super::{config::TestVmConfig, lifecycle::VmLifecycleFixture};
 
+pub use super::storage::VmStorageFixture;
+
 pub struct BehaviorFixture {
     pub storage: StorageEnvironmentFixture,
+    pub temporary: TempDir,
     firecracker: PathBuf,
-    temporary: TempDir,
 }
 
 #[derive(Clone)]
@@ -17,7 +22,10 @@ pub struct StorageEnvironmentFixture {
     pub image_root: PathBuf,
 }
 
+#[derive(Deref, DerefMut)]
 pub struct StoreFixture {
+    #[deref]
+    #[deref_mut]
     store: VmStore,
 }
 
@@ -26,7 +34,10 @@ pub struct StoredVmFixture {
     pub storage: VmStorageFixture,
 }
 
+#[derive(Deref, DerefMut)]
 pub struct BehaviorManagerFixture {
+    #[deref]
+    #[deref_mut]
     manager: Barbirolli,
 }
 
@@ -34,10 +45,6 @@ pub struct BehaviorVmFixture {
     pub id: VmId,
     pub lifecycle: VmLifecycleFixture,
     pub storage: VmStorageFixture,
-}
-
-pub struct VmStorageFixture {
-    pub artifact_dir: PathBuf,
 }
 
 impl BehaviorFixture {
@@ -85,10 +92,6 @@ impl BehaviorFixture {
             .await
             .expect("failed to create Barbirolli");
         BehaviorManagerFixture { manager }
-    }
-
-    pub fn path(&self) -> &std::path::Path {
-        self.temporary.path()
     }
 }
 
@@ -141,18 +144,36 @@ impl StoredVmFixture {
 }
 
 impl BehaviorManagerFixture {
-    pub async fn create_vm(&self, config: TestVmConfig) -> BehaviorVmFixture {
-        self.try_create_vm(config)
-            .await
-            .expect("failed to create manager VM")
-    }
-
     pub async fn try_create_vm(
         &self,
         config: TestVmConfig,
     ) -> Result<BehaviorVmFixture, LifecycleError> {
         let id = self.manager.create(config.into_input()).await?;
         self.try_vm(id)
+    }
+
+    pub async fn create_vms_concurrently<const N: usize>(
+        &self,
+        configs: [TestVmConfig; N],
+        inspect: impl FnOnce(&[BehaviorVmFixture; N]),
+    ) -> [BehaviorVmFixture; N] {
+        let barrier = Arc::new(Barrier::new(N.max(1)));
+        let ids = try_join_all(configs.map(|config| {
+            let manager = self.manager.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                manager.create(config.into_input()).await
+            }
+        }))
+        .await
+        .expect("a concurrent create failed");
+        let ids: [VmId; N] = ids
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one VM ID is returned per config"));
+        let vms = ids.map(|id| self.vm(id));
+        inspect(&vms);
+        vms
     }
 
     pub fn vm(&self, id: VmId) -> BehaviorVmFixture {
@@ -168,12 +189,25 @@ impl BehaviorManagerFixture {
         })
     }
 
-    pub async fn try_delete(&self, id: VmId) -> Result<(), LifecycleError> {
-        self.manager.delete(id).await
-    }
-
-    pub async fn list(&self) -> Vec<VmSummary> {
-        self.manager.list().await
+    pub async fn delete_vms_concurrently(
+        &self,
+        ids: &[VmId],
+        inspect: impl FnOnce(&[VmSummary]),
+    ) -> Vec<VmSummary> {
+        let barrier = Arc::new(Barrier::new(ids.len().max(1)));
+        try_join_all(ids.iter().copied().map(|id| {
+            let manager = self.manager.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                manager.delete(id).await
+            }
+        }))
+        .await
+        .expect("a concurrent delete failed");
+        let remaining = self.list().await;
+        inspect(&remaining);
+        remaining
     }
 
     pub async fn finish(&self) {
@@ -181,31 +215,5 @@ impl BehaviorManagerFixture {
             .shutdown()
             .await
             .expect("failed to drain Barbirolli");
-    }
-}
-
-impl VmStorageFixture {
-    fn new(spec: &VmSpec) -> Self {
-        Self {
-            artifact_dir: spec.artifact_dir.clone(),
-        }
-    }
-
-    pub fn config(&self) -> serde_json::Value {
-        let config =
-            fs::read(self.artifact_dir.join("config.json")).expect("failed to read VM config");
-        serde_json::from_slice(&config).expect("invalid VM config")
-    }
-
-    pub fn kernel(&self) -> PathBuf {
-        self.artifact_dir.join("vmlinux")
-    }
-
-    pub fn rootfs(&self) -> PathBuf {
-        self.artifact_dir.join("rootfs.ext4")
-    }
-
-    pub fn authorized_keys(&self) -> PathBuf {
-        self.artifact_dir.join("authorized_keys")
     }
 }

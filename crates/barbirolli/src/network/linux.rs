@@ -275,12 +275,6 @@ impl NetworkSpec {
 
         for rule in plan.forward_rules {
             let rule = match rule {
-                ForwardRule::DropVmToVm => Rule::new(table, "forward")
-                    .family(Family::Ip)
-                    .match_iif(self.tap.as_ref())
-                    .match_daddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
-                    .drop()
-                    .comment("vm-isolation"),
                 ForwardRule::AllowVmEgress => Rule::new(table, "forward")
                     .family(Family::Ip)
                     .match_iif(self.tap.as_ref())
@@ -294,9 +288,15 @@ impl NetworkSpec {
                     .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
                     .accept()
                     .comment("vm-established"),
+                ForwardRule::AllowEstablishedFromPeer => Rule::new(table, "forward")
+                    .family(Family::Ip)
+                    .match_saddr_v4(VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX)
+                    .match_oif(self.tap.as_ref())
+                    .match_ct_state(CtState::ESTABLISHED | CtState::RELATED)
+                    .accept()
+                    .comment("vm-peer-established"),
                 ForwardRule::AllowPublishedTcp(forward) => Rule::new(table, "forward")
                     .family(Family::Ip)
-                    .match_iif(host.as_ref())
                     .match_oif(self.tap.as_ref())
                     .match_daddr_v4(forward.guest_ip, 32)
                     .match_tcp_dport(forward.internal.into())
@@ -403,8 +403,16 @@ mod tests {
         overlaps_vm_pool, select_default_route,
     };
     use crate::{Port, PortBinding, support};
+    use barbirolli::VmStatus;
+    use barbirolli_derive::firecracker_test;
     use nlink::netlink::nftables::{CmpOp, RuleExpr};
     use std::net::Ipv4Addr;
+
+    use support::{
+        config::TestVmConfig,
+        firecracker::FirecrackerFixture,
+        network::{LimaHttpFixture, available_tcp_port},
+    };
 
     #[test]
     fn selects_lowest_metric_ipv4_default_route() {
@@ -437,6 +445,100 @@ mod tests {
         assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 16));
         assert!(overlaps_vm_pool(Ipv4Addr::new(172, 16, 0, 0), 12));
         assert!(!overlaps_vm_pool(Ipv4Addr::new(10, 0, 0, 0), 8));
+    }
+
+    #[firecracker_test]
+    async fn vms_are_isolated_and_can_reach_an_http_server_on_lima() {
+        let fixture = FirecrackerFixture::new().await;
+        let vms = fixture
+            .create_vms_concurrently::<2>(
+                [TestVmConfig::new(1, 128), TestVmConfig::new(1, 128)],
+                |_| {},
+            )
+            .await;
+        let mut running = vms;
+        running.sort_by_key(|vm| u16::from(vm.id));
+        running[0]
+            .lifecycle
+            .start(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Running);
+            })
+            .await;
+        running[1]
+            .lifecycle
+            .start(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Running);
+            })
+            .await;
+        let alice = &running[0];
+        let bob = &running[1];
+
+        let lima = LimaHttpFixture::start("outside-lima").await;
+        alice
+            .ssh
+            .http_get(&lima.url_for(&alice.network), |output| {
+                assert_eq!(output.stdout, "outside-lima");
+            })
+            .await;
+
+        let isolated_port = 18_080;
+        bob.ssh
+            .start_http_server(isolated_port, "bob-unpublished")
+            .await;
+        bob.network
+            .http_get(isolated_port, |response| {
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"bob-unpublished");
+            })
+            .await;
+        let blocked = alice
+            .ssh
+            .try_http_get(&bob.network.url(isolated_port))
+            .await;
+        assert!(!blocked.status.success());
+
+        fixture.finish().await;
+    }
+
+    #[firecracker_test]
+    async fn a_published_binding_permits_one_vm_to_reach_another() {
+        let fixture = FirecrackerFixture::new().await;
+        let allowed_port = 18_081;
+        let blocked_port = 18_082;
+        let external_port = available_tcp_port();
+        let vms = fixture
+            .create_vms_concurrently::<2>(
+                [
+                    TestVmConfig::new(1, 128),
+                    TestVmConfig::new(1, 128).binding(allowed_port, external_port),
+                ],
+                |_| {},
+            )
+            .await;
+        vms[0].lifecycle.start(|_| {}).await;
+        vms[1].lifecycle.start(|_| {}).await;
+        let alice = &vms[0];
+        let bob = &vms[1];
+
+        bob.ssh
+            .start_http_server(allowed_port, "bob-published")
+            .await;
+        bob.ssh
+            .start_http_server(blocked_port, "bob-unpublished")
+            .await;
+        bob.network.http_get(allowed_port, |_| {}).await;
+        bob.network.http_get(blocked_port, |_| {}).await;
+
+        alice
+            .ssh
+            .http_get(&bob.network.url(allowed_port), |output| {
+                assert_eq!(output.stdout, "bob-published");
+            })
+            .await;
+        let blocked = alice.ssh.try_http_get(&bob.network.url(blocked_port)).await;
+        assert!(!blocked.status.success());
+
+        fixture.finish().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -493,7 +595,7 @@ mod tests {
                 "published-tcp-output-dnat",
                 "vm-egress",
                 "vm-established",
-                "vm-isolation",
+                "vm-peer-established",
             ]
         );
 

@@ -51,6 +51,28 @@ mod tests {
 
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
     use barbirolli::{Port, PortBinding};
+    use barbirolli_derive::firecracker_test;
+
+    use barbirolli::support::{firecracker::FirecrackerFixture, ssh::SshKeyFixture};
+
+    #[firecracker_test]
+    async fn authorized_key_allows_an_ssh_connection_to_the_vm() {
+        let fixture = FirecrackerFixture::new().await;
+        let key = SshKeyFixture::generate().await;
+        let vm = fixture
+            .create_vm(TestVmConfig::new(1, 128).authorized_key(key.public_key.clone()))
+            .await;
+        vm.lifecycle.start(|_| {}).await;
+
+        vm.ssh
+            .with_private_key(key.private_key.clone())
+            .command("printf barbirolli-ssh", |output| {
+                assert_eq!(output.stdout, "barbirolli-ssh");
+            })
+            .await;
+
+        fixture.finish().await;
+    }
 
     #[tokio::test]
     async fn storage_copies_artifacts_without_a_key_sidecar() {

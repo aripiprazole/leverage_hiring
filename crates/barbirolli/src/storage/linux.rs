@@ -78,6 +78,7 @@ struct MountedRootfs {
 pub struct VmStore {
     pub vm_root: VmRootFolder,
     pub image_root: PathBuf,
+    creation_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -128,11 +129,13 @@ impl VmStore {
             vm_root: VmRootFolder::new(vm_root)?,
             image_root: canonicalize(&image_root)
                 .map_err(|error| StorageError::io(&image_root, error))?,
+            creation_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmSpec, StorageError> {
+        let _creation_guard = self.creation_lock.lock().await;
         let source_kernel = self.image_root.join("vmlinux");
         let source_rootfs = self.image_root.join("alpine.ext4");
         let id = self.vm_root.next_id()?;

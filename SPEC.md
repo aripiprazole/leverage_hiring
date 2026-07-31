@@ -277,15 +277,16 @@ impl TryFrom<&str> for InterfaceName {
   address, guest address, and broadcast address.
 - Startup fails if the pool overlaps an existing host route.
 - The lowest-metric IPv4 default route in the main routing table supplies the external interface.
-- Every binding publishes TCP from the selected external interface to the VM guest address.
-- Established replies and published ports can enter a VM. All other forwarded traffic to its TAP
-  is denied.
+- Every binding publishes TCP from the selected external interface to the VM guest address and
+  permits peer VMs to reach the same internal TCP port directly.
+- Established replies and published ports can enter a VM from the host or a peer VM. All other
+  forwarded traffic to its TAP is denied.
 - Each base-chain policy remains `accept` because every VM owns an independent table. The final
   output-TAP-specific drop supplies default deny without one VM's base chain dropping another VM's
   packets.
 - DNAT excludes `172.16.0.0/16`. Once a table translates a packet into the VM pool, another VM's
   table cannot translate it again because its internal port matches another external port.
-- VM internet egress and established replies are unrestricted; VM-to-VM traffic is denied.
+- VM to VM communication is dropped, while internet egress packets are allowed
 - IPv6, guest-to-host isolation, and egress filtering are out of scope.
 - IPv4 forwarding is shared host state and remains enabled after per-VM cleanup.
 - Guest static IP, gateway, and DNS configuration are present before boot.
