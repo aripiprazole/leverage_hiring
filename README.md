@@ -7,9 +7,19 @@
 - UDP port bindings: not implemented
 - Memory/Resources limiting: not implemented
 
+## Lima
+
+The projects should run inside of a Linux machine with KVM support.
+
+> Only tested using Lima on MacOS with Nested Virtualization.
+
+```bash
+limactl start --set '.nestedVirtualization=true' --name=provisioning template://default
+```
+
 ## Dependencies
 
-Ubuntu dependencies
+Required dependencies on Ubuntu
 
 ```bash
 sudo apt-get update
@@ -32,168 +42,128 @@ cargo --version
 
 ## Booting
 
+From the macOS host, open a shell in the repository inside Lima:
+
 ```bash
-$(pwd)/scripts/setup # or lima limactl shell --workdir ~/ provisioning $(pwd)/scripts/setup
-$(pwd)/scripts/run
+limactl shell --workdir "$PWD" provisioning
+```
+
+Then, inside Lima:
+
+```bash
+./x setup_service
+./x run_service
 ```
 
 ## Example commands
 
 ```sh
+# Show available VM commands
+./x help
+
+# Create a VM
+./x create --publish 2222:22
+
 # Start a VM
-curl -X POST http://127.0.0.1:3000/vms/0/start
+./x start 0
 
 # Stop a VM
-curl -X POST http://127.0.0.1:3000/vms/0/shutdown
+./x shutdown 0
+
+# Check status
+./x status 0
 
 # Delete a VM
-curl  -X DELETE http://127.0.0.1:3000/vms/0
+./x delete 0
+```
 
-# Create a new VM
-curl -X POST http://127.0.0.1:3000/vms \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "vcpu_count": 1,
-    "memory_mib": 256,
-    "authorized_keys": [],
-    "port_bindings": [
-      {
-        "internal": 22,
-        "external": 2222
-      }
-    ]
-  }'
+## CLI helpers
+
+```sh
+# Inspect the current state
+./x ps
+./x show 0
+
+# Open SSH using the VM's default key
+./x ssh 0
+
+# Use a custom key if you passed --authorized-key-file on create
+./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release"
+
+# Help for a specific command
+./x help create
+```
+
+If you use the provided Nix shell, `x` is also available in `PATH`:
+
+```bash
+nix develop --command x help
 ```
 
 ## Examples
 
-Run these from the repository root in a linux machine.
+Run these from the repository root inside the Linux/Lima guest. Keep
+`./x run_service` running in another Linux/Lima terminal.
 
 ### SQLite
 
 ```sh
-VM_ID=$(
-  curl --fail-with-body --silent --show-error \
-    -X POST http://127.0.0.1:3000/vms \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "vcpu_count": 1,
-      "memory_mib": 256,
-      "authorized_keys": [],
-      "port_bindings": []
-    }' | jq -r .id
-)
+VM_ID=$(./x create --memory-mib 256 | jq -r .id)
 
-VM_IP=$(
-  curl --fail-with-body --silent --show-error \
-    "http://127.0.0.1:3000/vms/$VM_ID" | jq -r .network.guest_ip
-)
+./x start "$VM_ID"
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/start"
-
-ssh \
-  -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectionAttempts=30 root@"$VM_IP" \
-  "apt-get update &&
+./x ssh "$VM_ID" -- "apt-get update &&
    apt-get install -y sqlite3 &&
    sqlite3 /root/example.db 'CREATE TABLE messages (body TEXT);' &&
    sqlite3 /root/example.db \"INSERT INTO messages VALUES ('hello');\" &&
    sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
+./x ssh "$VM_ID" -- sync
+./x shutdown "$VM_ID"
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/start"
+./x start "$VM_ID"
 
-ssh \
-  -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectionAttempts=30 root@"$VM_IP" \
-  "sqlite3 /root/example.db 'SELECT * FROM messages;'"
+./x ssh "$VM_ID" -- "sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
+./x shutdown "$VM_ID"
 
-curl -X DELETE "http://127.0.0.1:3000/vms/$VM_ID"
+./x delete "$VM_ID"
 ```
 
 ### HTTP
 
 ```sh
-VM_ID=$(
-  curl --silent --show-error \
-    -X POST http://127.0.0.1:3000/vms \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "vcpu_count": 1,
-      "memory_mib": 256,
-      "authorized_keys": [],
-      "port_bindings": [
-        {"internal": 80, "external": 8080}
-      ]
-    }' | jq -r .id
-)
+VM_ID=$(./x create --publish 8080:80 | jq -r .id)
 
-VM_IP=$(
-  curl --silent --show-error \
-    "http://127.0.0.1:3000/vms/$VM_ID" | jq -r .network.guest_ip
-)
+./x start "$VM_ID"
 
-curl -X POST \
-  "http://127.0.0.1:3000/vms/$VM_ID/start"
-
-ssh \
-  -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectionAttempts=30 root@"$VM_IP" \
-  "mkdir -p /srv/hello &&
+./x ssh "$VM_ID" -- "mkdir -p /srv/hello &&
    echo '<h1>Hello from a microVM</h1>' > /srv/hello/index.html &&
    python3 -m http.server 80 --directory /srv/hello"
 ```
 
-From another linux terminal:
+From another terminal inside the same Linux/Lima guest:
 
 ```sh
-curl --fail \
-  "http://$(limactl shell provisioning ip -j route get 1.1.1.1 |
-    jq -r '.[0].prefsrc'):8080"
+HOST_IP=$(ip -j route get 1.1.1.1 | jq -r '.[0].prefsrc')
+curl --fail "http://$HOST_IP:8080"
 ```
 
 Press `Ctrl-C` in the HTTP server terminal, then run:
 
 ```sh
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
-curl -X DELETE "http://127.0.0.1:3000/vms/$VM_ID"
+./x shutdown "$VM_ID"
+./x delete "$VM_ID"
 ```
 
 ### PostgreSQL
 
 ```sh
-VM_ID=$(
-  curl --silent --show-error \
-    -X POST http://127.0.0.1:3000/vms \
-    -H 'Content-Type: application/json' \
-    -d '{
-      "vcpu_count": 1,
-      "memory_mib": 512,
-      "authorized_keys": [],
-      "port_bindings": [
-        {"internal": 5432, "external": 5432}
-      ]
-    }' | jq -r .id
-)
+VM_ID=$(./x create --memory-mib 512 --publish 5432:5432 | jq -r .id)
 
-VM_IP=$(
-  curl --silent --show-error \
-    "http://127.0.0.1:3000/vms/$VM_ID" | jq -r .network.guest_ip
-)
+./x start "$VM_ID"
 
-curl --fail-with-body -X POST "http://127.0.0.1:3000/vms/$VM_ID/start"
-
-ssh \
-  -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectionAttempts=30 root@"$VM_IP" \
-  "export DEBIAN_FRONTEND=noninteractive &&
+./x ssh "$VM_ID" -- "export DEBIAN_FRONTEND=noninteractive &&
    apt-get update &&
    apt-get install -y postgresql &&
    sed -i \"s/^#listen_addresses = 'localhost'/listen_addresses = '*'/\" \
@@ -206,41 +176,26 @@ ssh \
    su postgres -c \"psql -d hello -c \\\"CREATE TABLE messages (body TEXT);
      INSERT INTO messages VALUES ('hello from postgres');\\\"\""
 
-LIMA_IP=$(
-  limactl shell provisioning ip -j route get 1.1.1.1 |
-    jq -r '.[0].prefsrc'
-)
+HOST_IP=$(ip -j route get 1.1.1.1 | jq -r '.[0].prefsrc')
 
 env PGPASSWORD=postgres \
-  psql --host "$LIMA_IP" --port 5432 \
+  psql --host "$HOST_IP" --port 5432 \
     --username postgres --dbname hello \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
+./x shutdown "$VM_ID"
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/start"
+./x start "$VM_ID"
 
-ssh \
-  -i '~/.local/share/barbirolli/ssh/id_ed25519' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o ConnectionAttempts=30 root@"$VM_IP" \
-  "service postgresql start"
+./x ssh "$VM_ID" -- "service postgresql start"
 
 env PGPASSWORD=postgres \
-  psql --host "$LIMA_IP" --port 5432 \
+  psql --host "$HOST_IP" --port 5432 \
     --username postgres --dbname hello \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-curl -X POST "http://127.0.0.1:3000/vms/$VM_ID/shutdown"
-curl -X DELETE "http://127.0.0.1:3000/vms/$VM_ID"
-```
-
-## Lima
-
-The flake sets up the limactl on MacOS targets, you can set it up by using:
-
-```bash
-limactl start --set '.nestedVirtualization=true' --name=provisioning template://default
+./x shutdown "$VM_ID"
+./x delete "$VM_ID"
 ```

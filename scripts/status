@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x status <vm_id>
+
+Show VM lifecycle status.
+EOF
+}
+
+if (($# == 0)); then
+    usage_error "missing VM_ID"
+fi
+
+case "$1" in
+    help | --help | -h)
+        usage
+        exit 0
+        ;;
+    *)
+        vm_id="$(require_vm_id "$1")"
+        if (($# != 1)); then
+            usage_error "unexpected extra argument: $2"
+        fi
+        api_request GET "/vms/$vm_id/status"
+        ;;
+esac
+

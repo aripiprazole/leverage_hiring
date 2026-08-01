@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x ps
+
+List all existing VM summaries.
+EOF
+}
+
+if (($# == 0)); then
+    api_request GET "/vms"
+    exit 0
+fi
+
+case "$1" in
+    help | --help | -h)
+        usage
+        exit 0
+        ;;
+    *)
+        usage_error "unexpected argument: $1"
+        ;;
+esac

@@ -208,7 +208,7 @@ Each `$VM_ROOT/<vm_id>` contains:
   `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
   file. No key sidecar is written beside the VM artifacts.
 - With no supplied keys, the rootfs keeps the default key embedded in the source image.
-- `scripts/setup` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
+- `scripts/setup_service` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
 
 ## Host and guest networking
 

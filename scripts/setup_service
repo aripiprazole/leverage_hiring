@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/setup
+Usage: x setup_service
 
 Download and prepare Firecracker 1.13, a guest kernel, a writable rootfs,
 and the SSH key used by local development.
@@ -21,7 +21,7 @@ if (($# > 0)); then
             exit 0
             ;;
         *)
-            die "unexpected argument: $1"
+            usage_error "unexpected argument: $1"
             ;;
     esac
 fi

@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 : "${BARBIROLLI_RUNTIME_DIR:=${XDG_DATA_HOME:-$HOME/.local/share}/barbirolli}"
 : "${CARGO_TARGET_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/barbirolli-target}"
 : "${ELHONE_ADDR:=127.0.0.1:3000}"
+: "${ELHONE_URL:=http://$ELHONE_ADDR}"
 : "${RUST_LOG:=info}"
 
 FIRECRACKER_VERSION="v1.13.2"
@@ -33,6 +34,7 @@ export VM_ROOT
 export IMAGE_ROOT
 export DEFAULT_AUTHORIZED_KEYS
 export FIRECRACKER
+export ELHONE_URL
 export ELHONE_ADDR
 export RUST_LOG
 
@@ -47,6 +49,11 @@ error() {
 die() {
     error "$*"
     exit 1
+}
+
+usage_error() {
+    error "$*"
+    exit 2
 }
 
 normalize_arch() {
@@ -107,5 +114,91 @@ runtime_is_prepared() {
 
 require_runtime_artifacts() {
     runtime_is_prepared ||
-        die "runtime artifacts are missing or invalid; run scripts/setup first"
+        die "runtime artifacts are missing or invalid; run x setup_service first"
+}
+
+validate_integer() {
+    local label="$1"
+    local value="$2"
+    local minimum="$3"
+    local maximum="$4"
+    local canonical
+    local normalized
+
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        usage_error "invalid $label: expected an integer, got $value"
+
+    canonical="${value#"${value%%[!0]*}"}"
+    [[ -n "$canonical" ]] || canonical=0
+
+    ((${#canonical} <= ${#maximum})) ||
+        usage_error "invalid $label: expected a value from $minimum to $maximum, got $value"
+
+    normalized=$((10#$canonical))
+    ((normalized >= minimum && normalized <= maximum)) ||
+        usage_error "invalid $label: expected a value from $minimum to $maximum, got $value"
+
+    printf '%d\n' "$normalized"
+}
+
+require_vm_id() {
+    validate_integer "VM ID" "$1" 0 16383
+}
+
+api_request() {
+    local method="$1"
+    local path="$2"
+    shift 2
+
+    require_commands curl jq
+
+    if (($# > 1)); then
+        usage_error "api_request accepts at most one JSON body argument"
+    fi
+
+    local response
+    local status=0
+    local url="${ELHONE_URL%/}$path"
+    if (($# == 1)); then
+        if response="$(
+            curl \
+                --fail-with-body \
+                --silent \
+                --show-error \
+                --request "$method" \
+                --header 'Accept: application/json' \
+                --header 'Content-Type: application/json' \
+                --data "$1" \
+                "$url"
+        )"; then
+            :
+        else
+            status=$?
+        fi
+    else
+        if response="$(
+            curl \
+                --fail-with-body \
+                --silent \
+                --show-error \
+                --request "$method" \
+                --header 'Accept: application/json' \
+                "$url"
+        )"; then
+            :
+        else
+            status=$?
+        fi
+    fi
+
+    if ((status != 0)); then
+        if [[ -n "$response" ]]; then
+            printf '%s\n' "$response" | jq .
+        fi
+        return "$status"
+    fi
+
+    if [[ -n "$response" ]]; then
+        printf '%s\n' "$response" | jq .
+    fi
 }

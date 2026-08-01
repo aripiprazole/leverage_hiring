@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x create [options]
+
+Options:
+  --vcpu-count <count>          Number of vCPUs (1-31). Default: 1.
+  --memory-mib <MiB>            VM memory in MiB (1-2047). Default: 256.
+  --publish <external>:<internal>  Publish one external TCP port to one internal port.
+  --authorized-key-file <path>   Add one additional authorized public key.
+  --help, -h                    Show this help message.
+
+Examples:
+  x create
+  x create --vcpu-count 2 --memory-mib 512 --publish 2222:22
+  x create --authorized-key-file ~/my_key.pub --publish 8080:80
+
+Note:
+  If you pass any --authorized-key-file values, those keys replace the default
+  key in the rootfs. Use --identity with `x ssh` if you need to connect with a
+  custom key.
+EOF
+}
+
+if (($# > 0)); then
+    case "$1" in
+        help | --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            ;;
+    esac
+fi
+
+vcpu_count="$(validate_integer "vCPU count" 1 1 31)"
+memory_mib="$(validate_integer "memory MiB" 256 1 2047)"
+declare -a authorized_key_files=()
+declare -a publish_mappings=()
+
+while (($# > 0)); do
+    case "$1" in
+        --vcpu-count)
+            (($# < 2)) && usage_error "missing value for --vcpu-count"
+            vcpu_count="$(validate_integer "vCPU count" "$2" 1 31)"
+            shift 2
+            ;;
+        --memory-mib)
+            (($# < 2)) && usage_error "missing value for --memory-mib"
+            memory_mib="$(validate_integer "memory MiB" "$2" 1 2047)"
+            shift 2
+            ;;
+        --publish)
+            (($# < 2)) && usage_error "missing value for --publish"
+            publish_mappings+=("$2")
+            shift 2
+            ;;
+        --authorized-key-file)
+            (($# < 2)) && usage_error "missing value for --authorized-key-file"
+            authorized_key_files+=("$2")
+            shift 2
+            ;;
+        *)
+            usage_error "unexpected argument: $1"
+            ;;
+    esac
+done
+
+port_bindings='[]'
+for mapping in "${publish_mappings[@]}"; do
+    if [[ "$mapping" != *:* ]]; then
+        usage_error "invalid publish mapping $mapping; expected external:internal"
+    fi
+    if [[ "$mapping" == *:*:* ]]; then
+        usage_error "invalid publish mapping $mapping; expected exactly one colon"
+    fi
+    [[ "$mapping" =~ ^[0-9]+:[0-9]+$ ]] || usage_error "invalid publish mapping $mapping; expected external:internal with ports 1-65535"
+
+    external="$(validate_integer external-port "${mapping%%:*}" 1 65535)"
+    internal="$(validate_integer internal-port "${mapping##*:}" 1 65535)"
+    port_bindings="$(jq -c --argjson external "$external" --argjson internal "$internal" \
+        '. + [{internal: $internal, external: $external}]' <<<"$port_bindings")"
+done
+
+authorized_keys='[]'
+for key_file in "${authorized_key_files[@]}"; do
+    if [[ ! -f "$key_file" ]]; then
+        usage_error "authorized key file not found: $key_file"
+    fi
+    if [[ ! -r "$key_file" ]]; then
+        usage_error "authorized key file is not readable: $key_file"
+    fi
+    authorized_key_lines=()
+    mapfile -t authorized_key_lines <"$key_file"
+    if ((${#authorized_key_lines[@]} == 0)); then
+        usage_error "authorized key file is empty: $key_file"
+    fi
+    if ((${#authorized_key_lines[@]} != 1)); then
+        usage_error "authorized key file must contain exactly one key: $key_file"
+    fi
+    authorized_key="${authorized_key_lines[0]}"
+    [[ -n "$authorized_key" ]] || usage_error "authorized key file is empty: $key_file"
+    [[ "$authorized_key" != *$'\r'* ]] ||
+        usage_error "authorized key file must not contain carriage returns: $key_file"
+    authorized_keys="$(jq -c --arg key "$authorized_key" '. + [$key]' <<<"$authorized_keys")"
+done
+
+payload="$(jq -nc \
+    --argjson vcpu_count "$vcpu_count" \
+    --argjson memory_mib "$memory_mib" \
+    --argjson authorized_keys "$authorized_keys" \
+    --argjson port_bindings "$port_bindings" \
+    '{vcpu_count: $vcpu_count, memory_mib: $memory_mib, authorized_keys: $authorized_keys, port_bindings: $port_bindings}')"
+
+api_request POST "/vms" "$payload"

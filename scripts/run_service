@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/run
+Usage: x run_service
 
 Build the service with local authentication, then run it with the
 privileges required for KVM, TAP, nftables, and IPv4 forwarding.
@@ -21,7 +21,7 @@ if (($# > 0)); then
             exit 0
             ;;
         *)
-            die "unexpected argument: $1"
+            usage_error "unexpected argument: $1"
             ;;
     esac
 fi
