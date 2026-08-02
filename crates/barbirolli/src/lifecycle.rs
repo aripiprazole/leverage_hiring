@@ -306,7 +306,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod behavior {
         use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
-        use barbirolli::{LifecycleError, NetworkSpec, VmId, VmStatus};
+        use barbirolli::{LifecycleError, MemoryMib, NetworkSpec, VmId, VmStatus};
 
         #[tokio::test]
         async fn manager_exposes_discovered_state_and_missing_vm_errors() {
@@ -431,15 +431,66 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn manager_draining_rejects_new_vms() {
+        async fn manager_draining_rejects_lifecycle_operations_but_keeps_reads_and_shutdown() {
             let fixture = BehaviorFixture::new();
             let manager = fixture.manager().await;
+            let vm = manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("failed to create manager VM");
 
             manager.finish().await;
+
             assert!(matches!(
                 manager.try_create_vm(TestVmConfig::new(1)).await,
                 Err(LifecycleError::Draining)
             ));
+            assert!(matches!(
+                manager.delete(vm.id).await,
+                Err(LifecycleError::Draining)
+            ));
+
+            let start = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.start(&manager).await
+            };
+            assert!(matches!(start, Err(LifecycleError::Draining)));
+
+            let balloon_config = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.balloon_config(&manager).await
+            };
+            assert!(matches!(balloon_config, Err(LifecycleError::Draining)));
+
+            let update_balloon = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.update_balloon(&manager, MemoryMib::from(1)).await
+            };
+            assert!(matches!(update_balloon, Err(LifecycleError::Draining)));
+
+            let balloon_statistics = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.balloon_statistics(&manager).await
+            };
+            assert!(matches!(balloon_statistics, Err(LifecycleError::Draining)));
+
+            let listed = manager.list().await;
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].id, vm.id);
+            assert_eq!(listed[0].status, VmStatus::Discovered);
+            assert_eq!(
+                barbirolli::Barbirolli::vm(&manager, vm.id)
+                    .expect("missing manager VM")
+                    .summary()
+                    .status,
+                VmStatus::Discovered
+            );
+
+            let shutdown = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.shutdown(&manager).await
+            };
+            assert!(shutdown.is_ok());
         }
     }
 }

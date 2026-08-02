@@ -257,8 +257,12 @@ impl BarbirolliVm {
         }
     }
 
-    pub fn balloon_config(&mut self) -> BoxFuture<'_, Result<BalloonConfig>> {
+    pub fn balloon_config<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+    ) -> BoxFuture<'a, Result<BalloonConfig>> {
         async move {
+            barbirolli.is_app_alive()?;
             let config = self
                 .managed_for("read balloon config")?
                 .balloon_config()
@@ -272,8 +276,13 @@ impl BarbirolliVm {
         .boxed()
     }
 
-    pub fn update_balloon(&mut self, amount_mib: MemoryMib) -> BoxFuture<'_, Result<()>> {
+    pub fn update_balloon<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+        amount_mib: MemoryMib,
+    ) -> BoxFuture<'a, Result<()>> {
         async move {
+            barbirolli.is_app_alive()?;
             self.managed_for("update balloon")?
                 .update_balloon(amount_mib.into())
                 .await?;
@@ -282,8 +291,12 @@ impl BarbirolliVm {
         .boxed()
     }
 
-    pub fn balloon_statistics(&mut self) -> BoxFuture<'_, Result<BalloonStatistics>> {
+    pub fn balloon_statistics<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+    ) -> BoxFuture<'a, Result<BalloonStatistics>> {
         async move {
+            barbirolli.is_app_alive()?;
             let statistics = self
                 .managed_for("read balloon statistics")?
                 .balloon_statistics()
@@ -412,6 +425,7 @@ impl BarbirolliVm {
     pub fn start<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, Result<()>> {
         let vm_id = self.id();
         async move {
+            barbirolli.is_app_alive()?;
             let spec = match self {
                 BarbirolliVm::Discovered(spec) => spec.clone(),
                 BarbirolliVm::Failed(spec) => {

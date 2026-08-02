@@ -49,8 +49,15 @@ GET /vms
 ]
 ```
 
-Returns the state, port bindings, and allocated network of every registered VM. States are
-`discovered`, `starting`, `running`, `shutting_down`, and `failed`.
+Returns the state, port bindings, and allocated network of every registered VM. Status and list
+responses expose these stable states:
+
+- `discovered`: the VM is persisted but not running.
+- `running`: the VM is actively managed by Firecracker.
+- `failed`: VM startup, shutdown, or runtime cleanup failed.
+
+`starting` and `shutting_down` are transition events emitted in daemon logs. Mutating operations
+on the same VM are serialized, so API readers observe the resulting stable state.
 
 ## GET `/vms/:id/status`
 
@@ -97,6 +104,20 @@ daemon's provisioning configuration (256 MiB by default) and persisted in `VmSpe
 per-request input. Ports are nonzero `u16` values. A binding
 `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
 External-port uniqueness is a provisioning invariant.
+
+Every new VM is assigned the daemon's `default_vm_mem` (256 MiB), and that value is persisted in
+the VM specification. Provisioning uses integer division for these calculations:
+
+- `mem_mib` (1,706 MiB) = `max_daemon_mem` (2,048 MiB) * 100 / (100 + `extra_percentage` (20)).
+- `count` (6) = `mem_mib` (1,706 MiB) / `default_vm_mem` (256 MiB).
+- `initial_balloon_mem` (57 MiB) = (`max_daemon_mem` (2,048 MiB) - `mem_mib` (1,706 MiB)) /
+  `count` (6).
+
+Firecracker deflates the balloon on guest out-of-memory conditions and collects balloon
+statistics every 10 seconds.
+
+The calculated `count` and `max_daemon_mem` values are planning inputs; VM creation does not
+currently enforce a global VM-count limit or total-memory admission check.
 
 # Barbirolli: VM and host-resource boundary
 

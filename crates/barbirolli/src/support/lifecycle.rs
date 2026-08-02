@@ -29,7 +29,7 @@ impl VmLifecycleFixture {
     pub async fn balloon_config(&self, inspect: impl FnOnce(&BalloonConfig)) -> BalloonConfig {
         let config = {
             let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
-            vm.balloon_config()
+            vm.balloon_config(&self.manager)
                 .await
                 .expect("failed to read balloon config through fctools")
         };
@@ -39,7 +39,7 @@ impl VmLifecycleFixture {
 
     pub async fn update_balloon(&self, amount_mib: u16) {
         let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
-        vm.update_balloon(MemoryMib::from(amount_mib))
+        vm.update_balloon(&self.manager, MemoryMib::from(amount_mib))
             .await
             .expect("failed to update balloon through fctools");
     }
@@ -49,7 +49,7 @@ impl VmLifecycleFixture {
             loop {
                 let statistics = {
                     let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
-                    vm.balloon_statistics()
+                    vm.balloon_statistics(&self.manager)
                         .await
                         .expect("failed to read balloon statistics through fctools")
                 };
