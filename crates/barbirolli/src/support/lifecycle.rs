@@ -14,10 +14,12 @@ pub struct VmLifecycleFixture {
 }
 
 impl VmLifecycleFixture {
+    #[must_use]
     pub fn new(manager: Barbirolli, id: VmId) -> Self {
         Self { manager, id }
     }
 
+    #[must_use]
     pub fn status(&self) -> VmStatus {
         self.manager
             .vm(self.id)

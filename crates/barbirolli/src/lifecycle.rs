@@ -17,8 +17,9 @@ pub use macos::*;
 
 pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 
-/// x = default_vm_mem * count
-/// max_daemon_mem = (x + (x / 100 * extra_percentage))
+/// The maximum daemon memory is calculated as
+/// `max_daemon_mem = x + (x / 100 * extra_percentage)`, where
+/// `x = default_vm_mem * count`.
 #[derive(Debug)]
 pub struct ProvisioningConfig {
     pub default_vm_mem: MemoryMib,
@@ -36,6 +37,7 @@ pub struct BalloonConfig {
 }
 
 impl BalloonConfig {
+    #[must_use]
     pub fn new(amount_mib: i32, deflate_on_oom: bool, stats_polling_interval_s: i32) -> Self {
         Self {
             amount_mib,
@@ -53,19 +55,21 @@ pub struct BalloonStatistics {
 
 impl Default for ProvisioningConfig {
     fn default() -> Self {
-        const VM_MEM_MIB: u32 = 256;
-        const DAEMON_MEM_MIB: u32 = 2048;
-        const EXTRA_PERCENTAGE: u32 = 20;
+        const VM_MEM_MIB: u16 = 256;
+        const DAEMON_MEM_MIB: u16 = 2048;
+        const EXTRA_PERCENTAGE: u8 = 20;
 
-        let mem_mib = DAEMON_MEM_MIB * 100 / (100 + EXTRA_PERCENTAGE);
-        let count = mem_mib / VM_MEM_MIB;
-        let balloon_pool_mib = DAEMON_MEM_MIB - mem_mib;
+        let mem_mib = u32::from(DAEMON_MEM_MIB) * 100 / (100 + u32::from(EXTRA_PERCENTAGE));
+        let count = mem_mib / u32::from(VM_MEM_MIB);
+        let balloon_pool_mib = u32::from(DAEMON_MEM_MIB) - mem_mib;
+        let initial_balloon_mem = u16::try_from(balloon_pool_mib / count)
+            .expect("default balloon target fits in MemoryMib");
 
         Self {
-            default_vm_mem: MemoryMib::from(VM_MEM_MIB as u16),
-            max_daemon_mem: MemoryMib::from(DAEMON_MEM_MIB as u16),
-            initial_balloon_mem: MemoryMib::from(balloon_pool_mib as u16 / count as u16),
-            extra_percentage: EXTRA_PERCENTAGE as u8,
+            default_vm_mem: MemoryMib::from(VM_MEM_MIB),
+            max_daemon_mem: MemoryMib::from(DAEMON_MEM_MIB),
+            initial_balloon_mem: MemoryMib::from(initial_balloon_mem),
+            extra_percentage: EXTRA_PERCENTAGE,
             count,
         }
     }
@@ -157,8 +161,10 @@ mod tests {
 
     #[firecracker_test]
     async fn creation_rejects_when_running_vm_capacity_is_reached() {
-        let mut provisioning = ProvisioningConfig::default();
-        provisioning.count = 1;
+        let provisioning = ProvisioningConfig {
+            count: 1,
+            ..ProvisioningConfig::default()
+        };
         let fixture = FirecrackerFixture::new(provisioning).await;
         let vm = fixture.create_vm(TestVmConfig::new(1)).await;
         vm.lifecycle.start(|_| {}).await;
@@ -340,8 +346,10 @@ mod tests {
         #[tokio::test]
         async fn manager_rejects_creation_when_running_vm_capacity_is_reached() {
             let fixture = BehaviorFixture::new();
-            let mut provisioning = ProvisioningConfig::default();
-            provisioning.count = 0;
+            let provisioning = ProvisioningConfig {
+                count: 0,
+                ..ProvisioningConfig::default()
+            };
             let manager = fixture.manager_with_provisioning(provisioning).await;
 
             let result = manager.try_create_vm(TestVmConfig::new(1)).await;
@@ -361,8 +369,10 @@ mod tests {
         #[tokio::test]
         async fn manager_capacity_does_not_count_discovered_or_failed_vms() {
             let fixture = BehaviorFixture::new();
-            let mut provisioning = ProvisioningConfig::default();
-            provisioning.count = 1;
+            let provisioning = ProvisioningConfig {
+                count: 1,
+                ..ProvisioningConfig::default()
+            };
             let manager = fixture.manager_with_provisioning(provisioning).await;
 
             let discovered = manager

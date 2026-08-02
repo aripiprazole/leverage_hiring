@@ -81,6 +81,12 @@ pub struct PersistedVmSpec {
 }
 
 impl VmStore {
+    /// Opens the VM store rooted at `vm_root` and validates its image root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either root cannot be created, resolved, or read as
+    /// a valid VM storage location.
     #[tracing::instrument(
         skip_all,
         fields(
@@ -105,6 +111,12 @@ impl VmStore {
         })
     }
 
+    /// Creates and persists a VM's artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is invalid or any artifact, rootfs, or
+    /// configuration operation fails.
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(
         &self,
@@ -156,17 +168,29 @@ impl VmStore {
             network: NetworkSpec::new(id)
                 .map_err(|error| StorageError::InvalidInput(error.to_string()))?,
         });
-        persisted.write_into(tmp.path().join("config.json"))?;
+        persisted.write_into(&tmp.path().join("config.json"))?;
         rename(tmp.path(), &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
         Ok(persisted.spec)
     }
 
-    pub async fn all(&self) -> Result<Vec<VmSpec>> {
+    /// Loads all persisted VM specifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM root cannot be read or a persisted
+    /// configuration is invalid.
+    pub fn all(&self) -> Result<Vec<VmSpec>> {
         VmRootFolder::new(&self.vm_root.dir)?
             .map(|item| item.map(|item| item.persisted_spec.spec))
             .collect::<Result<Vec<_>, StorageError>>()
     }
 
+    /// Applies `f` to every non-deleted persisted VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted VM discovery fails. Callback errors are
+    /// accumulated in the returned [`Validated`] value.
     #[tracing::instrument(skip(f))]
     pub async fn collect<T, E, F, Fut>(&self, mut f: F) -> Result<Validated<HashMap<VmId, T>, E>>
     where
@@ -175,7 +199,7 @@ impl VmStore {
     {
         let mut acc = HashMap::new();
         let mut errors = vec![];
-        for spec in self.all().await? {
+        for spec in self.all()? {
             if spec.deleted {
                 continue;
             }
@@ -196,16 +220,23 @@ impl VmStore {
         })
     }
 
+    /// Marks a VM as deleted in its persisted configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the updated configuration cannot be serialized or
+    /// written.
     #[tracing::instrument(skip(self, spec), fields(vm_id = %spec.id), err)]
     pub fn delete(&self, spec: &VmSpec) -> Result<()> {
         let config = spec.artifact_dir.join("config.json");
         let mut spec = spec.clone();
         spec.deleted = true;
-        PersistedVmSpec::new(spec).write_into(config)
+        PersistedVmSpec::new(spec).write_into(&config)
     }
 }
 
 impl PersistedVmSpec {
+    #[must_use]
     pub fn new(spec: VmSpec) -> Self {
         Self {
             version: CONFIG_VERSION,
@@ -213,13 +244,18 @@ impl PersistedVmSpec {
         }
     }
 
-    pub fn write_into(&self, path: PathBuf) -> Result<()> {
+    /// Writes this specification to `path` as formatted JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or writing fails.
+    pub fn write_into(&self, path: &Path) -> Result<()> {
         let contents =
-            serde_json::to_vec_pretty(&self).map_err(|error| StorageError::InvalidConfig {
-                path: path.clone(),
+            serde_json::to_vec_pretty(self).map_err(|error| StorageError::InvalidConfig {
+                path: path.to_path_buf(),
                 message: error.to_string(),
             })?;
-        std::fs::write(&path, contents).map_err(|error| StorageError::io(&path, error))?;
+        std::fs::write(path, contents).map_err(|error| StorageError::io(path, error))?;
         Ok(())
     }
 }
@@ -350,6 +386,7 @@ impl MountedRootfs {
         Ok(mounted)
     }
 
+    #[must_use]
     fn path(&self) -> &Path {
         self.mountpoint.path()
     }

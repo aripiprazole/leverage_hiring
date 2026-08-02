@@ -57,6 +57,7 @@ pub struct Monitor {
 }
 
 impl IdlePolicy {
+    #[must_use]
     pub fn cpu_threshold_percent(self) -> f64 {
         self.cpu_idle_high_percent
             + 0.2 * (self.cpu_active_low_percent - self.cpu_idle_high_percent)
@@ -112,13 +113,14 @@ impl Monitor {
 
 impl Sample {
     fn cpu_percent_since(self, previous: Self) -> Option<f64> {
-        let elapsed_usec = self
+        let elapsed = self
             .sampled_at
-            .checked_duration_since(previous.sampled_at)?
-            .as_micros() as u64;
-        let usage = self.cpu_usage_usec.checked_sub(previous.cpu_usage_usec)?;
-        (elapsed_usec != 0 && self.vcpu_count != 0)
-            .then(|| 100.0 * usage as f64 / (elapsed_usec as f64 * f64::from(self.vcpu_count)))
+            .checked_duration_since(previous.sampled_at)?;
+        let usage =
+            Duration::from_micros(self.cpu_usage_usec.checked_sub(previous.cpu_usage_usec)?);
+        (!elapsed.is_zero() && self.vcpu_count != 0).then(|| {
+            100.0 * usage.as_secs_f64() / (elapsed.as_secs_f64() * f64::from(self.vcpu_count))
+        })
     }
 
     fn activity_since(self, previous: Self, policy: IdlePolicy) -> Activity {
@@ -143,8 +145,8 @@ impl Sample {
 impl Default for IdlePolicy {
     fn default() -> Self {
         Self {
-            initial_interval: Duration::from_secs(300),
-            strike_interval: Duration::from_secs(60),
+            initial_interval: Duration::from_mins(5),
+            strike_interval: Duration::from_mins(1),
             final_interval: Duration::from_secs(30),
             cpu_idle_high_percent: 0.5,
             cpu_active_low_percent: 3.0,
@@ -173,7 +175,7 @@ mod tests {
 
     #[test]
     fn threshold_defaults_to_one_percent() {
-        assert_eq!(IdlePolicy::default().cpu_threshold_percent(), 1.0);
+        assert!((IdlePolicy::default().cpu_threshold_percent() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

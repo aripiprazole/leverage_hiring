@@ -6,6 +6,9 @@ use super::{Result, StorageError};
 pub struct VmStore;
 
 impl VmStore {
+    /// # Errors
+    ///
+    /// This implementation currently cannot fail.
     pub fn new(_vm_root: PathBuf, _image_root: PathBuf) -> Result<Self, StorageError> {
         Ok(Self)
     }

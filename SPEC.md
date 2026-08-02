@@ -434,13 +434,12 @@ async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 
 The start sequence is:
 
-1. Barbirolli prepares the TAP, routes, addresses, forwarding, and nftables table.
-2. `fctools` builds the Firecracker resources and configuration.
+1. Prepares the TAP, routes, addresses, forwarding, and nftables table.
+2. Builds the Firecracker resources and configuration.
 3. Firecracker starts and opens its API socket.
-4. Barbirolli finds the Firecracker PID.
-5. Barbirolli creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
-6. The metrics reader starts.
-7. `ManagedVm` takes ownership of the live resources.
+4. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
+5. The metrics reader starts.
+6. `ManagedVm` takes ownership of the live resources.
 
 ```rust
 async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
@@ -457,19 +456,18 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
     let cgroup = VmCgroup::create(spec.id.to_string(), pid)
         .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
 
-    let latest_metrics = Arc::new(RwLock::new(None));
-    let metrics_task = spawn_metrics_reader(spec.metrics_path(), latest_metrics.clone());
+    let metrics = Arc::new(RwLock::new(None));
 
     Ok(Self {
+        pid,
         spec,
         vm,
-        network: Some(network),
-        pid,
-        cgroup: Some(cgroup),
-        metrics_task,
-        latest_metrics,
-        monitor: Mutex::new(None),
         failed: false,
+        monitor: Mutex::new(None),
+        network: Some(network),
+        cgroup: Some(cgroup),
+        metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
+        metrics,
     })
 }
 ```

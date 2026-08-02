@@ -56,6 +56,7 @@ impl Default for BehaviorFixture {
 }
 
 impl BehaviorFixture {
+    #[must_use]
     pub fn new() -> Self {
         let temporary = tempfile::tempdir().expect("failed to create temporary storage");
         let vm_root = temporary.path().join("vms");
@@ -119,6 +120,7 @@ impl BehaviorFixture {
 }
 
 impl StorageEnvironmentFixture {
+    #[must_use]
     pub fn open(&self) -> StoreFixture {
         StoreFixture {
             store: VmStore::new(self.vm_root.clone(), self.image_root.clone())
@@ -202,6 +204,7 @@ impl BehaviorManagerFixture {
         vms
     }
 
+    #[must_use]
     pub fn vm(&self, id: VmId) -> BehaviorVmFixture {
         self.try_vm(id).expect("missing manager VM")
     }

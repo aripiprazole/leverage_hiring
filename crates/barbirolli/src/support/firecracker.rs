@@ -40,14 +40,15 @@ impl FirecrackerFixture {
             PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
         let firecracker =
             PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
-        let ssh_private_key = std::env::var_os("SSH_PRIVATE_KEY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let ssh_private_key = std::env::var_os("SSH_PRIVATE_KEY").map_or_else(
+            || {
                 image_root
                     .parent()
                     .expect("IMAGE_ROOT should have a parent")
                     .join("ssh/id_ed25519")
-            });
+            },
+            PathBuf::from,
+        );
         let store = VmStore::new(vm_root.clone(), image_root.clone())
             .expect("failed to create the VM store");
         let manager = Barbirolli::new(
@@ -109,6 +110,7 @@ impl FirecrackerFixture {
         vms
     }
 
+    #[must_use]
     pub fn vm(&self, id: VmId) -> FirecrackerVmFixture {
         let spec = self
             .manager

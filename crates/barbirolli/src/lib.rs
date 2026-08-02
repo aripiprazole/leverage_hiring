@@ -10,7 +10,12 @@ mod vm;
 extern crate self as barbirolli;
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test fixture helpers intentionally fail fast instead of exposing recoverable APIs"
+)]
 pub mod support;
 
 use std::path::PathBuf;

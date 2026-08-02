@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(config.elhone_addr).await?;
     let elhone = axum::serve(listener, elhone::router(daemon.clone()));
 
-    tracing::info!(addr = %config.addr, "HTTP service started");
+    tracing::info!(addr = %config.elhone_addr, "HTTP service started");
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(config.idle_initial_interval_seconds, 300);
         assert_eq!(config.idle_strike_interval_seconds, 60);
         assert_eq!(config.idle_final_interval_seconds, 30);
-        assert_eq!(config.idle_cpu_high_percent, 0.5);
-        assert_eq!(config.idle_cpu_low_percent, 3.0);
+        assert!((config.idle_cpu_high_percent - 0.5).abs() < f64::EPSILON);
+        assert!((config.idle_cpu_low_percent - 3.0).abs() < f64::EPSILON);
     }
 }

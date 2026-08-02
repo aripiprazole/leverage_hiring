@@ -7,6 +7,7 @@ pub struct TestVmConfig {
 }
 
 impl TestVmConfig {
+    #[must_use]
     pub fn new(vcpu_count: u8) -> Self {
         Self {
             vcpu_count,
@@ -15,6 +16,7 @@ impl TestVmConfig {
         }
     }
 
+    #[must_use]
     pub fn binding(mut self, internal: u16, external: u16) -> Self {
         self.bindings.push(PortBinding {
             internal: Port::try_from(internal).expect("valid internal port"),
@@ -23,11 +25,13 @@ impl TestVmConfig {
         self
     }
 
+    #[must_use]
     pub fn authorized_key(mut self, key: AuthorizedKey) -> Self {
         self.authorized_keys.push(key);
         self
     }
 
+    #[must_use]
     pub fn into_input(self) -> VmInput {
         VmInput {
             vcpu_count: VcpuCount::try_from(self.vcpu_count).expect("valid vCPU count"),

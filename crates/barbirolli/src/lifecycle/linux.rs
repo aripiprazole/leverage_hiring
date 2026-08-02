@@ -65,11 +65,17 @@ pub struct BarbirolliInner {
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
+    /// Creates a lifecycle manager and reconciles persisted VMs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Firecracker cannot be validated, persisted VM state
+    /// cannot be loaded, or one or more VMs fail warmup reconciliation.
     #[tracing::instrument]
     pub async fn new(store: VmStore, config: DaemonConfig) -> Result<Self, LifecycleError> {
         tracing::info!("initializing barbirolli");
         let firecracker = Firecracker::new(config.firecracker).await?;
-        let specs = store.all().await?;
+        let specs = store.all()?;
         let barbirolli = Self(Arc::new(BarbirolliInner {
             firecracker,
             vms: DashMap::default(),
@@ -91,10 +97,20 @@ impl Barbirolli {
         }
     }
 
+    /// Returns the VM associated with `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::NotFound`] if the VM is not registered.
     pub fn vm(&self, vm_id: VmId) -> Result<Ref<'_, VmId, BarbirolliVm>> {
         self.vms.get(&vm_id).ok_or(LifecycleError::NotFound(vm_id))
     }
 
+    /// Returns mutable access to the VM associated with `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::NotFound`] if the VM is not registered.
     pub fn vm_mut(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
         self.vms
             .get_mut(&vm_id)
@@ -110,11 +126,17 @@ impl Barbirolli {
             interval.tick().await;
             for mut vm in self.vms.iter_mut() {
                 let vm = vm.value_mut();
-                vm.check_idle(self).await;
+                vm.heartbeat(self).await;
             }
         }
     }
 
+    /// Persists a new discovered VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is draining, capacity is exhausted, or
+    /// the VM artifacts cannot be created.
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.is_app_alive()?;
@@ -160,6 +182,12 @@ impl Barbirolli {
         .boxed()
     }
 
+    /// Shuts down and soft-deletes a VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is draining, the VM is not registered,
+    /// shutdown fails, or the deleted state cannot be persisted.
     #[tracing::instrument(skip(self), fields(%vm_id, operation = "delete"), err)]
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.is_app_alive()?;
@@ -177,6 +205,11 @@ impl Barbirolli {
         Ok(())
     }
 
+    /// Drains the manager and shuts down every registered VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an aggregate error when one or more VMs fail to shut down.
     #[tracing::instrument(skip(self), fields(vm_count = self.vms.len()), err)]
     pub async fn shutdown(&self) -> Result<(), LifecycleError> {
         tracing::info!("draining barbirolli");
@@ -185,16 +218,14 @@ impl Barbirolli {
         for mut vm in self.vms.iter_mut() {
             tracing::info!(id = ?vm.key(), "shutting down");
             if let Err(err) = vm.value_mut().shutdown(self).await {
-                errors.push(Box::new(err))
+                errors.push(Box::new(err));
             }
         }
-        match NEVec::try_from_vec(errors) {
-            Some(errors) => Err(LifecycleError::Shutdown(Validated::Fail(errors))),
-            None => {
-                tracing::info!("barbirolli shutdown complete");
-                Ok(())
-            }
+        if let Some(errors) = NEVec::try_from_vec(errors) {
+            return Err(LifecycleError::Shutdown(Validated::Fail(errors)));
         }
+        tracing::info!("barbirolli shutdown complete");
+        Ok(())
     }
 
     fn is_app_alive(&self) -> Result<()> {
@@ -223,12 +254,11 @@ async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(),
             }
         }
     }
-    match NEVec::try_from_vec(errors) {
-        Some(errors) => Validated::Fail(errors),
-        None => {
-            tracing::info!(vm_count = barbirolli.vms.len(), "reconciliation done");
-            Validated::Good(())
-        }
+    if let Some(errors) = NEVec::try_from_vec(errors) {
+        Validated::Fail(errors)
+    } else {
+        tracing::info!(vm_count = barbirolli.vms.len(), "reconciliation done");
+        Validated::Good(())
     }
 }
 
@@ -363,7 +393,7 @@ impl BarbirolliVm {
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
-    fn check_idle<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, ()> {
+    fn heartbeat<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, ()> {
         let vm_id = self.id();
         async move {
             let Some(Observation {
@@ -395,17 +425,17 @@ impl BarbirolliVm {
                     "VM idle strike"
                 ),
                 IdleDecision::Shutdown => {
-                    self.final_idle_check_and_shutdown(sample.instance_pid, barbirolli)
+                    self.final_heartbeat_and_shutdown(sample.instance_pid, barbirolli)
                         .await;
                 }
             }
         }
-        .instrument(info_span!("check_idle", %vm_id, operation = "idle_check"))
+        .instrument(info_span!("heartbeat", %vm_id, operation = "heartbeat"))
         .boxed()
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
-    fn final_idle_check_and_shutdown<'a>(
+    fn final_heartbeat_and_shutdown<'a>(
         &'a mut self,
         expected_pid: i32,
         barbirolli: &'a Barbirolli,
@@ -430,7 +460,7 @@ impl BarbirolliVm {
             }
         }
         .instrument(info_span!(
-            "final_idle_check_and_shutdown",
+            "final_heartbeat_and_shutdown",
             %vm_id,
             operation = "idle_shutdown"
         ))
@@ -592,9 +622,8 @@ impl Firecracker {
             else {
                 continue;
             };
-            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
-                Ok(command) => command,
-                Err(_) => continue,
+            let Ok(command) = tokio::fs::read(entry.path().join("cmdline")).await else {
+                continue;
             };
             let arguments = command
                 .split(|byte| *byte == 0)

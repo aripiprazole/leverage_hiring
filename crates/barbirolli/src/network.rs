@@ -76,11 +76,15 @@ pub struct NetworkSpec {
 }
 
 impl NetworkSpec {
+    /// Builds the deterministic network allocation for `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the derived TAP interface name is invalid.
     pub fn new(vm_id: VmId) -> std::result::Result<Self, ParseValueError> {
         let id = u16::from(vm_id);
         let offset = id * 4;
-        let third = (offset / 256) as u8;
-        let fourth = (offset % 256) as u8;
+        let [third, fourth] = offset.to_be_bytes();
         let guest = fourth + 2;
 
         Ok(Self {
@@ -93,10 +97,12 @@ impl NetworkSpec {
         })
     }
 
+    #[must_use]
     pub fn subnet_cidr(&self) -> String {
         format!("{}/30", self.subnet)
     }
 
+    #[must_use]
     pub fn kernel_boot_args(&self) -> String {
         format!(
             "keep_bootcon console=ttyS0 reboot=k panic=1 ip={}::{}:255.255.255.252::eth0:off nameserver=1.1.1.1",

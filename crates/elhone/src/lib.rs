@@ -50,7 +50,7 @@ async fn vm(
     Path(id): Path<String>,
 ) -> Result<Json<barbirolli::VmSummary>, ApiError> {
     tracing::info!("get vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     Ok(Json(
         state.manager.vm_mut(id).map_err(ApiError::from)?.summary(),
     ))
@@ -79,7 +79,7 @@ async fn vm_status(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("vm status");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
     Ok(Json(StatusResponse {
         id,
@@ -93,7 +93,7 @@ async fn start_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("start vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
@@ -109,7 +109,7 @@ async fn shutdown_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("shutdown vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
@@ -125,7 +125,7 @@ async fn delete_vm(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     tracing::info!("delete vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     state.manager.delete(id).await.map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -219,7 +219,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn parse_vm_id(value: String) -> Result<VmId, ApiError> {
+fn parse_vm_id(value: &str) -> Result<VmId, ApiError> {
     let raw = value
         .parse::<u16>()
         .map_err(|_| ApiError::UnprocessableEntity(format!("invalid VM ID {value:?}")))?;

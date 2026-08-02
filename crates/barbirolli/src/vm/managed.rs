@@ -45,7 +45,7 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    Barbirolli, VmSpec,
+    Barbirolli, VmId, VmSpec,
     idle::{Monitor, Sample},
     io_error,
     lifecycle::PidError,
@@ -204,7 +204,7 @@ fn vm_config(
             network_interfaces: vec![NetworkInterface {
                 iface_id: "eth0".into(),
                 host_dev_name: spec.network.tap.as_ref().to_owned(),
-                guest_mac: Some(spec.network.guest_mac.to_owned()),
+                guest_mac: Some(spec.network.guest_mac.clone()),
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             }],
@@ -284,7 +284,7 @@ impl ManagedVm {
                 });
             }
         };
-        let cgroup = match VmCgroup::new(spec.id.to_string(), pid) {
+        let cgroup = match VmCgroup::new(spec.id, pid) {
             Ok(cgroup) => cgroup,
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
@@ -373,14 +373,13 @@ impl ManagedVm {
         let cgroup = self
             .cgroup
             .take()
-            .map_or(Ok(()), |cgroup| cgroup.cleanup())
+            .map_or(Ok(()), VmCgroup::cleanup)
             .map_err(LifecycleError::Health);
 
         match (vm, network, cgroup) {
             (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(()), Ok(())) => Err(error),
+            (Err(error), Ok(()), Ok(())) | (Ok(()), Ok(()), Err(error)) => Err(error),
             (Ok(()), Err(error), Ok(())) => Err(error.into()),
-            (Ok(()), Ok(()), Err(error)) => Err(error),
             (vm, network, cgroup) => Err(LifecycleError::Cleanup {
                 vm: vm.err().map(Box::new),
                 network: network.err().map(Box::new),
@@ -451,7 +450,7 @@ struct VmCgroup {
 }
 
 impl VmCgroup {
-    fn new(id: String, pid: Pid) -> Result<Self, HealthError> {
+    fn new(id: VmId, pid: Pid) -> Result<Self, HealthError> {
         let root = PathBuf::from(CGROUP_ROOT);
         io_error!(HealthError, fs::create_dir_all(&root), root.clone())?;
         let controllers = root.join("cgroup.subtree_control");

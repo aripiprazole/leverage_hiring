@@ -24,10 +24,12 @@ pub struct SshOutput {
 }
 
 impl SshFixture {
+    #[must_use]
     pub fn new(guest: std::net::Ipv4Addr, private_key: PathBuf) -> Self {
         Self { guest, private_key }
     }
 
+    #[must_use]
     pub fn with_private_key(&self, private_key: PathBuf) -> Self {
         Self::new(self.guest, private_key)
     }

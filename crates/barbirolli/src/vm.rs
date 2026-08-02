@@ -53,9 +53,9 @@ pub struct PortBinding {
 pub struct ApiSocket(PathBuf);
 
 impl ApiSocket {
+    #[cfg(target_os = "linux")]
     fn remove(&self) -> Result<(), std::io::Error> {
-        let api_socket: PathBuf = self.0.clone().into();
-        match std::fs::remove_file(api_socket) {
+        match std::fs::remove_file(&self.0) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),

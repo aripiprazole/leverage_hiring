@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ForwardRule, InterfaceName, Ipv4Addr, NetworkSpec, ParseValueError, PortBinding,
+    VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX,
+};
 
 use nlink::{
     netlink::{
@@ -73,6 +76,12 @@ impl NetworkSpec {
             guest_ip = %self.guest_ip
         )
     )]
+    /// Prepares the TAP device, routes, and firewall rules for this VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host network cannot be inspected or configured.
+    /// If setup and rollback both fail, both errors are retained.
     pub async fn prepare(&self, bindings: &[PortBinding]) -> Result<ManagedNetwork> {
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
@@ -193,6 +202,11 @@ impl NetworkSpec {
         }
     }
 
+    /// Removes networking left behind by a previously running VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nftables table or TAP device cannot be removed.
     #[tracing::instrument(err)]
     pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
         tracing::info!(
@@ -203,6 +217,8 @@ impl NetworkSpec {
         self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(err, skip(conn))]
     async fn install_rules(
         &self,
         conn: &Connection<Nftables>,
@@ -210,6 +226,7 @@ impl NetworkSpec {
         table: &str,
         bindings: &[PortBinding],
     ) -> Result<(), NetworkError> {
+        tracing::info!("installing rules");
         let prerouting_chain = Chain::new(table, "prerouting")?
             .family(Family::Ip)
             .hook(Hook::Prerouting)
