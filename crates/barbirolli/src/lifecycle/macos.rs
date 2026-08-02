@@ -1,7 +1,7 @@
 use futures::{FutureExt, future::BoxFuture};
 
-use super::{DaemonConfig, LifecycleError, Result, VmSummary};
-use crate::{VmId, VmInput, VmSpec, VmStore};
+use super::{BalloonConfig, BalloonStatistics, DaemonConfig, LifecycleError, Result, VmSummary};
+use crate::{MemoryMib, VmId, VmInput, VmSpec, VmStore};
 
 pub struct BarbirolliVm;
 
@@ -23,6 +23,18 @@ impl BarbirolliVm {
     }
 
     pub fn shutdown(&mut self, _barbirolli: &Barbirolli) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
+
+    pub fn balloon_config(&mut self) -> BoxFuture<'_, Result<BalloonConfig>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
+
+    pub fn update_balloon(&mut self, _amount_mib: MemoryMib) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
+
+    pub fn balloon_statistics(&mut self) -> BoxFuture<'_, Result<BalloonStatistics>> {
         async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
     }
 }

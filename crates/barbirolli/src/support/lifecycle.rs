@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use barbirolli::{Barbirolli, VmId, VmStatus};
+use barbirolli::{BalloonConfig, BalloonStatistics, Barbirolli, MemoryMib, VmId, VmStatus};
 use tokio::sync::Barrier;
 
 #[derive(Clone)]
@@ -24,6 +24,43 @@ impl VmLifecycleFixture {
             .expect("missing fixture VM")
             .summary()
             .status
+    }
+
+    pub async fn balloon_config(&self, inspect: impl FnOnce(&BalloonConfig)) -> BalloonConfig {
+        let config = {
+            let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
+            vm.balloon_config()
+                .await
+                .expect("failed to read balloon config through fctools")
+        };
+        inspect(&config);
+        config
+    }
+
+    pub async fn update_balloon(&self, amount_mib: u16) {
+        let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
+        vm.update_balloon(MemoryMib::from(amount_mib))
+            .await
+            .expect("failed to update balloon through fctools");
+    }
+
+    pub async fn wait_for_balloon(&self, amount_mib: u32) -> BalloonStatistics {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let statistics = {
+                    let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
+                    vm.balloon_statistics()
+                        .await
+                        .expect("failed to read balloon statistics through fctools")
+                };
+                if statistics.target_mib == amount_mib && statistics.actual_mib == amount_mib {
+                    return statistics;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("balloon did not reach {amount_mib} MiB"))
     }
 
     pub async fn start(&self, inspect: impl FnOnce(&Self)) {

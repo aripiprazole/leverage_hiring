@@ -1,4 +1,6 @@
-use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
+use super::{
+    BalloonConfig, BalloonStatistics, LifecycleError, Result, VmStatus, VmSummary, WarmupFailure,
+};
 
 use std::{
     fmt::Debug,
@@ -44,7 +46,7 @@ pub enum BarbirolliVm {
 
 #[derive(Debug, Clone)]
 pub struct Balloon {
-    pub ballon_mem: MemoryMib,
+    pub mem: MemoryMib,
 }
 
 pub struct BarbirolliInner {
@@ -72,7 +74,7 @@ impl Barbirolli {
             firecracker,
             vms: DashMap::default(),
             balloon: Balloon {
-                ballon_mem: config.provisioning.initial_ballon_mem,
+                mem: config.provisioning.initial_balloon_mem,
             },
             provisioning: config.provisioning,
             store,
@@ -252,6 +254,58 @@ impl BarbirolliVm {
                 port_bindings: vm.spec.port_bindings.clone(),
                 network: vm.spec.network.clone(),
             },
+        }
+    }
+
+    pub fn balloon_config(&mut self) -> BoxFuture<'_, Result<BalloonConfig>> {
+        async move {
+            let config = self
+                .managed_for("read balloon config")?
+                .balloon_config()
+                .await?;
+            Ok(BalloonConfig {
+                amount_mib: config.amount_mib,
+                deflate_on_oom: config.deflate_on_oom,
+                stats_polling_interval_s: config.stats_polling_interval_s,
+            })
+        }
+        .boxed()
+    }
+
+    pub fn update_balloon(&mut self, amount_mib: MemoryMib) -> BoxFuture<'_, Result<()>> {
+        async move {
+            self.managed_for("update balloon")?
+                .update_balloon(amount_mib.into())
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    pub fn balloon_statistics(&mut self) -> BoxFuture<'_, Result<BalloonStatistics>> {
+        async move {
+            let statistics = self
+                .managed_for("read balloon statistics")?
+                .balloon_statistics()
+                .await?;
+            Ok(BalloonStatistics {
+                target_mib: statistics.target_mib,
+                actual_mib: statistics.actual_mib,
+            })
+        }
+        .boxed()
+    }
+
+    fn managed_for(&mut self, operation: &'static str) -> Result<&mut ManagedVm> {
+        let vm_id = self.id();
+        let status = self.summary().status;
+        match self {
+            Self::Managed(managed) if !managed.failed => Ok(managed),
+            _ => Err(LifecycleError::InvalidTransition {
+                vm_id,
+                operation,
+                status,
+            }),
         }
     }
 

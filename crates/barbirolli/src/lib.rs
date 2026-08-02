@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 pub use idle::IdlePolicy;
 pub use lifecycle::{
-    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmStatus, VmSummary,
+    BalloonConfig, BalloonStatistics, Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig,
+    VmStatus, VmSummary,
 };
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};

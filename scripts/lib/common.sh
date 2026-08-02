@@ -23,7 +23,6 @@ FIRECRACKER="$BARBIROLLI_RUNTIME_DIR/bin/firecracker"
 DEFAULT_AUTHORIZED_KEYS="$SSH_DIR/id_ed25519.pub"
 SSH_PRIVATE_KEY="$SSH_DIR/id_ed25519"
 KERNEL_IMAGE="$IMAGE_ROOT/vmlinux"
-KERNEL_CONFIG="$IMAGE_ROOT/vmlinux.config"
 ROOTFS_IMAGE="$IMAGE_ROOT/alpine.ext4"
 ROOTFS_SQUASHFS="$DOWNLOAD_DIR/ubuntu-$ROOTFS_VERSION.squashfs"
 ROOTFS_KEY_MARKER="$ROOTFS_IMAGE.authorized_key"
@@ -106,7 +105,6 @@ rootfs_resolver_matches() {
 runtime_is_prepared() {
     firecracker_is_compatible &&
         [[ -s "$KERNEL_IMAGE" ]] &&
-        [[ -s "$KERNEL_CONFIG" ]] &&
         [[ -s "$ROOTFS_IMAGE" ]] &&
         [[ -s "$SSH_PRIVATE_KEY" ]] &&
         [[ -s "$DEFAULT_AUTHORIZED_KEYS" ]] &&

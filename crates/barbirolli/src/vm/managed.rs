@@ -14,9 +14,11 @@ use fctools::{
     runtime::tokio::TokioRuntime,
     vm::{
         Vm, VmError as FctoolsVmError, VmState,
+        api::{VmApi, VmApiError},
         configuration::{InitMethod, VmConfiguration, VmConfigurationData},
         models::{
-            BalloonDevice, BootSource, Drive, MachineConfiguration, MetricsSystem, NetworkInterface,
+            BalloonDevice, BalloonStatistics, BootSource, Drive, MachineConfiguration,
+            MetricsSystem, NetworkInterface, UpdateBalloonDevice,
         },
         shutdown::{VmShutdownAction, VmShutdownError, VmShutdownMethod},
     },
@@ -207,7 +209,7 @@ fn vm_config(
                 tx_rate_limiter: None,
             }],
             balloon_device: Some(BalloonDevice {
-                amount_mib: daemon.balloon.ballon_mem.0 as i32,
+                amount_mib: i32::from(u16::from(daemon.balloon.mem)),
                 deflate_on_oom: true,
                 stats_polling_interval_s: Some(10),
             }),
@@ -308,6 +310,21 @@ impl ManagedVm {
             metrics,
             spec,
         })
+    }
+
+    pub async fn balloon_config(&mut self) -> Result<BalloonDevice> {
+        Ok(self.vm.get_balloon_device().await?)
+    }
+
+    pub async fn update_balloon(&mut self, amount_mib: u16) -> Result<()> {
+        Ok(self
+            .vm
+            .update_balloon_device(UpdateBalloonDevice { amount_mib })
+            .await?)
+    }
+
+    pub async fn balloon_statistics(&mut self) -> Result<BalloonStatistics> {
+        Ok(self.vm.get_balloon_statistics().await?)
     }
 
     pub async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
@@ -528,6 +545,8 @@ pub enum LifecycleError {
     VmmId(#[from] VmmIdError),
     #[error(transparent)]
     Vm(#[from] FctoolsVmError),
+    #[error(transparent)]
+    VmApi(#[from] VmApiError),
     #[error(transparent)]
     Shutdown(#[from] VmShutdownError),
     #[error(

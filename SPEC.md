@@ -138,7 +138,7 @@ struct DaemonConfig {
 struct ProvisioningConfig {
     default_vm_mem: MemoryMib,
     max_daemon_mem: MemoryMib,
-    initial_ballon_mem: MemoryMib,
+    initial_balloon_mem: MemoryMib,
     count: u32,
     extra_percentage: u8,
 }
@@ -222,7 +222,6 @@ enum LifecycleError {
 Each `$VM_ROOT/<vm_id>` contains:
 
 - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
-- `vmlinux.config`: the pinned kernel config fragment installed by `scripts/setup_daemon`.
 - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
 - `config.json`: versioned `VmSpec`.
 

@@ -105,16 +105,6 @@ prepare_kernel() {
             "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$FIRECRACKER_CI_VERSION/$ARCH/vmlinux-$KERNEL_VERSION" \
             "$KERNEL_IMAGE"
     fi
-
-    if [[ ! -s "$KERNEL_CONFIG" ]]; then
-        info "installing the guest kernel config fragment"
-        install -m 0644 "$SCRIPT_DIR/kernel.config" "$KERNEL_CONFIG"
-    fi
-
-    grep -qx 'CONFIG_MEMORY_BALLOON=y' "$KERNEL_CONFIG"
-    grep -qx 'CONFIG_VIRTIO=y' "$KERNEL_CONFIG"
-    grep -qx 'CONFIG_VIRTIO_BALLOON=y' "$KERNEL_CONFIG"
-    grep -qx 'CONFIG_VIRTIO_MMIO=y' "$KERNEL_CONFIG"
 }
 
 ROOTFS_WORK=""

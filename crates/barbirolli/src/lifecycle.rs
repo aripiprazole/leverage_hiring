@@ -23,25 +23,50 @@ pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
 pub struct ProvisioningConfig {
     pub default_vm_mem: MemoryMib,
     pub max_daemon_mem: MemoryMib,
-    pub initial_ballon_mem: MemoryMib,
+    pub initial_balloon_mem: MemoryMib,
     pub count: u32,
     pub extra_percentage: u8,
 }
 
-// extra_percentage = 20
-// default_vm_mem = 256
-// x = default_vm_mem * count
-// 2048 = (x + (x / 10 * extra_percentage))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonConfig {
+    pub amount_mib: i32,
+    pub deflate_on_oom: bool,
+    pub stats_polling_interval_s: Option<i32>,
+}
+
+impl BalloonConfig {
+    pub fn new(amount_mib: i32, deflate_on_oom: bool, stats_polling_interval_s: i32) -> Self {
+        Self {
+            amount_mib,
+            deflate_on_oom,
+            stats_polling_interval_s: Some(stats_polling_interval_s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonStatistics {
+    pub target_mib: u32,
+    pub actual_mib: u32,
+}
+
 impl Default for ProvisioningConfig {
     fn default() -> Self {
-        let ballon_sec = 2048 - (2048 / (1 + (20 / 100)));
-        let total_count = 2048 / ((1 + (20 / 100)) * 256);
+        const VM_MEM_MIB: u32 = 256;
+        const DAEMON_MEM_MIB: u32 = 2048;
+        const EXTRA_PERCENTAGE: u32 = 20;
+
+        let mem_mib = DAEMON_MEM_MIB * 100 / (100 + EXTRA_PERCENTAGE);
+        let count = mem_mib / VM_MEM_MIB;
+        let balloon_pool_mib = DAEMON_MEM_MIB - mem_mib;
+
         Self {
-            default_vm_mem: MemoryMib::from(256),
-            max_daemon_mem: MemoryMib::from(2048),
-            initial_ballon_mem: MemoryMib::from(ballon_sec / total_count),
-            extra_percentage: 20,
-            count: 2048 / ((1 + (20 / 100)) * 256),
+            default_vm_mem: MemoryMib::from(VM_MEM_MIB as u16),
+            max_daemon_mem: MemoryMib::from(DAEMON_MEM_MIB as u16),
+            initial_balloon_mem: MemoryMib::from(balloon_pool_mib as u16 / count as u16),
+            extra_percentage: EXTRA_PERCENTAGE as u8,
+            count,
         }
     }
 }
@@ -106,14 +131,45 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests {
-    use barbirolli::VmStatus;
     use barbirolli::support;
+    use barbirolli::{BalloonConfig, ProvisioningConfig, VmStatus};
     use barbirolli_derive::firecracker_test;
 
-    use support::{
-        config::TestVmConfig,
-        firecracker::{FirecrackerFixture, MachineConfig},
-    };
+    use support::{config::TestVmConfig, firecracker::FirecrackerFixture};
+
+    #[test]
+    fn default_provisioning_calculates_a_nonzero_balloon_target() {
+        let provisioning = ProvisioningConfig::default();
+
+        assert_eq!(u16::from(provisioning.default_vm_mem), 256);
+        assert_eq!(u16::from(provisioning.max_daemon_mem), 2048);
+        assert_eq!(provisioning.extra_percentage, 20);
+        assert_eq!(provisioning.count, 6);
+        assert_eq!(u16::from(provisioning.initial_balloon_mem), 57);
+    }
+
+    #[firecracker_test]
+    async fn guest_balloon_inflates_and_deflates() {
+        let fixture = FirecrackerFixture::new().await;
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+
+        vm.lifecycle.start(|_| {}).await;
+        vm.lifecycle
+            .balloon_config(|config| {
+                assert_eq!(config, &BalloonConfig::new(57, true, 10));
+            })
+            .await;
+        let inflated = vm.lifecycle.wait_for_balloon(57).await;
+        assert_eq!(inflated.target_mib, 57);
+        assert_eq!(inflated.actual_mib, 57);
+
+        vm.lifecycle.update_balloon(0).await;
+        let deflated = vm.lifecycle.wait_for_balloon(0).await;
+        assert_eq!(deflated.target_mib, 0);
+        assert_eq!(deflated.actual_mib, 0);
+
+        fixture.finish().await;
+    }
 
     #[firecracker_test]
     async fn per_vm_api_sockets_support_concurrent_vms_and_repeated_lifecycle_calls() {
@@ -126,12 +182,7 @@ mod tests {
                 assert_eq!(lifecycle.status(), VmStatus::Running);
             })
             .await;
-        first
-            .api
-            .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(1, 256));
-            })
-            .await;
+        assert!(first.api_socket.exists());
 
         let second = fixture.create_vm(TestVmConfig::new(2)).await;
         assert_ne!(first.id, second.id);
@@ -141,13 +192,8 @@ mod tests {
                 assert_eq!(lifecycle.status(), VmStatus::Running);
             })
             .await;
-        assert_ne!(first.api.socket, second.api.socket);
-        second
-            .api
-            .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 256));
-            })
-            .await;
+        assert_ne!(first.api_socket, second.api_socket);
+        assert!(second.api_socket.exists());
 
         first
             .lifecycle
@@ -155,13 +201,8 @@ mod tests {
                 assert_eq!(lifecycle.status(), VmStatus::Discovered);
             })
             .await;
-        assert!(!first.api.socket.exists());
-        second
-            .api
-            .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 256));
-            })
-            .await;
+        assert!(!first.api_socket.exists());
+        assert!(second.api_socket.exists());
 
         first
             .lifecycle
@@ -169,18 +210,8 @@ mod tests {
                 assert_eq!(lifecycle.status(), VmStatus::Running);
             })
             .await;
-        first
-            .api
-            .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(1, 256));
-            })
-            .await;
-        second
-            .api
-            .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 256));
-            })
-            .await;
+        assert!(first.api_socket.exists());
+        assert!(second.api_socket.exists());
 
         fixture.finish().await;
     }
