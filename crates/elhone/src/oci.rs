@@ -555,6 +555,7 @@ pub async fn pull(
     State(state): State<AppState>,
     input: Result<Json<PullInput>, JsonRejection>,
 ) -> Result<Json<api_schema::Container>, ApiError> {
+    tracing::info!("elhone starts the OCI pull request");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -569,6 +570,7 @@ pub async fn run(
     State(state): State<AppState>,
     input: Result<Json<PullInput>, JsonRejection>,
 ) -> Result<Json<api_schema::Container>, ApiError> {
+    tracing::info!("elhone starts the OCI run request");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -583,6 +585,7 @@ pub async fn stop(
     State(state): State<AppState>,
     input: Result<Json<ReferenceInput>, JsonRejection>,
 ) -> Result<Json<api_schema::Container>, ApiError> {
+    tracing::info!("elhone starts the OCI stop request");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -597,6 +600,7 @@ pub async fn rm(
     State(state): State<AppState>,
     input: Result<Json<ReferenceInput>, JsonRejection>,
 ) -> Result<HttpStatusCode, ApiError> {
+    tracing::info!("elhone starts the OCI remove request");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store

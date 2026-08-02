@@ -109,6 +109,7 @@ impl CreateVmRequest {
 
 #[tracing::instrument(skip(state))]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
+    tracing::info!("elhone starts to list the VMs");
     let vms = state.manager.list().await;
     tracing::info!(vm_count = vms.len(), "elhone listed the VMs");
     Json(vms)
@@ -119,6 +120,7 @@ async fn vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<barbirolli::VmSummary>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts to get the VM");
     let id = parse_vm_id(&id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
     tracing::info!(%id, "elhone found the VM");
@@ -131,6 +133,7 @@ async fn vm_logs(
     Path(id): Path<String>,
     query: Result<Query<VmLogsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts to get the VM serial log");
     let id = parse_vm_id(&id)?;
     let Query(query) = query.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let path = {
@@ -140,7 +143,7 @@ async fn vm_logs(
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(|error| vm_log_io_error(id, "open", &path, error))?;
-    let length = file
+    let len = file
         .metadata()
         .await
         .map_err(|error| vm_log_io_error(id, "inspect", &path, error))?
@@ -149,10 +152,10 @@ async fn vm_logs(
         %id,
         path = %path.display(),
         follow = query.follow,
-        byte_count = length,
+        byte_count = len,
         "elhone opened the VM serial log"
     );
-    let stream = vm_log_stream(file, path, query.follow, length);
+    let stream = vm_log_stream(file, path, query.follow, len);
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -164,7 +167,7 @@ async fn vm_logs(
     if !query.follow {
         response.headers_mut().insert(
             header::CONTENT_LENGTH,
-            HeaderValue::from_str(&length.to_string())
+            HeaderValue::from_str(&len.to_string())
                 .expect("a decimal content length is always a valid header value"),
         );
     }
@@ -233,6 +236,7 @@ async fn create_vm(
     State(state): State<AppState>,
     input: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
+    tracing::info!("elhone starts to create the VM");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let input = input.into_vm_input(state.standard_rootfs);
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
@@ -251,6 +255,7 @@ async fn vm_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts to get the VM status");
     let id = parse_vm_id(&id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
     tracing::info!(%id, status = ?summary.status, "elhone read the VM status");
@@ -265,6 +270,7 @@ async fn start_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts VM startup");
     let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.start(&state.manager).await.map_err(ApiError::from)?;
@@ -281,6 +287,7 @@ async fn shutdown_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts VM shutdown");
     let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
@@ -297,6 +304,7 @@ async fn delete_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts to delete the VM");
     let id = parse_vm_id(&id)?;
     state.manager.delete(id).await.map_err(ApiError::from)?;
     tracing::info!(%id, "elhone deleted the VM");
@@ -305,11 +313,13 @@ async fn delete_vm(
 
 #[tracing::instrument]
 async fn not_found() -> ApiError {
+    tracing::info!("elhone starts to handle an unknown route");
     ApiError::NotFound("route not found".to_owned())
 }
 
 #[tracing::instrument]
 async fn method_not_allowed() -> ApiError {
+    tracing::info!("elhone starts method-not-allowed handling");
     ApiError::MethodNotAllowed
 }
 
