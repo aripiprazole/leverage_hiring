@@ -23,7 +23,8 @@ DELETE /vms/:id
 ```
 
 Shuts down the VM, cleans its runtime resources, persists the deletion marker, and returns
-`204 No Content`. If shutdown or cleanup fails, deletion stops and the VM remains registered.
+`204 No Content`. The deletion marker and deregistration occur after successful shutdown and
+cleanup.
 
 ## GET `/vms`
 
@@ -52,7 +53,7 @@ GET /vms
 Returns the state, port bindings, and allocated network of every registered VM. Status and list
 responses expose these stable states:
 
-- `discovered`: the VM is persisted but not running.
+- `discovered`: the VM is persisted and stopped.
 - `running`: the VM is actively managed by Firecracker.
 - `failed`: VM startup, shutdown, or runtime cleanup failed.
 
@@ -83,7 +84,7 @@ GET /vms/:id/status
 POST /vms/:id/start
 ```
 
-Starts a discovered VM. Starting an already running VM succeeds without changing it.
+Starts a discovered VM. The operation is idempotent for a running VM.
 
 ## POST `/vms/:id/shutdown`
 
@@ -91,8 +92,8 @@ Starts a discovered VM. Starting an already running VM succeeds without changing
 POST /vms/:id/shutdown
 ```
 
-Gracefully shuts down a managed VM and cleans its runtime resources. Shutting down a discovered
-VM succeeds without changing it.
+Gracefully shuts down a managed VM and cleans its runtime resources. The operation is idempotent
+for a discovered VM.
 
 ## POST `/vms`
 
@@ -106,10 +107,10 @@ POST /vms
 }
 ```
 
-Creates a stopped VM and returns `201 Created` with its ID. Kernel and rootfs paths are not part
-of the request; the service copies both artifacts from `IMAGE_ROOT`. Memory is selected by the
-daemon's provisioning configuration (256 MiB by default) and persisted in `VmSpec`; it is not a
-per-request input. Ports are nonzero `u16` values. A binding
+Creates a stopped VM and returns `201 Created` with its ID. The request contains `vcpu_count`,
+`authorized_keys`, and `port_bindings`; the service copies the kernel and rootfs artifacts from
+`IMAGE_ROOT`. The daemon's provisioning configuration selects memory (256 MiB by default), which
+is persisted in `VmSpec`. Ports are `u16` values in the range `1..=65535`. A binding
 `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
 
 Every new VM is assigned the daemon's `default_vm_mem` (256 MiB), and that value is persisted in
@@ -123,8 +124,8 @@ the VM specification. Provisioning uses integer division for these calculations:
 Firecracker deflates the balloon on guest out-of-memory conditions and collects balloon
 statistics every 10 seconds.
 
-Before creating a VM, Barbirolli counts the currently running VMs and rejects creation when that
-count reaches the configured `count`. It does not perform a memory/count check.
+Before creating a VM, Barbirolli counts the currently running VMs. It admits creation while that
+total is below the configured `count`.
 
 # Barbirolli: VM and host-resource boundary
 
@@ -137,7 +138,7 @@ conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The_Hall%C3
 - Barbirolli owns persistence, the Firecracker lifecycle, and VM networking.
 - Barbirolli supports Firecracker 1.13 on x86_64 and aarch64 Linux; `FIRECRACKER` names its
   executable.
-- Firecracker runs through `UnrestrictedVmmExecutor`; jailer support is out of scope.
+- Firecracker runs through `UnrestrictedVmmExecutor`.
 - Each running VM has one cgroup v2 directory for health and idle sampling.
 
 ```rust
@@ -174,7 +175,7 @@ struct ProvisioningConfig {
 enum BarbirolliVm {
     /// Persisted and stopped. Owns no runtime resources.
     Discovered(VmSpec),
-    /// The last lifecycle operation failed. Owns no runtime resources.
+    /// Persisted after the last lifecycle operation failed.
     Failed(VmSpec),
     /// Running, or retaining resources after a failed cleanup.
     Managed(ManagedVm),
@@ -204,7 +205,7 @@ struct VmId(u16);
 
 struct VmSpec {
     id: VmId,
-    /// Defaults to false when absent from a config.
+    /// The persisted default is false.
     deleted: bool,
     artifact_dir: PathBuf,
     kernel: PathBuf,
@@ -257,13 +258,14 @@ Each `$VM_ROOT/<vm_id>` contains:
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
 - Every persisted `VmSpec` owns its unique Firecracker API socket path under
-  `$VM_ROOT/.sockets`; runtime cleanup removes the socket file without discarding that path.
+  `$VM_ROOT/.sockets`; runtime cleanup removes the socket file and retains that path in `VmSpec`.
 - A VM gets the `VmId` equal to the number of persisted VM directories, starting at `0`. Deleted
-  VM directories remain in that count, so IDs increase monotonically and are never reused.
-- A nonempty `authorized_keys` request is written directly to
+  VM directories remain in that count, so IDs increase monotonically and stay assigned to their
+  directories.
+- Supplied `authorized_keys` are written directly to
   `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
-  file. No key sidecar is written beside the VM artifacts.
-- With no supplied keys, the rootfs keeps the default key embedded in the source image.
+  file.
+- An empty `authorized_keys` request preserves the default key embedded in the source image.
 - `scripts/setup_daemon` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
 
 ## Host and guest networking
@@ -331,19 +333,18 @@ impl TryFrom<&str> for InterfaceName {
 
 - The `172.16.0.0/16` pool provides 2^14 `/30` networks. Each contains a network address, host
   address, guest address, and broadcast address.
-- Startup fails if the pool overlaps an existing host route.
+- The address pool must be disjoint from existing host routes.
 - The lowest-metric IPv4 default route in the main routing table supplies the external interface.
 - Every binding publishes TCP from the selected external interface to the VM guest address and
   permits peer VMs to reach the same internal TCP port directly.
-- Established replies and published ports can enter a VM from the host or a peer VM. All other
-  forwarded traffic to its TAP is denied.
-- Each base-chain policy remains `accept` because every VM owns an independent table. The final
-  output-TAP-specific drop supplies default deny without one VM's base chain dropping another VM's
-  packets.
-- DNAT excludes `172.16.0.0/16`. Once a table translates a packet into the VM pool, another VM's
-  table cannot translate it again because its internal port matches another external port.
-- VM to VM communication is dropped, while internet egress packets are allowed
-- IPv6, guest-to-host isolation, and egress filtering are out of scope.
+- Inbound forwarding to a VM's TAP is limited to established replies and published ports from the
+  host or a peer VM.
+- Each VM owns an independent table whose base-chain policy is `accept`. A final
+  output-TAP-specific rule enforces that VM's inbound allowlist while preserving evaluation of the
+  other VM tables.
+- DNAT applies to packets sourced outside `172.16.0.0/16`. The source-pool condition ensures each
+  packet is translated by at most one VM table.
+- Peer VMs reach published ports, and internet egress packets are allowed.
 - IPv4 forwarding is shared host state and remains enabled after per-VM cleanup.
 - Guest static IP, gateway, and DNS configuration are present before boot.
 
@@ -512,13 +513,13 @@ async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 
 `ManagedVm::shutdown` sends Ctrl-Alt-Del on x86_64 or writes `reboot\n` to the serial console on
 aarch64. On timeout it falls back to pause-and-kill, then kill. Cleanup separately stops the
-metrics reader and removes the Firecracker resources, network, and cgroup. All cleanup branches
-run even when one fails.
+metrics reader and removes the Firecracker resources, network, and cgroup. Cleanup attempts every
+resource and aggregates errors.
 
 ### Deletion
 
 Deletion runs the normal shutdown path, writes `deleted: true` to `config.json`, and removes the VM
-from the in-memory map. The VM directory remains on disk and its ID is never reused.
+from the in-memory map. The VM directory remains on disk and retains its ID.
 
 ```rust
 async fn delete(&self, vm_id: VmId) -> Result<()> {
@@ -535,9 +536,9 @@ async fn delete(&self, vm_id: VmId) -> Result<()> {
 
 ### Warmup and recovery
 
-At startup Barbirolli reads every versioned config. Every non-deleted VM is reconciled before it is
-registered as `Discovered`; any reconciliation failure prevents startup. Deleted VMs only count
-toward ID allocation. No VM starts automatically.
+At startup Barbirolli reads every versioned config. Each active VM is registered as `Discovered`
+after successful reconciliation; reconciliation is a startup requirement. Deleted VMs contribute
+to ID allocation. Warmup leaves every registered VM in `Discovered`.
 
 ```rust
 /// kills all processe stale processes on the application startup, stale
@@ -556,16 +557,24 @@ async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<()> {
 
 ### Application shutdown
 
-Application shutdown sets `draining`, rejects new operations, and shuts down every registered VM.
-One failure does not stop the remaining shutdowns; Barbirolli returns all failures at the end.
+Application shutdown sets `draining`, shuts down every registered VM, and returns aggregated
+failures after all shutdown attempts complete.
 
 ## Idle detection and automatic shutdown
 
-Each running VM is sampled at the Firecracker boundary. CPU, memory, and process usage come from
-the VM's cgroup; network and disk byte counters come from Firecracker's metrics FIFO; connection
-state comes from conntrack entries involving the guest IP. Memory is reported but does not count
-as activity. CPU above its configured threshold, network or disk traffic, a process-count change,
-or any established TCP connection resets the idle timer.
+Each running VM is sampled at the Firecracker boundary.
+
+- CPU, memory, and process usage come from the VM's cgroup; network and disk byte counters come from Firecracker's metrics FIFO.
+- Connection state comes from conntrack entries involving the guest IP.
+- Memory remains a reported health metric.
+
+Activity consists of:
+
+- CPU above its configured threshold
+- network or disk traffic, a process-count change
+- any established TCP connection
+
+Each resets the idle timer.
 
 ```text
 cpu_percent =
