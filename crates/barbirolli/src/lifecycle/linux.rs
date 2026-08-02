@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     path::PathBuf,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -19,7 +19,11 @@ use dashmap::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use nonempty_collections::NEVec;
-use tokio::time::{MissedTickBehavior, interval};
+use rustix::process::Pid;
+use tokio::{
+    process::Command,
+    time::{MissedTickBehavior, interval},
+};
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
@@ -44,7 +48,7 @@ pub struct Balloon {
 
 pub struct BarbirolliInner {
     pub(crate) vms: DashMap<VmId, BarbirolliVm>,
-    pub balloon: RwLock<Balloon>,
+    pub balloon: Balloon,
     pub provisioning: ProvisioningConfig,
     pub store: VmStore,
     pub firecracker: Firecracker,
@@ -66,9 +70,9 @@ impl Barbirolli {
         let barbirolli = Self(Arc::new(BarbirolliInner {
             firecracker,
             vms: DashMap::default(),
-            balloon: RwLock::new(Balloon {
+            balloon: Balloon {
                 ballon_mem: config.provisioning.initial_ballon_mem,
-            }),
+            },
             provisioning: config.provisioning,
             store,
             shutdown_timeout: Duration::from_secs(10),
@@ -324,7 +328,7 @@ impl BarbirolliVm {
     ) -> BoxFuture<'a, ()> {
         let vm_id = self.id();
         async move {
-            if !matches!(self, Self::Managed(managed) if managed.pid == expected_pid) {
+            if !matches!(self, Self::Managed(managed) if managed.pid.as_raw_pid() == expected_pid) {
                 tracing::debug!("VM instance changed before final idle check");
                 return;
             }
@@ -436,10 +440,22 @@ pub struct Firecracker {
     pub api_socket_timeout: Duration,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PidError {
+    #[error("failed to access pid resource {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the Firecracker process could not be identified")]
+    ProcessNotFound,
+}
+
 impl Firecracker {
     pub async fn new(firecracker: impl Into<PathBuf>) -> Result<Firecracker> {
         let firecracker = firecracker.into();
-        let output = tokio::process::Command::new(&firecracker)
+        let output = Command::new(&firecracker)
             .arg("--version")
             .output()
             .await
@@ -462,5 +478,52 @@ impl Firecracker {
         } else {
             Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
         }
+    }
+
+    #[tracing::instrument(err)]
+    pub(crate) async fn pid(&self, spec: &VmSpec) -> Result<Pid, PidError> {
+        let api_socket: PathBuf = spec.api_socket.clone().into();
+        let expected_socket = api_socket.as_os_str().as_encoded_bytes();
+        let expected_firecracker = self.bin.as_os_str().as_encoded_bytes();
+        let expected_id = format!("barbirolli-{}", spec.id);
+        let mut proc = tokio::fs::read_dir("/proc")
+            .await
+            .map_err(|source| PidError::Io {
+                path: PathBuf::from("/proc"),
+                source,
+            })?;
+        while let Some(entry) = proc.next_entry().await.map_err(|source| PidError::Io {
+            path: PathBuf::from("/proc"),
+            source,
+        })? {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
+                Ok(command) => command,
+                Err(_) => continue,
+            };
+            let arguments = command
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .collect::<Vec<_>>();
+            if arguments
+                .first()
+                .is_some_and(|arg| *arg == expected_firecracker)
+                && arguments
+                    .windows(2)
+                    .any(|args| args[0] == b"--api-sock" && args[1] == expected_socket)
+                && arguments
+                    .windows(2)
+                    .any(|args| args[0] == b"--id" && args[1] == expected_id.as_bytes())
+            {
+                return Pid::from_raw(pid).ok_or(PidError::ProcessNotFound);
+            }
+        }
+        Err(PidError::ProcessNotFound)
     }
 }

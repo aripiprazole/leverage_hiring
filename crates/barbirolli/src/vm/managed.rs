@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::Ipv4Addr,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
@@ -13,7 +14,9 @@ use fctools::{
     vm::{
         Vm, VmError as FctoolsVmError, VmState,
         configuration::{InitMethod, VmConfiguration, VmConfigurationData},
-        models::{BootSource, Drive, MachineConfiguration, MetricsSystem, NetworkInterface},
+        models::{
+            BalloonDevice, BootSource, Drive, MachineConfiguration, MetricsSystem, NetworkInterface,
+        },
         shutdown::{VmShutdownAction, VmShutdownError, VmShutdownMethod},
     },
     vmm::{
@@ -30,32 +33,38 @@ use fctools::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use nonempty_collections::NEVec;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use rustix::process::Pid;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    task::JoinHandle,
+};
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
     Barbirolli, VmSpec,
     idle::{Monitor, Sample},
+    lifecycle::PidError,
     network::{ManagedNetwork, NetworkError},
 };
 
 type FirecrackerResourceSystem = ResourceSystem<DirectProcessSpawner, TokioRuntime>;
 type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
+type Result<T = (), E = LifecycleError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct ManagedVm {
     pub spec: VmSpec,
     pub failed: bool,
-    pub pid: i32,
+    pub pid: Pid,
     pub monitor: Mutex<Option<Monitor>>,
     network: Option<ManagedNetwork>,
     #[debug(skip)]
     vm: FirecrackerVm,
     cgroup: Option<VmCgroup>,
-    latest_metrics: Arc<RwLock<Option<Metrics>>>,
+    metrics: Arc<RwLock<Option<Metrics>>>,
     #[debug(skip)]
-    metrics_task: tokio::task::JoinHandle<()>,
+    metrics_task: JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -64,14 +73,14 @@ struct VmCgroup {
 }
 
 impl VmSpec {
-    async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm, LifecycleError> {
+    async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm> {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
             TokioRuntime,
             VmmOwnershipModel::Shared,
             2,
         );
-        let configuration = vm_config(&mut resources, self)?;
+        let configuration = vm_config(&mut resources, barbirolli, self)?;
         let arguments = VmmArguments::new(VmmApiSocket::Enabled(self.api_socket.clone().into()));
         let executor = UnrestrictedVmmExecutor::new(arguments)
             .id(VmmId::new(format!("barbirolli-{}", self.id))?);
@@ -85,10 +94,7 @@ impl VmSpec {
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
-    pub(crate) fn reconcile<'a>(
-        &'a self,
-        barbirolli: &'a Barbirolli,
-    ) -> BoxFuture<'a, Result<(), LifecycleError>> {
+    pub(crate) fn reconcile<'a>(&'a self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, Result<()>> {
         let vm_id = self.id;
         async move {
             let mut errors = vec![];
@@ -113,46 +119,16 @@ impl VmSpec {
         .boxed()
     }
 
+    #[tracing::instrument]
     async fn kill_stale_processes(&self, barbirolli: &Barbirolli) -> Result<(), std::io::Error> {
-        let expected_firecracker = barbirolli.firecracker.bin.as_os_str().as_encoded_bytes();
-        let api_socket: PathBuf = self.api_socket.clone().into();
-        let expected_socket = api_socket.as_os_str().as_encoded_bytes();
-        let expected_id = format!("barbirolli-{}", self.id);
-        let mut proc = tokio::fs::read_dir("/proc").await?;
-        while let Some(entry) = proc.next_entry().await? {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            let command = match tokio::fs::read(entry.path().join("cmdline")).await {
-                Ok(command) => command,
-                Err(_) => continue,
-            };
-            let arguments = command
-                .split(|byte| *byte == 0)
-                .filter(|argument| !argument.is_empty())
-                .collect::<Vec<_>>();
-            let is_firecracker = arguments
-                .first()
-                .is_some_and(|argument| *argument == expected_firecracker);
-            let has_id = arguments
-                .windows(2)
-                .any(|arguments| arguments[0] == b"--id" && arguments[1] == expected_id.as_bytes());
-            let has_socket = arguments
-                .windows(2)
-                .any(|arguments| arguments[0] == b"--api-sock" && arguments[1] == expected_socket);
-            if is_firecracker
-                && has_id
-                && has_socket
-                && let Some(pid) = rustix::process::Pid::from_raw(pid)
-            {
+        match barbirolli.firecracker.pid(self).await {
+            Ok(pid) => {
                 rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+                Ok(())
             }
+            Err(PidError::ProcessNotFound) => Ok(()),
+            Err(PidError::Io { source, .. }) => Err(source),
         }
-        Ok(())
     }
 
     fn metrics_path(&self) -> PathBuf {
@@ -189,8 +165,9 @@ impl VmSpec {
 
 fn vm_config(
     resources: &mut FirecrackerResourceSystem,
+    daemon: &Barbirolli,
     spec: &VmSpec,
-) -> Result<VmConfiguration, LifecycleError> {
+) -> Result<VmConfiguration> {
     let kernel = resources.create_resource(
         &spec.kernel,
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
@@ -238,7 +215,11 @@ fn vm_config(
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
             }],
-            balloon_device: None,
+            balloon_device: Some(BalloonDevice {
+                amount_mib: daemon.balloon.ballon_mem.0 as i32,
+                deflate_on_oom: true,
+                stats_polling_interval_s: Some(10),
+            }),
             vsock_device: None,
             logger_system: None,
             metrics_system: Some(MetricsSystem { metrics }),
@@ -248,10 +229,7 @@ fn vm_config(
     })
 }
 
-async fn rollback_vm(
-    vm: &mut FirecrackerVm,
-    shutdown_timeout: Duration,
-) -> Result<(), LifecycleError> {
+async fn rollback_vm(vm: &mut FirecrackerVm, shutdown_timeout: Duration) -> Result<()> {
     let shutdown = match vm.get_state() {
         VmState::NotStarted | VmState::Exited | VmState::Crashed(_) => Ok(()),
         VmState::Running | VmState::Paused => vm
@@ -276,7 +254,7 @@ async fn rollback_vm(
 }
 
 impl ManagedVm {
-    pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self, LifecycleError> {
+    pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
         let network = spec.network.prepare(&spec.port_bindings).await?;
         let mut vm = match spec.prepare_vm(barbirolli).await {
             Ok(vm) => vm,
@@ -300,11 +278,11 @@ impl ManagedVm {
             });
         }
 
-        let pid = match find_firecracker_pid(barbirolli, &spec).await {
+        let pid = match barbirolli.firecracker.pid(&spec).await {
             Ok(pid) => pid,
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(error.into()),
+                    startup_error: Box::new(LifecycleError::Health(error.into())),
                     vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
                         .await
                         .err()
@@ -326,23 +304,22 @@ impl ManagedVm {
                 });
             }
         };
-        let latest_metrics = Arc::new(RwLock::new(None));
-        let metrics_task = spawn_metrics_reader(spec.metrics_path(), latest_metrics.clone());
+        let metrics = Arc::new(RwLock::new(None));
 
         Ok(Self {
-            spec,
             vm,
             network: Some(network),
             failed: false,
             pid,
             monitor: Mutex::new(None),
             cgroup: Some(cgroup),
-            latest_metrics,
-            metrics_task,
+            metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
+            metrics,
+            spec,
         })
     }
 
-    pub async fn shutdown(&mut self, shutdown_timeout: Duration) -> Result<(), LifecycleError> {
+    pub async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
         if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
             return Ok(());
         }
@@ -354,17 +331,17 @@ impl ManagedVm {
                     } else {
                         VmShutdownMethod::WriteToSerial(b"reboot\n".to_vec())
                     },
-                    timeout: Some(shutdown_timeout),
+                    timeout: Some(timeout),
                     graceful: true,
                 },
                 VmShutdownAction {
                     method: VmShutdownMethod::PauseThenKill,
-                    timeout: Some(shutdown_timeout / 2),
+                    timeout: Some(timeout / 2),
                     graceful: false,
                 },
                 VmShutdownAction {
                     method: VmShutdownMethod::Kill,
-                    timeout: Some(shutdown_timeout / 2),
+                    timeout: Some(timeout / 2),
                     graceful: false,
                 },
             ])
@@ -372,7 +349,9 @@ impl ManagedVm {
         Ok(())
     }
 
-    pub async fn cleanup(&mut self) -> Result<(), LifecycleError> {
+    #[tracing::instrument(err)]
+    pub async fn cleanup(&mut self) -> Result<()> {
+        tracing::info!("managed vm cleanup");
         self.metrics_task.abort();
         let vm = self.vm.cleanup().await.map_err(LifecycleError::from);
         let network = match self.network.as_ref() {
@@ -405,14 +384,14 @@ impl ManagedVm {
     pub(crate) fn activity_sample(&self) -> Result<Sample, HealthError> {
         let cgroup = self.cgroup.as_ref().ok_or(HealthError::MissingCgroup)?;
         let metrics = self
-            .latest_metrics
+            .metrics
             .read()
             .map_err(|_| HealthError::MetricsLock)?
             .clone()
             .ok_or(HealthError::MissingMetrics)?;
         let connections = connection_counts(self.spec.network.guest_ip);
         Ok(Sample {
-            instance_pid: self.pid,
+            instance_pid: self.pid.as_raw_pid(),
             sampled_at: Instant::now(),
             cpu_usage_usec: cgroup.read_key("cpu.stat", "usage_usec")?,
             memory_bytes: cgroup.read_value("memory.current")?,
@@ -434,10 +413,7 @@ impl ManagedVm {
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
 
-fn spawn_metrics_reader(
-    path: PathBuf,
-    latest: Arc<RwLock<Option<Metrics>>>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = read_metrics(&path, &latest).await {
             tracing::error!(%error, path = %path.display(), "Firecracker metrics reader stopped");
@@ -469,54 +445,8 @@ async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Resul
     Ok(())
 }
 
-async fn find_firecracker_pid(barbirolli: &Barbirolli, spec: &VmSpec) -> Result<i32, HealthError> {
-    let api_socket: PathBuf = spec.api_socket.clone().into();
-    let expected_socket = api_socket.as_os_str().as_encoded_bytes();
-    let expected_firecracker = barbirolli.firecracker.bin.as_os_str().as_encoded_bytes();
-    let expected_id = format!("barbirolli-{}", spec.id);
-    let mut proc = tokio::fs::read_dir("/proc")
-        .await
-        .map_err(|source| HealthError::Io {
-            path: PathBuf::from("/proc"),
-            source,
-        })?;
-    while let Some(entry) = proc.next_entry().await.map_err(|source| HealthError::Io {
-        path: PathBuf::from("/proc"),
-        source,
-    })? {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let command = match tokio::fs::read(entry.path().join("cmdline")).await {
-            Ok(command) => command,
-            Err(_) => continue,
-        };
-        let arguments = command
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .collect::<Vec<_>>();
-        if arguments
-            .first()
-            .is_some_and(|arg| *arg == expected_firecracker)
-            && arguments
-                .windows(2)
-                .any(|args| args[0] == b"--api-sock" && args[1] == expected_socket)
-            && arguments
-                .windows(2)
-                .any(|args| args[0] == b"--id" && args[1] == expected_id.as_bytes())
-        {
-            return Ok(pid);
-        }
-    }
-    Err(HealthError::ProcessNotFound)
-}
-
 impl VmCgroup {
-    fn create(id: String, pid: i32) -> Result<Self, HealthError> {
+    fn create(id: String, pid: Pid) -> Result<Self, HealthError> {
         let root = PathBuf::from(CGROUP_ROOT);
         fs::create_dir_all(&root).map_err(|source| HealthError::Io {
             path: root.clone(),
@@ -533,7 +463,7 @@ impl VmCgroup {
             source,
         })?;
         let procs = path.join("cgroup.procs");
-        if let Err(source) = fs::write(&procs, pid.to_string()) {
+        if let Err(source) = fs::write(&procs, pid.as_raw_pid().to_string()) {
             let setup = HealthError::Io {
                 path: procs,
                 source,
@@ -588,7 +518,7 @@ impl VmCgroup {
     }
 }
 
-fn connection_counts(guest_ip: std::net::Ipv4Addr) -> (u64, u64) {
+fn connection_counts(guest_ip: Ipv4Addr) -> (u64, u64) {
     let Some(contents) = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
         .into_iter()
         .find_map(|path| fs::read_to_string(path).ok())
@@ -663,8 +593,8 @@ pub enum HealthError {
     },
     #[error("invalid health value in {0}")]
     InvalidValue(PathBuf),
-    #[error("the Firecracker process could not be identified")]
-    ProcessNotFound,
+    #[error("pid error: {0}")]
+    PidError(#[from] PidError),
     #[error("the VM cgroup is unavailable")]
     MissingCgroup,
     #[error("Firecracker has not emitted a metrics sample")]
