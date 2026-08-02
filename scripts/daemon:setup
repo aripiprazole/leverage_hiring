@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x setup_daemon
+Usage: x daemon:setup
 
 Download and prepare Firecracker 1.13, a guest kernel, a writable rootfs,
 and the SSH key used by local development.

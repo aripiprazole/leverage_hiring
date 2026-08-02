@@ -7,9 +7,9 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x shutdown <vm_id>
+Usage: x vm:show <vm_id>
 
-Shutdown one VM.
+Show full details for one VM.
 EOF
 }
 
@@ -27,6 +27,6 @@ case "$1" in
         if (($# != 1)); then
             usage_error "unexpected extra argument: $2"
         fi
-        api_request POST "/vms/$vm_id/shutdown"
+        api_request GET "/vms/$vm_id"
         ;;
 esac

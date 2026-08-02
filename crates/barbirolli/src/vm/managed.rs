@@ -80,19 +80,35 @@ pub struct ManagedVm {
 
 #[derive(Debug)]
 struct SerialConsole {
+    #[debug("{vm_id}")]
     vm_id: VmId,
     #[debug("{}", path.display())]
     path: PathBuf,
     #[debug("{}", if stdin.is_some() { "open" } else { "closed" })]
     stdin: Option<FirecrackerStdin>,
-    #[debug("{}", if stdout_task.is_some() { "running" } else { "stopped" })]
+    #[debug(
+        "{}",
+        match stdout_task.as_ref() {
+            Some(task) if task.is_finished() => "finished",
+            Some(_) => "running",
+            None => "released",
+        }
+    )]
     stdout_task: Option<JoinHandle<()>>,
-    #[debug("{}", if stderr_task.is_some() { "running" } else { "stopped" })]
+    #[debug(
+        "{}",
+        match stderr_task.as_ref() {
+            Some(task) if task.is_finished() => "finished",
+            Some(_) => "running",
+            None => "released",
+        }
+    )]
     stderr_task: Option<JoinHandle<()>>,
 }
 
 impl SerialConsole {
     #[tracing::instrument(
+        name = "attach_serial_console",
         skip(vm, path),
         fields(%vm_id, path = %path.display()),
         err
@@ -108,17 +124,19 @@ impl SerialConsole {
             path.clone()
         )?;
         let pipes = vm.take_pipes()?;
-        tracing::debug!("attaching Firecracker serial console");
-        Ok(Self {
+        let console = Self {
             vm_id,
             path: path.clone(),
             stdin: Some(pipes.stdin),
             stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, path)),
             stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
-        })
+        };
+        tracing::debug!(?console, "Firecracker serial console attached");
+        Ok(console)
     }
 
     #[tracing::instrument(
+        name = "write_serial_console",
         skip(self, bytes),
         fields(vm_id = %self.vm_id, path = %self.path.display(), byte_count = bytes.len()),
         err
@@ -137,22 +155,23 @@ impl SerialConsole {
     }
 
     #[tracing::instrument(
+        name = "finish_serial_console",
         skip(self),
         fields(vm_id = %self.vm_id, path = %self.path.display())
     )]
     async fn finish(&mut self) {
-        tracing::debug!("finishing Firecracker serial console");
         drop(self.stdin.take());
         join_serial_task(&mut self.stdout_task, "stdout").await;
         join_serial_task(&mut self.stderr_task, "stderr").await;
+        tracing::debug!(console = ?self, "Firecracker serial console finished");
     }
 
     #[tracing::instrument(
+        name = "abort_serial_console",
         skip(self),
         fields(vm_id = %self.vm_id, path = %self.path.display())
     )]
     fn abort(&mut self) {
-        tracing::warn!("aborting Firecracker serial console readers");
         drop(self.stdin.take());
         if let Some(task) = self.stdout_task.take() {
             task.abort();
@@ -160,6 +179,7 @@ impl SerialConsole {
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
+        tracing::warn!(console = ?self, "Firecracker serial console readers aborted");
     }
 }
 
@@ -973,6 +993,8 @@ mod tests {
         };
 
         let active = format!("{console:?}");
+        assert!(active.contains("vm_id: 0"));
+        assert!(active.contains(&format!("path: {}", path.display())));
         assert!(active.contains("stdin: open"));
         assert!(active.contains("stdout_task: running"));
         assert!(active.contains("stderr_task: running"));
@@ -992,8 +1014,8 @@ mod tests {
 
         let finished = format!("{console:?}");
         assert!(finished.contains("stdin: closed"));
-        assert!(finished.contains("stdout_task: stopped"));
-        assert!(finished.contains("stderr_task: stopped"));
+        assert!(finished.contains("stdout_task: released"));
+        assert!(finished.contains("stderr_task: released"));
 
         assert_eq!(
             tokio::fs::read(&path)

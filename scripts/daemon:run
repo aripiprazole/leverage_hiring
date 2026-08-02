@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x run_daemon
+Usage: x daemon:run
 
 Build the daemon, then run it with the privileges required for KVM,
 TAP, nftables, and IPv4 forwarding.

@@ -51,34 +51,34 @@ Then, inside Lima:
 
 ```bash
 # dependency install etc
-./x setup_daemon
-./x run_daemon
+./x daemon:setup
+./x daemon:run
 ```
 
 ## Example commands
 
 ```sh
 ./x help # Show available VM commands
-./x create --publish 2222:22 # Create a VM
-./x start 0 # Start a VM
-./x shutdown 0 # Stop a VM
-./x status 0 # Check status
+./x vm:create --publish 2222:22 # Create a VM
+./x vm:start 0 # Start a VM
+./x vm:shutdown 0 # Stop a VM
+./x vm:status 0 # Check status
 ./x vm:logs 0 # Print retained serial output and follow new output
-./x delete 0 # Delete a VM
+./x vm:delete 0 # Delete a VM
 ```
 
-New VMs use the daemon provisioning default of 256 MiB. Memory is not selected per create request.
+New VMs use the daemon provisioning default of 256 MiB. The `vm:create` command does not accept a memory option.
 
 ## CLI helpers
 
 ```sh
-./x ps
-./x show 0 # Inspect the current state
-./x ssh 0 # Open SSH using the VM's default key
+./x vm:ps
+./x vm:show 0 # Inspect the current state
+./x vm:ssh 0 # Open SSH using the VM's default key
 ./x vm:logs 0 --pull # Print the current retained serial output and exit
 ./x vm:logs 0 --attach # Explicit form of the default follow mode
-./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use a custom key if you passed --authorized-key-file on create
-./x help create # Help for a specific command
+./x vm:ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use a custom key if you passed --authorized-key-file to vm:create
+./x help vm:create # Help for a specific command
 ```
 
 Each VM's raw Firecracker stdout is retained in `$VM_ROOT/<id>/serial.log`. The file is append-only
@@ -94,7 +94,7 @@ nix develop --command x help
 ## Examples
 
 Run these from the repository root inside the Linux/Lima guest. Keep
-`./x run_daemon` running in another Linux/Lima terminal.
+`./x daemon:run` running in another Linux/Lima terminal.
 
 ### OCI image lifecycle
 
@@ -114,36 +114,36 @@ VM while retaining the pulled image, then removes the stopped lifecycle and its 
 ### SQLite
 
 ```sh
-VM_ID=$(./x create | jq -r .id)
+VM_ID=$(./x vm:create | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "apt-get update &&
+./x vm:ssh "$VM_ID" -- "apt-get update &&
    apt-get install -y sqlite3 &&
    sqlite3 /root/example.db 'CREATE TABLE messages (body TEXT);' &&
    sqlite3 /root/example.db \"INSERT INTO messages VALUES ('hello');\" &&
    sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-./x ssh "$VM_ID" -- sync
-./x shutdown "$VM_ID"
+./x vm:ssh "$VM_ID" -- sync
+./x vm:shutdown "$VM_ID"
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "sqlite3 /root/example.db 'SELECT * FROM messages;'"
+./x vm:ssh "$VM_ID" -- "sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-./x shutdown "$VM_ID"
+./x vm:shutdown "$VM_ID"
 
-./x delete "$VM_ID"
+./x vm:delete "$VM_ID"
 ```
 
 ### HTTP
 
 ```sh
-VM_ID=$(./x create --publish 8080:80 | jq -r .id)
+VM_ID=$(./x vm:create --publish 8080:80 | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "mkdir -p /srv/hello &&
+./x vm:ssh "$VM_ID" -- "mkdir -p /srv/hello &&
    echo '<h1>Hello from a microVM</h1>' > /srv/hello/index.html &&
    python3 -m http.server 80 --directory /srv/hello"
 ```
@@ -158,18 +158,18 @@ curl --fail "http://$HOST_IP:8080"
 Press `Ctrl-C` in the HTTP server terminal, then run:
 
 ```sh
-./x shutdown "$VM_ID"
-./x delete "$VM_ID"
+./x vm:shutdown "$VM_ID"
+./x vm:delete "$VM_ID"
 ```
 
 ### PostgreSQL
 
 ```sh
-VM_ID=$(./x create --publish 5432:5432 | jq -r .id)
+VM_ID=$(./x vm:create --publish 5432:5432 | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "export DEBIAN_FRONTEND=noninteractive &&
+./x vm:ssh "$VM_ID" -- "export DEBIAN_FRONTEND=noninteractive &&
    apt-get update &&
    apt-get install -y postgresql &&
    sed -i \"s/^#listen_addresses = 'localhost'/listen_addresses = '*'/\" \
@@ -190,11 +190,11 @@ env PGPASSWORD=postgres \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-./x shutdown "$VM_ID"
+./x vm:shutdown "$VM_ID"
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "service postgresql start"
+./x vm:ssh "$VM_ID" -- "service postgresql start"
 
 env PGPASSWORD=postgres \
   psql --host "$HOST_IP" --port 5432 \
@@ -202,6 +202,6 @@ env PGPASSWORD=postgres \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-./x shutdown "$VM_ID"
-./x delete "$VM_ID"
+./x vm:shutdown "$VM_ID"
+./x vm:delete "$VM_ID"
 ```
