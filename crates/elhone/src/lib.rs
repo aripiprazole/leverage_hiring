@@ -1,5 +1,7 @@
+mod oci;
+
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -22,9 +24,11 @@ pub fn router(manager: Barbirolli) -> Router {
         .route("/vms/{id}/status", get(vm_status))
         .route("/vms/{id}/start", post(start_vm))
         .route("/vms/{id}/shutdown", post(shutdown_vm))
+        .route("/run", post(oci::run))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .with_state(AppState { manager })
+        .layer(Extension(oci::OciFetcher::default()))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
@@ -151,6 +155,8 @@ enum ApiError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    BadGateway(String),
+    #[error("{0}")]
     InternalServerError(String),
 }
 
@@ -161,7 +167,20 @@ impl ApiError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl From<oci::OciError> for ApiError {
+    fn from(error: oci::OciError) -> Self {
+        match error {
+            oci::OciError::InvalidInput(message) => Self::UnprocessableEntity(message),
+            error => {
+                tracing::error!(%error, "OCI request failed");
+                Self::BadGateway(error.to_string())
+            }
         }
     }
 }

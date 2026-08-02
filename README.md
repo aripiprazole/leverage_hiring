@@ -18,9 +18,8 @@ limactl start --set '.nestedVirtualization=true' --name=provisioning template://
 
 ## Dependencies
 
-Required dependencies on Ubuntu
-
 ```bash
+# ubuntu deps
 sudo apt-get update
 sudo apt-get install -y \
   build-essential \
@@ -51,6 +50,7 @@ limactl shell --workdir "$PWD" provisioning
 Then, inside Lima:
 
 ```bash
+# dependency install etc
 ./x setup_daemon
 ./x run_daemon
 ```
@@ -58,23 +58,12 @@ Then, inside Lima:
 ## Example commands
 
 ```sh
-# Show available VM commands
-./x help
-
-# Create a VM
-./x create --publish 2222:22
-
-# Start a VM
-./x start 0
-
-# Stop a VM
-./x shutdown 0
-
-# Check status
-./x status 0
-
-# Delete a VM
-./x delete 0
+./x help # Show available VM commands
+./x create --publish 2222:22 # Create a VM
+./x start 0 # Start a VM
+./x shutdown 0 # Stop a VM
+./x status 0 # Check status
+./x delete 0 # Delete a VM
 ```
 
 New VMs use the daemon provisioning default of 256 MiB. Memory is not selected per create request.
@@ -82,18 +71,11 @@ New VMs use the daemon provisioning default of 256 MiB. Memory is not selected p
 ## CLI helpers
 
 ```sh
-# Inspect the current state
 ./x ps
-./x show 0
-
-# Open SSH using the VM's default key
-./x ssh 0
-
-# Use a custom key if you passed --authorized-key-file on create
-./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release"
-
-# Help for a specific command
-./x help create
+./x show 0 # Inspect the current state
+./x ssh 0 # Open SSH using the VM's default key
+./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use a custom key if you passed --authorized-key-file on create
+./x help create # Help for a specific command
 ```
 
 If you use the provided Nix shell, `x` is also available in `PATH`:
