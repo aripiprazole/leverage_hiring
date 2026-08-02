@@ -43,7 +43,7 @@ pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
         .route("/oci/pull", post(oci::pull))
         .route("/oci/run", post(oci::run))
         .route("/oci/stop", post(oci::stop))
-        .route("/oci/rm", post(oci::remove))
+        .route("/oci/rm", post(oci::rm))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .with_state(AppState {
@@ -102,8 +102,9 @@ impl CreateVmRequest {
 
 #[tracing::instrument(skip(state))]
 async fn list_vms(State(state): State<AppState>) -> Json<Vec<barbirolli::VmSummary>> {
-    tracing::info!("list vms");
-    Json(state.manager.list().await)
+    let vms = state.manager.list().await;
+    tracing::info!(vm_count = vms.len(), "elhone listed the VMs");
+    Json(vms)
 }
 
 #[tracing::instrument(skip(state))]
@@ -111,11 +112,10 @@ async fn vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<barbirolli::VmSummary>, ApiError> {
-    tracing::info!("get vm");
     let id = parse_vm_id(&id)?;
-    Ok(Json(
-        state.manager.vm_mut(id).map_err(ApiError::from)?.summary(),
-    ))
+    let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
+    tracing::info!(%id, "elhone found the VM");
+    Ok(Json(summary))
 }
 
 #[tracing::instrument(skip(state, query))]
@@ -124,7 +124,6 @@ async fn vm_logs(
     Path(id): Path<String>,
     query: Result<Query<VmLogsQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
-    tracing::info!("get VM logs");
     let id = parse_vm_id(&id)?;
     let Query(query) = query.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let path = {
@@ -139,6 +138,13 @@ async fn vm_logs(
         .await
         .map_err(|error| vm_log_io_error(id, "inspect", &path, error))?
         .len();
+    tracing::info!(
+        %id,
+        path = %path.display(),
+        follow = query.follow,
+        byte_count = length,
+        "elhone opened the VM serial log"
+    );
     let stream = vm_log_stream(file, path, query.follow, length);
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
@@ -196,7 +202,7 @@ fn vm_log_stream(
                     return Some((Ok(Bytes::from(buffer)), state));
                 }
                 Err(error) => {
-                    tracing::error!(%error, path = %state.path.display(), "VM log stream failed");
+                    tracing::error!(%error, path = %state.path.display(), "the VM log stream failed");
                     state.done = true;
                     return Some((Err(error), state));
                 }
@@ -211,7 +217,7 @@ fn vm_log_io_error(
     path: &std::path::Path,
     error: io::Error,
 ) -> ApiError {
-    tracing::error!(%error, %id, operation, path = %path.display(), "VM log request failed");
+    tracing::error!(%error, %id, operation, path = %path.display(), "the VM log request failed");
     ApiError::InternalServerError(format!("failed to {operation} VM {id} serial log"))
 }
 
@@ -220,10 +226,10 @@ async fn create_vm(
     State(state): State<AppState>,
     input: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
-    tracing::info!("create vm");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     let input = input.into_vm_input(state.standard_rootfs);
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
+    tracing::info!(%id, "elhone created the VM");
     Ok((
         StatusCode::CREATED,
         Json(StatusResponse {
@@ -238,9 +244,9 @@ async fn vm_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    tracing::info!("vm status");
     let id = parse_vm_id(&id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
+    tracing::info!(%id, status = ?summary.status, "elhone read the VM status");
     Ok(Json(StatusResponse {
         id,
         status: summary.status,
@@ -252,11 +258,11 @@ async fn start_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    tracing::info!("start vm");
     let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
+    tracing::info!(%id, "elhone started the VM");
     Ok(Json(StatusResponse {
         id,
         status: summary.status,
@@ -268,11 +274,11 @@ async fn shutdown_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    tracing::info!("shutdown vm");
     let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
+    tracing::info!(%id, "elhone stopped the VM");
     Ok(Json(StatusResponse {
         id,
         status: summary.status,
@@ -284,9 +290,9 @@ async fn delete_vm(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    tracing::info!("delete vm");
     let id = parse_vm_id(&id)?;
     state.manager.delete(id).await.map_err(ApiError::from)?;
+    tracing::info!(%id, "elhone deleted the VM");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -332,13 +338,13 @@ impl ApiError {
 impl From<oci::OciError> for ApiError {
     fn from(error: oci::OciError) -> Self {
         if error.is_local_failure() {
-            tracing::error!(%error, "OCI artifact build failed");
+            tracing::error!(%error, "the OCI artifact build failed");
             return Self::InternalServerError(error.to_string());
         }
         match error {
             oci::OciError::InvalidInput(message) => Self::UnprocessableEntity(message),
             error => {
-                tracing::error!(%error, "OCI request failed");
+                tracing::error!(%error, "the OCI request failed");
                 Self::BadGateway(error.to_string())
             }
         }
@@ -364,22 +370,22 @@ impl From<LifecycleError> for ApiError {
             )
             | LifecycleError::Shutdown(_)
             | LifecycleError::Warmup(_) => {
-                tracing::error!(%error, "Elhone request failed");
+                tracing::error!(%error, "the VM request failed");
                 Self::InternalServerError(message)
             }
             #[cfg(target_os = "linux")]
             LifecycleError::Storage(StorageError::RootfsProvision(_)) => {
-                tracing::error!(%error, "Elhone request failed");
+                tracing::error!(%error, "the VM request failed");
                 Self::InternalServerError(message)
             }
             #[cfg(not(target_os = "linux"))]
             LifecycleError::UnsupportedPlatform => {
-                tracing::error!(%error, "Elhone request failed");
+                tracing::error!(%error, "the VM request failed");
                 Self::InternalServerError(message)
             }
             #[cfg(target_os = "linux")]
             LifecycleError::Vm(_) => {
-                tracing::error!(%error, "Elhone request failed");
+                tracing::error!(%error, "the VM request failed");
                 Self::InternalServerError(message)
             }
         }

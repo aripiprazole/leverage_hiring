@@ -1,9 +1,6 @@
-use std::{
-    fmt::{self, Display},
-    net::Ipv4Addr,
-    str::FromStr,
-};
+use std::{net::Ipv4Addr, str::FromStr};
 
+use derive_more::{Debug, Display};
 use serde::{Deserialize, Serialize};
 
 use crate::{ParseValueError, VmId};
@@ -150,9 +147,11 @@ impl NetworkSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
+#[debug("{_0}")]
+#[display("{_0}")]
 pub struct InterfaceName(String);
 
 impl FromStr for InterfaceName {
@@ -169,12 +168,6 @@ impl FromStr for InterfaceName {
         } else {
             Err(ParseValueError::new("network interface", value))
         }
-    }
-}
-
-impl Display for InterfaceName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
     }
 }
 

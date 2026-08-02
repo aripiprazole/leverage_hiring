@@ -30,7 +30,7 @@ impl ManagedNetwork {
             vm_id = %self.spec.vm_id,
             tap = %self.spec.tap,
             table = %self.table,
-            "VM network cleaned up"
+            "barbirolli removed the VM network"
         );
         Ok(())
     }
@@ -125,7 +125,7 @@ impl NetworkSpec {
             .await
         {
             Ok(()) => {
-                tracing::info!(host_interface = %host, "VM network prepared");
+                tracing::info!(host_interface = %host, "barbirolli prepared the VM network");
                 Ok(ManagedNetwork {
                     spec: self.clone(),
                     table,
@@ -212,7 +212,7 @@ impl NetworkSpec {
         tracing::info!(
             vm_id = %self.vm_id,
             tap = %self.tap,
-            "cleaning up stale VM network"
+            "barbirolli removes a stale VM network"
         );
         self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
     }
@@ -226,7 +226,7 @@ impl NetworkSpec {
         table: &str,
         bindings: &[PortBinding],
     ) -> Result<(), NetworkError> {
-        tracing::info!("installing rules");
+        tracing::info!("barbirolli installs the VM network rules");
         let prerouting_chain = Chain::new(table, "prerouting")?
             .family(Family::Ip)
             .hook(Hook::Prerouting)

@@ -156,7 +156,9 @@ impl Workspace {
     }
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug, derive_more::Display)]
+#[debug("{}", _0.display())]
+#[display("{}", _0.display())]
 struct Archive(PathBuf);
 
 impl AsRef<Path> for Archive {

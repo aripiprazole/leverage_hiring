@@ -1,10 +1,9 @@
 use std::{
-    fmt::{self, Display},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-use derive_more::{Display, From, Into};
+use derive_more::{Debug, Display, From, Into};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
@@ -61,15 +60,19 @@ pub struct PortBinding {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+    Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
 )]
 #[serde(transparent)]
+#[debug("{}", _0.display())]
+#[display("{}", _0.display())]
 pub struct ApiSocket(PathBuf);
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+    Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
 )]
 #[serde(transparent)]
+#[debug("{}", _0.display())]
+#[display("{}", _0.display())]
 pub struct Rootfs(PathBuf);
 
 impl AsRef<Path> for Rootfs {
@@ -93,6 +96,7 @@ impl ApiSocket {
 /// TCP only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct Port(u16);
 
@@ -123,6 +127,7 @@ impl<'de> Deserialize<'de> for Port {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct AuthorizedKey(String);
 
@@ -152,7 +157,9 @@ impl<'de> Deserialize<'de> for AuthorizedKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[debug("{_0}")]
+#[display("{_0}")]
 pub struct VmId(u16);
 
 impl TryFrom<u16> for VmId {
@@ -189,14 +196,9 @@ impl<'de> Deserialize<'de> for VmId {
     }
 }
 
-impl Display for VmId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct VcpuCount(u8);
 
@@ -230,6 +232,7 @@ impl<'de> Deserialize<'de> for VcpuCount {
     Debug, Clone, Copy, PartialEq, From, Into, Eq, Hash, PartialOrd, Ord, Display, Serialize,
 )]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct MemoryMib(u16);
 

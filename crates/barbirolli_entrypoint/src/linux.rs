@@ -389,7 +389,7 @@ impl SignalMask {
 impl Drop for SignalMask {
     fn drop(&mut self) {
         if let Err(err) = self.restore() {
-            eprintln!("failed to drop signal mask: {err:?}");
+            eprintln!("barbirolli_entrypoint: signal-mask cleanup failed: {err:?}");
         }
     }
 }
@@ -489,7 +489,8 @@ pub fn sync_filesystems() {
 }
 
 pub fn power_off(exit: ExitStatus) -> Result<()> {
-    eprintln!("barbirolli_entrypoint: OCI process exited with {exit}; powering off");
+    eprintln!("barbirolli_entrypoint: OCI process exited with {exit}");
+    eprintln!("barbirolli_entrypoint: VM starts power-off");
     let result = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
     debug_assert_eq!(result, -1, "a successful power-off syscall cannot return");
     Err(EntrypointError::PowerOff {

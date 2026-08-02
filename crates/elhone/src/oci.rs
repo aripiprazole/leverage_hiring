@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     fmt::{self, Display},
     path::Path,
-    str::FromStr,
     sync::{Arc, Once},
 };
 
@@ -20,7 +19,7 @@ use reqwest::{
     header::{ACCEPT, CONTENT_TYPE, HeaderMap},
     redirect::Policy,
 };
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
@@ -56,7 +55,9 @@ impl TransportPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(derive_more::Debug, derive_more::Display, Clone, Copy)]
+#[debug("{_0}")]
+#[display("{_0}")]
 struct OutboundUrl<'a>(&'a Url);
 
 impl AsRef<Url> for OutboundUrl<'_> {
@@ -65,131 +66,17 @@ impl AsRef<Url> for OutboundUrl<'_> {
     }
 }
 
-impl Display for OutboundUrl<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImageReference {
-    name: ImageName,
-    tag: ImageTag,
-}
-
-impl ImageReference {
-    fn docker_hub_location(&self) -> Result<registry::Loc, OciError> {
-        registry::Loc::docker_hub(&self.name, &self.tag)
-    }
-}
-
-impl Display for ImageReference {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}:{}", self.name, self.tag)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImageName(String);
-
-impl FromStr for ImageName {
-    type Err = OciError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let valid_component = |component: &str| {
-            !component.is_empty()
-                && component.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-                })
-                && component
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && component
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-        };
-        if value.is_empty() || !value.split('/').all(valid_component) {
-            return Err(OciError::InvalidInput(format!(
-                "invalid OCI image name {value:?}"
-            )));
-        }
-        Ok(Self(if value.contains('/') {
-            value.to_owned()
-        } else {
-            format!("library/{value}")
-        }))
-    }
-}
-
-impl Display for ImageName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ImageTag(String);
-
-impl FromStr for ImageTag {
-    type Err = OciError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let valid = !value.is_empty()
-            && value.len() <= 128
-            && value
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
-        valid
-            .then(|| Self(value.to_owned()))
-            .ok_or_else(|| OciError::InvalidInput(format!("invalid OCI image tag {value:?}")))
-    }
-}
-
-impl Display for ImageTag {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageTag {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullInput {
-    name: ImageName,
-    tag: ImageTag,
+    name: image::Name,
+    tag: image::Tag,
     token: String,
 }
 
 impl PullInput {
-    fn reference(&self) -> ImageReference {
-        ImageReference {
+    fn reference(&self) -> image::Reference {
+        image::Reference {
             name: self.name.clone(),
             tag: self.tag.clone(),
         }
@@ -199,13 +86,13 @@ impl PullInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceInput {
-    name: ImageName,
-    tag: ImageTag,
+    name: image::Name,
+    tag: image::Tag,
 }
 
 impl ReferenceInput {
-    fn reference(&self) -> ImageReference {
-        ImageReference {
+    fn reference(&self) -> image::Reference {
+        image::Reference {
             name: self.name.clone(),
             tag: self.tag.clone(),
         }
@@ -214,19 +101,9 @@ impl ReferenceInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum OciStatus {
+pub enum OciStatus {
     Pulled,
     Running,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LifecycleResponse {
-    name: String,
-    tag: String,
-    status: OciStatus,
-    vm_id: Option<VmId>,
-    manifest_digest: String,
-    filesystem: api_schema::FileSystem,
 }
 
 struct FetchedImage {
@@ -240,8 +117,8 @@ struct OciEntry {
 }
 
 impl OciEntry {
-    fn response(&self, reference: &ImageReference) -> LifecycleResponse {
-        LifecycleResponse {
+    fn response(&self, reference: &image::Reference) -> api_schema::Container {
+        api_schema::Container {
             name: reference.name.to_string(),
             tag: reference.tag.to_string(),
             status: if self.vm_id.is_some() {
@@ -249,8 +126,8 @@ impl OciEntry {
             } else {
                 OciStatus::Pulled
             },
-            vm_id: self.vm_id,
-            manifest_digest: self.image.details.manifest.digest.to_string(),
+            id: self.vm_id,
+            digest: self.image.details.manifest.digest.to_string(),
             filesystem: (&self.image.filesystem).into(),
         }
     }
@@ -259,7 +136,7 @@ impl OciEntry {
 #[derive(Clone)]
 pub struct OciStore {
     fetcher: OciFetcher,
-    entries: Arc<Mutex<HashMap<ImageReference, OciEntry>>>,
+    entries: Arc<Mutex<HashMap<image::Reference, OciEntry>>>,
 }
 
 impl Default for OciStore {
@@ -282,22 +159,24 @@ impl OciStore {
 
     async fn ensure_pulled(
         &self,
-        entries: &mut HashMap<ImageReference, OciEntry>,
-        reference: &ImageReference,
+        entries: &mut HashMap<image::Reference, OciEntry>,
+        reference: &image::Reference,
         token: String,
     ) -> Result<(), OciStoreError> {
         if entries.contains_key(reference) {
+            tracing::debug!(%reference, "the OCI image is already in the store");
             return Ok(());
         }
         let image = self
             .fetcher
-            .fetch(reference.docker_hub_location()?, token)
+            .fetch(reference.docker_hub_loc()?, token)
             .await?;
         entries.insert(reference.clone(), OciEntry { image, vm_id: None });
+        tracing::info!(%reference, "elhone stored the OCI image");
         Ok(())
     }
 
-    async fn pull(&self, input: PullInput) -> Result<LifecycleResponse, OciStoreError> {
+    async fn pull(&self, input: PullInput) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
         let mut entries = self.entries.lock().await;
         self.ensure_pulled(&mut entries, &reference, input.token)
@@ -312,7 +191,7 @@ impl OciStore {
         &self,
         manager: &M,
         input: PullInput,
-    ) -> Result<LifecycleResponse, OciStoreError> {
+    ) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
         let mut entries = self.entries.lock().await;
         self.ensure_pulled(&mut entries, &reference, input.token)
@@ -323,7 +202,10 @@ impl OciStore {
 
         if let Some(vm_id) = entry.vm_id {
             match manager.start_oci_vm(vm_id).await {
-                Ok(()) => return Ok(entry.response(&reference)),
+                Ok(()) => {
+                    tracing::info!(%reference, %vm_id, "elhone started the OCI VM");
+                    return Ok(entry.response(&reference));
+                }
                 Err(LifecycleError::NotFound(_)) => entry.vm_id = None,
                 Err(error) => return Err(error.into()),
             }
@@ -348,6 +230,7 @@ impl OciStore {
                 }
             }
         }
+        tracing::info!(%reference, %vm_id, "elhone started the OCI VM");
         Ok(entry.response(&reference))
     }
 
@@ -355,7 +238,7 @@ impl OciStore {
         &self,
         manager: &M,
         input: ReferenceInput,
-    ) -> Result<LifecycleResponse, OciStoreError> {
+    ) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
         let mut entries = self.entries.lock().await;
         let entry = entries
@@ -363,9 +246,18 @@ impl OciStore {
             .ok_or_else(|| OciStoreError::NotFound(reference.clone()))?;
         if let Some(vm_id) = entry.vm_id {
             match manager.delete_oci_vm(vm_id).await {
-                Ok(()) | Err(LifecycleError::NotFound(_)) => entry.vm_id = None,
+                Ok(()) => {
+                    entry.vm_id = None;
+                    tracing::info!(%reference, %vm_id, "elhone stopped the OCI VM");
+                }
+                Err(LifecycleError::NotFound(_)) => {
+                    entry.vm_id = None;
+                    tracing::debug!(%reference, %vm_id, "the OCI VM is already absent");
+                }
                 Err(error) => return Err(error.into()),
             }
+        } else {
+            tracing::debug!(%reference, "the OCI VM is already stopped");
         }
         Ok(entry.response(&reference))
     }
@@ -392,6 +284,7 @@ impl OciStore {
             }
         }
         entries.remove(&reference);
+        tracing::info!(%reference, "elhone removed the OCI image");
         Ok(())
     }
 }
@@ -432,39 +325,6 @@ impl OciVmManager for Barbirolli {
 
     fn oci_vm_status(&self, vm_id: VmId) -> Result<VmStatus, LifecycleError> {
         Ok(self.vm(vm_id)?.summary().status)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum OciStoreError {
-    #[error(transparent)]
-    Fetch(#[from] OciError),
-    #[error(transparent)]
-    Lifecycle(#[from] LifecycleError),
-    #[error("OCI image {0} is not pulled")]
-    NotFound(ImageReference),
-    #[error("OCI image {0} must be stopped before removal")]
-    Running(ImageReference),
-    #[error("failed to start OCI image {reference}: {start}; cleanup also failed: {cleanup}")]
-    StartCleanup {
-        reference: ImageReference,
-        start: Box<LifecycleError>,
-        cleanup: Box<LifecycleError>,
-    },
-}
-
-impl From<OciStoreError> for ApiError {
-    fn from(error: OciStoreError) -> Self {
-        match error {
-            OciStoreError::Fetch(error) => Self::from(error),
-            OciStoreError::Lifecycle(error) => Self::from(error),
-            OciStoreError::NotFound(_) => Self::NotFound(error.to_string()),
-            OciStoreError::Running(_) => Self::Conflict(error.to_string()),
-            OciStoreError::StartCleanup { .. } => {
-                tracing::error!(%error, "OCI VM startup rollback failed");
-                Self::InternalServerError(error.to_string())
-            }
-        }
     }
 }
 
@@ -541,10 +401,10 @@ impl OciFetcher {
             ));
         }
         let initial_url = self.transport.parse(&loc.manifest)?;
-        tracing::warn!(
+        tracing::info!(
             url = %loc.manifest,
             host = loc.manifest.host_str().unwrap_or_default(),
-            "fetching OCI data"
+            "elhone fetches the OCI image"
         );
 
         let host = match self.platform {
@@ -563,10 +423,10 @@ impl OciFetcher {
                 let selected = host.select_platform(&document.manifests)?;
                 let manifest_url = loc.manifest_url(&selected.digest)?;
                 let manifest_url = self.transport.parse(&manifest_url)?;
-                let fetched = session
+                let manifest = session
                     .fetch_manifest(manifest_url, Some(&selected))
                     .await?;
-                let FetchedManifest::Manifest(fetched) = fetched else {
+                let FetchedManifest::Manifest(manifest) = manifest else {
                     return Err(OciError::InvalidDocument(
                         "selected platform descriptor resolved to another image index".to_owned(),
                     ));
@@ -579,10 +439,10 @@ impl OciFetcher {
                         annotations: document.annotations,
                     }),
                     selected.platform,
-                    fetched,
+                    manifest,
                 )
             }
-            FetchedManifest::Manifest(fetched) => (None, None, fetched),
+            FetchedManifest::Manifest(manifest) => (None, None, manifest),
         };
 
         let config = image::Config::new(&host, &manifest.document.layers, {
@@ -686,7 +546,7 @@ fn install_ring_crypto_provider() {
 pub async fn pull(
     State(state): State<AppState>,
     input: Result<Json<PullInput>, JsonRejection>,
-) -> Result<Json<LifecycleResponse>, ApiError> {
+) -> Result<Json<api_schema::Container>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -700,7 +560,7 @@ pub async fn pull(
 pub async fn run(
     State(state): State<AppState>,
     input: Result<Json<PullInput>, JsonRejection>,
-) -> Result<Json<LifecycleResponse>, ApiError> {
+) -> Result<Json<api_schema::Container>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -714,7 +574,7 @@ pub async fn run(
 pub async fn stop(
     State(state): State<AppState>,
     input: Result<Json<ReferenceInput>, JsonRejection>,
-) -> Result<Json<LifecycleResponse>, ApiError> {
+) -> Result<Json<api_schema::Container>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     state
         .oci_store
@@ -725,7 +585,7 @@ pub async fn stop(
 }
 
 #[tracing::instrument(skip(state, input), err)]
-pub async fn remove(
+pub async fn rm(
     State(state): State<AppState>,
     input: Result<Json<ReferenceInput>, JsonRejection>,
 ) -> Result<HttpStatusCode, ApiError> {
@@ -1209,10 +1069,11 @@ mod media {
 mod api_schema {
     use std::collections::BTreeMap;
 
+    use barbirolli::VmId;
     use reqwest::Url;
     use serde::Serialize;
 
-    use crate::oci::descriptor;
+    use crate::oci::{OciStatus, descriptor};
 
     use super::{digest, media, oci_schema, platform};
 
@@ -1226,6 +1087,16 @@ mod api_schema {
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,
         pub layers: Vec<Layer>,
+        pub filesystem: FileSystem,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Container {
+        pub name: String,
+        pub tag: String,
+        pub status: OciStatus,
+        pub id: Option<VmId>,
+        pub digest: String,
         pub filesystem: FileSystem,
     }
 
@@ -1491,8 +1362,16 @@ mod descriptor {
 }
 
 mod image {
+    use std::{
+        fmt::{self, Display},
+        str::FromStr,
+    };
+
     use oci_spec::runtime::Process;
+    use serde::{Deserialize, Deserializer, de};
     use serde_json::json;
+
+    use crate::oci::{OciError, registry};
 
     use super::{api_schema, descriptor, oci_schema, platform};
 
@@ -1506,6 +1385,18 @@ mod image {
         pub runtime: oci_schema::RuntimeConfig,
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct Reference {
+        pub name: Name,
+        pub tag: Tag,
+    }
+
+    impl Reference {
+        pub fn docker_hub_loc(&self) -> Result<registry::Loc, OciError> {
+            registry::Loc::docker_hub(&self.name, &self.tag)
+        }
     }
 
     impl Config {
@@ -1625,6 +1516,94 @@ mod image {
         }
     }
 
+    impl Display for Reference {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "{}:{}", self.name, self.tag)
+        }
+    }
+
+    #[derive(derive_more::Debug, derive_more::Display, Clone, PartialEq, Eq, Hash)]
+    #[debug("{_0}")]
+    #[display("{_0}")]
+    pub struct Name(String);
+
+    impl FromStr for Name {
+        type Err = OciError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            let valid_component = |component: &str| {
+                !component.is_empty()
+                    && component.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                    })
+                    && component
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && component
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            };
+            if value.is_empty() || !value.split('/').all(valid_component) {
+                return Err(OciError::InvalidInput(format!(
+                    "invalid OCI image name {value:?}"
+                )));
+            }
+            Ok(Self(if value.contains('/') {
+                value.to_owned()
+            } else {
+                format!("library/{value}")
+            }))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Name {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
+    }
+
+    #[derive(derive_more::Debug, derive_more::Display, Clone, PartialEq, Eq, Hash)]
+    #[debug("{_0}")]
+    #[display("{_0}")]
+    pub struct Tag(String);
+
+    impl FromStr for Tag {
+        type Err = OciError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            let valid = !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
+            valid
+                .then(|| Self(value.to_owned()))
+                .ok_or_else(|| OciError::InvalidInput(format!("invalid OCI image tag {value:?}")))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Tag {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
+    }
+
     fn numeric_user(value: Option<&str>) -> Result<(u32, u32)> {
         let value = value.unwrap_or_default().trim();
         if value.is_empty() {
@@ -1655,9 +1634,9 @@ mod image {
             if platform.os != host.os || platform.arch != host.architecture {
                 return Err(ParseImageConfigError::Platform {
                     image_os: platform.os,
-                    image_architecture: platform.arch,
+                    image_arch: platform.arch,
                     host_os: host.os.clone(),
-                    host_architecture: host.architecture.clone(),
+                    host_arch: host.architecture.clone(),
                 });
             }
 
@@ -1673,14 +1652,12 @@ mod image {
 
     #[derive(Debug, thiserror::Error)]
     pub enum ParseImageConfigError {
-        #[error(
-            "image platform {image_os}/{image_architecture} does not match host {host_os}/{host_architecture}"
-        )]
+        #[error("image platform {image_os}/{image_arch} does not match host {host_os}/{host_arch}")]
         Platform {
             image_os: platform::OS,
-            image_architecture: platform::Arch,
+            image_arch: platform::Arch,
             host_os: platform::OS,
-            host_architecture: platform::Arch,
+            host_arch: platform::Arch,
         },
         #[error("rootfs has {diff_id_count} diff IDs but manifest has {layer_count} layers")]
         Rootfs {
@@ -1701,7 +1678,9 @@ mod registry {
     use reqwest::Url;
     use serde::{Deserialize, Deserializer, de};
 
-    use super::{ImageName, ImageTag, OciError, digest};
+    use crate::oci::image;
+
+    use super::{OciError, digest};
 
     #[derive(Debug)]
     pub struct Loc {
@@ -1709,7 +1688,7 @@ mod registry {
     }
 
     impl Loc {
-        pub fn docker_hub(name: &ImageName, tag: &ImageTag) -> Result<Self, OciError> {
+        pub fn docker_hub(name: &image::Name, tag: &image::Tag) -> Result<Self, OciError> {
             format!("https://registry-1.docker.io/v2/{name}/manifests/{tag}").parse()
         }
     }
@@ -1801,17 +1780,16 @@ mod registry {
 }
 
 mod digest {
-    use std::{
-        fmt::{self, Display},
-        str::FromStr,
-    };
+    use std::str::FromStr;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
     use sha2::{Digest as _, Sha256};
 
     use super::ParseValueError;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    #[derive(derive_more::Debug, derive_more::Display, Clone, PartialEq, Eq, Hash)]
+    #[debug("{_0}")]
+    #[display("{_0}")]
     pub struct Sha256Digest(String);
 
     impl From<&[u8]> for Sha256Digest {
@@ -1854,12 +1832,6 @@ mod digest {
         }
     }
 
-    impl Display for Sha256Digest {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            self.0.fmt(formatter)
-        }
-    }
-
     impl Serialize for Sha256Digest {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -1882,10 +1854,7 @@ mod digest {
 }
 
 mod platform {
-    use std::{
-        fmt::{self, Display},
-        str::FromStr,
-    };
+    use std::str::FromStr;
 
     use serde::{Deserialize, Deserializer, Serialize, de};
 
@@ -1907,9 +1876,9 @@ mod platform {
             let arch = match std::env::consts::ARCH {
                 "x86_64" => "amd64",
                 "aarch64" => "arm64",
-                architecture => {
+                arch => {
                     return Err(OciError::InvalidInput(format!(
-                        "unsupported host architecture {architecture:?}"
+                        "unsupported host architecture {arch:?}"
                     )));
                 }
             };
@@ -1945,7 +1914,9 @@ mod platform {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[derive(derive_more::Debug, derive_more::Display, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[debug("{_0}")]
+    #[display("{_0}")]
     #[serde(transparent)]
     pub struct OS(String);
 
@@ -1968,12 +1939,6 @@ mod platform {
         }
     }
 
-    impl Display for OS {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            self.0.fmt(formatter)
-        }
-    }
-
     impl<'de> Deserialize<'de> for OS {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
@@ -1985,7 +1950,9 @@ mod platform {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[derive(derive_more::Debug, derive_more::Display, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[debug("{_0}")]
+    #[display("{_0}")]
     #[serde(transparent)]
     pub struct Arch(String);
 
@@ -2008,12 +1975,6 @@ mod platform {
         }
     }
 
-    impl Display for Arch {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            self.0.fmt(formatter)
-        }
-    }
-
     impl<'de> Deserialize<'de> for Arch {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
@@ -2022,6 +1983,39 @@ mod platform {
             String::deserialize(deserializer)?
                 .parse()
                 .map_err(de::Error::custom)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OciStoreError {
+    #[error(transparent)]
+    Fetch(#[from] OciError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
+    #[error("OCI image {0} is not pulled")]
+    NotFound(image::Reference),
+    #[error("OCI image {0} must be stopped before removal")]
+    Running(image::Reference),
+    #[error("failed to start OCI image {reference}: {start}; cleanup also failed: {cleanup}")]
+    StartCleanup {
+        reference: image::Reference,
+        start: Box<LifecycleError>,
+        cleanup: Box<LifecycleError>,
+    },
+}
+
+impl From<OciStoreError> for ApiError {
+    fn from(error: OciStoreError) -> Self {
+        match error {
+            OciStoreError::Fetch(error) => Self::from(error),
+            OciStoreError::Lifecycle(error) => Self::from(error),
+            OciStoreError::NotFound(_) => Self::NotFound(error.to_string()),
+            OciStoreError::Running(_) => Self::Conflict(error.to_string()),
+            OciStoreError::StartCleanup { .. } => {
+                tracing::error!(%error, "the OCI VM startup rollback failed");
+                Self::InternalServerError(error.to_string())
+            }
         }
     }
 }
@@ -2137,9 +2131,8 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::{
-        ApiError, FetchedImage, ImageName, ImageReference, ImageTag, OciEntry, OciFetcher,
-        OciStatus, OciStore, OciStoreError, OciVmManager, PullInput, ReferenceInput, descriptor,
-        digest, image, oci_schema, platform,
+        ApiError, FetchedImage, OciEntry, OciFetcher, OciStatus, OciStore, OciStoreError,
+        OciVmManager, PullInput, ReferenceInput, descriptor, digest, image, oci_schema, platform,
     };
 
     const TOKEN: &str = "fixture-token";
@@ -2648,10 +2641,10 @@ mod tests {
         .expect("fixture configuration should parse")
     }
 
-    fn fixture_reference() -> ImageReference {
-        ImageReference {
-            name: "fixture".parse::<ImageName>().expect("valid image name"),
-            tag: "latest".parse::<ImageTag>().expect("valid image tag"),
+    fn fixture_reference() -> image::Reference {
+        image::Reference {
+            name: "fixture".parse::<image::Name>().expect("valid image name"),
+            tag: "latest".parse::<image::Tag>().expect("valid image tag"),
         }
     }
 
@@ -3052,7 +3045,7 @@ mod tests {
             .await
             .expect("running image should be idempotent");
         assert_eq!(running.status, OciStatus::Running);
-        assert_eq!(repeated.vm_id, running.vm_id);
+        assert_eq!(repeated.id, running.id);
         assert_eq!(
             manager
                 .rootfs
@@ -3074,7 +3067,7 @@ mod tests {
             .await
             .expect("running image should stop");
         assert_eq!(stopped.status, OciStatus::Pulled);
-        assert!(stopped.vm_id.is_none());
+        assert!(stopped.id.is_none());
         assert!(filesystem.exists());
 
         store

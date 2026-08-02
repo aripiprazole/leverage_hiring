@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(config.elhone_addr).await?;
     let elhone = axum::serve(listener, elhone::router(daemon.clone(), standard_rootfs));
 
-    tracing::info!(addr = %config.elhone_addr, "HTTP service started");
+    tracing::info!(addr = %config.elhone_addr, "http service started");
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),

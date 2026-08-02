@@ -18,6 +18,7 @@ axum = "0.8.8"
 barbirolli = { path = "crates/barbirolli", default-features = false }
 barbirolli_derive = { path = "crates/barbirolli_derive" }
 dashmap = "6.2.1"
+derive_more = { version = "2.1.1", features = ["full"] }
 envy = "0.4.2"
 nonempty-collections = "1.4.0"
 fctools = { version = "=0.6.0", default-features = false }

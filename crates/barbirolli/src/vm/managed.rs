@@ -131,7 +131,10 @@ impl SerialConsole {
             stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, path)),
             stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
         };
-        tracing::debug!(?console, "Firecracker serial console attached");
+        tracing::debug!(
+            ?console,
+            "barbirolli attached the Firecracker serial console"
+        );
         Ok(console)
     }
 
@@ -142,7 +145,7 @@ impl SerialConsole {
         err
     )]
     async fn write(&mut self, bytes: &[u8]) -> std::result::Result<(), SerialShutdownError> {
-        tracing::debug!("writing Firecracker serial stdin");
+        tracing::debug!("barbirolli writes to the Firecracker serial input");
         let stdin = self
             .stdin
             .as_mut()
@@ -163,7 +166,7 @@ impl SerialConsole {
         drop(self.stdin.take());
         join_serial_task(&mut self.stdout_task, "stdout").await;
         join_serial_task(&mut self.stderr_task, "stderr").await;
-        tracing::debug!(console = ?self, "Firecracker serial console finished");
+        tracing::debug!(console = ?self, "the Firecracker serial console stopped");
     }
 
     #[tracing::instrument(
@@ -179,7 +182,10 @@ impl SerialConsole {
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
-        tracing::warn!(console = ?self, "Firecracker serial console readers aborted");
+        tracing::warn!(
+            console = ?self,
+            "barbirolli stopped the Firecracker serial-console readers"
+        );
     }
 }
 
@@ -209,7 +215,7 @@ fn spawn_serial_stdout_reader(
                     Ok(0) => break,
                     Ok(read) => read,
                     Err(error) => {
-                        tracing::error!(%error, "failed to read Firecracker stdout");
+                        tracing::error!(%error, "the Firecracker stdout reader failed");
                         break;
                     }
                 };
@@ -219,13 +225,13 @@ fn spawn_serial_stdout_reader(
                 {
                     tracing::error!(
                         %error,
-                        "failed to append Firecracker serial log; continuing to drain stdout"
+                        "the stdout reader continues because the Firecracker serial-log write failed"
                     );
                     recording = false;
                 }
             }
             if recording && let Err(error) = tokio::io::AsyncWriteExt::flush(&mut file).await {
-                tracing::error!(%error, "failed to flush Firecracker serial log");
+                tracing::error!(%error, "the Firecracker serial-log flush failed");
             }
         }
         .instrument(span),
@@ -243,10 +249,10 @@ fn spawn_serial_stderr_reader(mut stderr: FirecrackerStderr, vm_id: VmId) -> Joi
                     Ok(read) => tracing::warn!(
                         byte_count = read,
                         stderr = ?String::from_utf8_lossy(&buffer[..read]),
-                        "Firecracker stderr output"
+                        "the Firecracker process wrote to stderr"
                     ),
                     Err(error) => {
-                        tracing::error!(%error, "failed to read Firecracker stderr");
+                        tracing::error!(%error, "the Firecracker stderr reader failed");
                         break;
                     }
                 }
@@ -260,7 +266,7 @@ async fn join_serial_task(task: &mut Option<JoinHandle<()>>, stream: &'static st
     if let Some(task) = task.take()
         && let Err(error) = task.await
     {
-        tracing::error!(%error, stream, "Firecracker serial reader task failed");
+        tracing::error!(%error, stream, "the Firecracker serial-reader task failed");
     }
 }
 
@@ -342,7 +348,7 @@ impl VmSpec {
 
     #[tracing::instrument(err)]
     fn cleanup_cgroup_and_metrics(&self) -> Result<(), HealthError> {
-        tracing::info!("cleaning up cgroup and metrics");
+        tracing::info!("barbirolli starts cgroup and metrics cleanup");
         let metrics = self.metrics_path();
         let metrics_cleanup = match fs::remove_file(&metrics) {
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
@@ -467,6 +473,7 @@ async fn rollback_vm_with_console(
 }
 
 impl ManagedVm {
+    #[tracing::instrument(skip(spec, barbirolli), fields(vm_id = %spec.id), err)]
     pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
         let network = spec.network.prepare(&spec.bindings).await?;
         let mut vm = match spec.prepare_vm(barbirolli).await {
@@ -541,7 +548,7 @@ impl ManagedVm {
         };
         let metrics = Arc::new(RwLock::new(None));
 
-        Ok(Self {
+        let managed = Self {
             vm,
             network: Some(network),
             failed: false,
@@ -552,7 +559,12 @@ impl ManagedVm {
             metrics,
             console,
             spec,
-        })
+        };
+        tracing::info!(
+            pid = managed.pid.as_raw_pid(),
+            "barbirolli started the managed VM"
+        );
+        Ok(managed)
     }
 
     pub async fn balloon_config(&mut self) -> Result<BalloonDevice> {
@@ -599,7 +611,7 @@ impl ManagedVm {
         }
 
         if let Err(error) = self.shutdown_through_serial(timeout).await {
-            tracing::warn!(%error, vm_id = %self.spec.id, "graceful serial shutdown failed");
+            tracing::warn!(%error, vm_id = %self.spec.id, "the graceful serial shutdown failed");
         }
         if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
             return Ok(());
@@ -640,7 +652,7 @@ impl ManagedVm {
 
     #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     pub async fn cleanup(&mut self) -> Result<()> {
-        tracing::info!("managed vm cleanup");
+        tracing::info!("barbirolli starts managed VM cleanup");
         self.metrics_task.abort();
         if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
             self.console.finish().await;
@@ -709,7 +721,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
 fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = read_metrics(&path, &latest).await {
-            tracing::error!(%error, path = %path.display(), "Firecracker metrics reader stopped");
+            tracing::error!(%error, path = %path.display(), "the Firecracker metrics reader failed");
         }
     })
 }
@@ -721,7 +733,7 @@ async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Resul
         let metrics = match serde_json::from_str(&line) {
             Ok(metrics) => metrics,
             Err(error) => {
-                tracing::warn!(%error, "discarding invalid Firecracker metrics");
+                tracing::warn!(%error, "barbirolli discarded invalid Firecracker metrics");
                 continue;
             }
         };

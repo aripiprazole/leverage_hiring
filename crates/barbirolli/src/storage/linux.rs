@@ -60,7 +60,7 @@ impl VmStore {
         err
     )]
     pub fn new(vm_root: PathBuf, image_root: PathBuf) -> Result<Self> {
-        tracing::info!("creating VM store");
+        tracing::info!("barbirolli creates the VM store");
         create_dir_all(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let vm_root = canonicalize(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let socket_dir = vm_root.join(SOCKET_DIRECTORY);
@@ -357,7 +357,7 @@ struct MountedRootfs {
 impl MountedRootfs {
     #[tracing::instrument(err)]
     fn new(rootfs: &Path) -> Result<Self, RootfsProvisionError> {
-        tracing::info!("attaching rootfs loop device");
+        tracing::info!("barbirolli attaches the rootfs loop device");
         let parent = rootfs.parent().unwrap_or_else(|| Path::new("."));
         let mountpoint = tempfile::Builder::new()
             .prefix(".rootfs-mount-")
@@ -403,7 +403,7 @@ impl MountedRootfs {
             flags,
             None::<&std::ffi::CStr>,
         ) {
-            tracing::error!(?error, "failed to mount rootfs");
+            tracing::error!(?error, "the rootfs mount failed");
             let setup = RootfsProvisionError::operation(
                 "mount rootfs",
                 mounted.mountpoint.path(),
@@ -418,7 +418,7 @@ impl MountedRootfs {
             });
         }
         mounted.mounted = true;
-        tracing::info!("rootfs mounted");
+        tracing::info!("barbirolli mounted the rootfs");
         Ok(mounted)
     }
 
@@ -433,7 +433,7 @@ impl MountedRootfs {
 
     #[tracing::instrument(skip(self), err)]
     fn cleanup(&mut self) -> Result<(), RootfsCleanupError> {
-        tracing::info!("cleaning up rootfs mount");
+        tracing::info!("barbirolli starts rootfs cleanup");
         let unmount = if self.mounted {
             match mount::unmount(self.mountpoint.path(), mount::UnmountFlags::NOFOLLOW) {
                 Ok(()) => {
@@ -480,7 +480,7 @@ impl MountedRootfs {
 impl Drop for MountedRootfs {
     fn drop(&mut self) {
         if let Err(err) = self.cleanup() {
-            tracing::error!(?err, "failed to drop mounted rootfs");
+            tracing::error!(?err, "the mounted-rootfs cleanup failed");
         }
     }
 }
@@ -505,7 +505,10 @@ impl PathDescriptor {
             return Err(StorageError::SocketDirectory);
         }
         if name.as_encoded_bytes().starts_with(".creating-".as_bytes()) {
-            tracing::warn!(path = %self.directory.display(), "removing stale VM creation directory");
+            tracing::warn!(
+                path = %self.directory.display(),
+                "barbirolli removes a stale VM creation directory"
+            );
             remove_dir_all(&self.directory)
                 .map_err(|error| StorageError::io(&self.directory, error))?;
             return Err(StorageError::CreatingDirectory);

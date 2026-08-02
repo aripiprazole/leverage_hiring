@@ -561,6 +561,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "barbirolli",
+ "derive_more",
  "flate2",
  "futures",
  "http-body-util",
