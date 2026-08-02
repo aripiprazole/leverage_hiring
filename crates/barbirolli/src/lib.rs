@@ -10,13 +10,38 @@ mod vm;
 extern crate self as barbirolli;
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test fixture helpers intentionally fail fast instead of exposing recoverable APIs"
+)]
 pub mod support;
 
+use std::path::PathBuf;
+
 pub use idle::IdlePolicy;
-pub use lifecycle::{Barbirolli, LifecycleError, VmStatus, VmSummary};
+pub use lifecycle::{
+    BalloonConfig, BalloonStatistics, Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig,
+    VmStatus, VmSummary,
+};
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};
 pub use vm::{
-    AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId, VmInput, VmSpec,
+    ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId,
+    VmInput, VmSpec,
 };
+
+pub trait IoError {
+    fn from_io_error(path: PathBuf, err: std::io::Error) -> Self;
+}
+
+#[cfg(target_os = "linux")]
+macro_rules! io_error {
+    ($error:ty, $result:expr, $path:expr) => {
+        ($result).map_err(|source| <$error as crate::IoError>::from_io_error($path, source))
+    };
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use io_error;

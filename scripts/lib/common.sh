@@ -114,7 +114,7 @@ runtime_is_prepared() {
 
 require_runtime_artifacts() {
     runtime_is_prepared ||
-        die "runtime artifacts are missing or invalid; run x setup_service first"
+        die "runtime artifacts are missing or invalid; run x setup_daemon first"
 }
 
 validate_integer() {

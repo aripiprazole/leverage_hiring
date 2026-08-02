@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ForwardRule, InterfaceName, Ipv4Addr, NetworkSpec, ParseValueError, PortBinding,
+    VM_NETWORK_POOL, VM_NETWORK_POOL_PREFIX,
+};
 
 use nlink::{
     netlink::{
@@ -20,6 +23,7 @@ pub struct ManagedNetwork {
 }
 
 impl ManagedNetwork {
+    #[tracing::instrument(err)]
     pub async fn cleanup(&self) -> Result<()> {
         self.spec.cleanup(&self.table).await?;
         tracing::info!(
@@ -47,7 +51,7 @@ impl NetworkSpec {
         nftables_conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<()> {
         let tap = route
             .get_link_by_name(self.tap.as_ref())
@@ -58,7 +62,7 @@ impl NetworkSpec {
             .await?;
         route.set_link_up_by_index(tap.ifindex()).await?;
         tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await?;
-        self.install_rules(nftables_conn, host, table, port_bindings)
+        self.install_rules(nftables_conn, host, table, bindings)
             .await
     }
 
@@ -72,7 +76,13 @@ impl NetworkSpec {
             guest_ip = %self.guest_ip
         )
     )]
-    pub async fn prepare(&self, port_bindings: &[PortBinding]) -> Result<ManagedNetwork> {
+    /// Prepares the TAP device, routes, and firewall rules for this VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host network cannot be inspected or configured.
+    /// If setup and rollback both fail, both errors are retained.
+    pub async fn prepare(&self, bindings: &[PortBinding]) -> Result<ManagedNetwork> {
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -111,7 +121,7 @@ impl NetworkSpec {
             .create_persistent()?;
 
         match self
-            .setup(&route_conn, &nftables_conn, &host, &table, port_bindings)
+            .setup(&route_conn, &nftables_conn, &host, &table, bindings)
             .await
         {
             Ok(()) => {
@@ -165,6 +175,7 @@ impl NetworkSpec {
         }
     }
 
+    #[tracing::instrument(err)]
     async fn cleanup(&self, table: &str) -> Result<(), NetworkError> {
         let nftables = match Connection::<Nftables>::new() {
             Ok(connection) => connection
@@ -191,6 +202,12 @@ impl NetworkSpec {
         }
     }
 
+    /// Removes networking left behind by a previously running VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the nftables table or TAP device cannot be removed.
+    #[tracing::instrument(err)]
     pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
         tracing::info!(
             vm_id = %self.vm_id,
@@ -200,13 +217,16 @@ impl NetworkSpec {
         self.cleanup(&format!("fc_vm_{}", self.vm_id)).await
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(err, skip(conn))]
     async fn install_rules(
         &self,
         conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<(), NetworkError> {
+        tracing::info!("installing rules");
         let prerouting_chain = Chain::new(table, "prerouting")?
             .family(Family::Ip)
             .hook(Hook::Prerouting)
@@ -237,7 +257,7 @@ impl NetworkSpec {
             .match_oif(host.as_ref())
             .masquerade();
 
-        let plan = self.firewall_plan(port_bindings);
+        let plan = self.firewall_plan(bindings);
         let mut transaction = conn
             .transaction()
             .add_table(table, Family::Ip)
@@ -253,8 +273,8 @@ impl NetworkSpec {
                     .family(Family::Ip)
                     .match_iif(host.as_ref())
                     .match_daddr_v4_not(
-                        forward.destination_exclusion.network,
-                        forward.destination_exclusion.prefix,
+                        forward.dest_exclusion.network,
+                        forward.dest_exclusion.prefix,
                     )
                     .match_tcp_dport(forward.external.into())
                     .dnat(forward.guest_ip, Some(forward.internal.into()))
@@ -264,8 +284,8 @@ impl NetworkSpec {
                 Rule::new(table, "output")
                     .family(Family::Ip)
                     .match_daddr_v4_not(
-                        forward.destination_exclusion.network,
-                        forward.destination_exclusion.prefix,
+                        forward.dest_exclusion.network,
+                        forward.dest_exclusion.prefix,
                     )
                     .match_tcp_dport(forward.external.into())
                     .dnat(forward.guest_ip, Some(forward.internal.into()))
@@ -402,7 +422,7 @@ mod tests {
         Connection, DefaultRouteCandidate, Family, NetworkError, NetworkSpec, Nftables,
         overlaps_vm_pool, select_default_route,
     };
-    use crate::{Port, PortBinding, support};
+    use crate::{Port, PortBinding, ProvisioningConfig, support};
     use barbirolli::VmStatus;
     use barbirolli_derive::firecracker_test;
     use nlink::netlink::nftables::{CmpOp, RuleExpr};
@@ -449,12 +469,9 @@ mod tests {
 
     #[firecracker_test]
     async fn vms_are_isolated_and_can_reach_an_http_server_on_lima() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let vms = fixture
-            .create_vms_concurrently::<2>(
-                [TestVmConfig::new(1, 128), TestVmConfig::new(1, 128)],
-                |_| {},
-            )
+            .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |_| {})
             .await;
         let mut running = vms;
         running.sort_by_key(|vm| u16::from(vm.id));
@@ -502,15 +519,15 @@ mod tests {
 
     #[firecracker_test]
     async fn a_published_binding_permits_one_vm_to_reach_another() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let allowed_port = 18_081;
         let blocked_port = 18_082;
         let external_port = available_tcp_port();
         let vms = fixture
             .create_vms_concurrently::<2>(
                 [
-                    TestVmConfig::new(1, 128),
-                    TestVmConfig::new(1, 128).binding(allowed_port, external_port),
+                    TestVmConfig::new(1),
+                    TestVmConfig::new(1).binding(allowed_port, external_port),
                 ],
                 |_| {},
             )

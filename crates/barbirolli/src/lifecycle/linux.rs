@@ -1,4 +1,6 @@
-use super::{LifecycleError, Result, VmStatus, VmSummary, WarmupFailure};
+use super::{
+    BalloonConfig, BalloonStatistics, LifecycleError, Result, VmStatus, VmSummary, WarmupFailure,
+};
 
 use std::{
     fmt::Debug,
@@ -19,12 +21,18 @@ use dashmap::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use nonempty_collections::NEVec;
+use rustix::process::Pid;
+use tokio::{
+    process::Command,
+    time::{MissedTickBehavior, interval},
+};
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    StorageError, VmId, VmInput, VmSpec, VmStore,
+    DaemonConfig, MemoryMib, ProvisioningConfig, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
+    io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
 };
 
@@ -36,12 +44,17 @@ pub enum BarbirolliVm {
     Managed(ManagedVm),
 }
 
+#[derive(Debug, Clone)]
+pub struct Balloon {
+    pub mem: MemoryMib,
+}
+
 pub struct BarbirolliInner {
     pub(crate) vms: DashMap<VmId, BarbirolliVm>,
+    pub balloon: Balloon,
+    pub provisioning: ProvisioningConfig,
     pub store: VmStore,
-    pub firecracker: PathBuf,
-    pub api_socket_dir: PathBuf,
-    pub api_socket_timeout: Duration,
+    pub firecracker: Firecracker,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
     pub idle_policy: IdlePolicy,
@@ -52,93 +65,101 @@ pub struct BarbirolliInner {
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
-    pub async fn new(
-        store: VmStore,
-        firecracker: impl Into<PathBuf>,
-    ) -> Result<Self, LifecycleError> {
-        Self::new_with_idle_policy(store, firecracker, IdlePolicy::default()).await
-    }
-
-    pub async fn new_with_idle_policy(
-        mut store: VmStore,
-        firecracker: impl Into<PathBuf>,
-        idle_policy: IdlePolicy,
-    ) -> Result<Self, LifecycleError> {
-        let firecracker = verify_firecracker(firecracker).await?;
-        tracing::info!(?firecracker, "initializing barbirolli");
-        let specs = store
-            .vm_root
-            .by_ref()
-            .map(|item| item.map(|item| item.persisted_spec.spec))
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        let api_socket_dir = store.vm_root.dir.join(".sockets");
+    /// Creates a lifecycle manager and reconciles persisted VMs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Firecracker cannot be validated, persisted VM state
+    /// cannot be loaded, or one or more VMs fail warmup reconciliation.
+    #[tracing::instrument]
+    pub async fn new(store: VmStore, config: DaemonConfig) -> Result<Self, LifecycleError> {
+        tracing::info!("initializing barbirolli");
+        let firecracker = Firecracker::new(config.firecracker).await?;
+        let specs = store.all()?;
         let barbirolli = Self(Arc::new(BarbirolliInner {
-            vms: DashMap::default(),
-            store,
             firecracker,
-            api_socket_dir,
-            api_socket_timeout: Duration::from_secs(10),
+            vms: DashMap::default(),
+            balloon: Balloon {
+                mem: config.provisioning.initial_balloon_mem,
+            },
+            provisioning: config.provisioning,
+            store,
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
-            idle_policy,
+            idle_policy: config.idle_policy.unwrap_or_default(),
         }));
-        let mut errors = vec![];
-        for spec in specs {
-            if spec.deleted {
-                continue;
-            }
-            if let Err(err) = spec.reconcile(&barbirolli).await {
-                errors.push(WarmupFailure::Reconcile(err));
-                continue;
-            }
-            barbirolli
-                .vms
-                .insert(spec.id, BarbirolliVm::Discovered(spec));
-        }
-        match NEVec::try_from_vec(errors) {
-            Some(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
-            None => {
-                tracing::info!(vm_count = barbirolli.vms.len(), "barbirolli ready");
+        match reconcile(&barbirolli, specs).await {
+            Validated::Fail(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
+            Validated::Good(()) => {
+                tracing::info!("barbirolli ready");
                 Ok(barbirolli)
             }
         }
     }
 
-    pub async fn run_idle_reaper(&self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        while self.is_app_alive().is_ok() {
-            interval.tick().await;
-            for mut vm in self.vms.iter_mut() {
-                let vm = vm.value_mut();
-                vm.check_idle(self).await;
-            }
-        }
-    }
-
-    pub(crate) fn api_socket(&self, vm_id: VmId) -> PathBuf {
-        self.api_socket_dir
-            .join(format!("firecracker-{vm_id}.socket"))
-    }
-
-    pub(crate) fn legacy_api_socket(&self) -> PathBuf {
-        self.api_socket_dir.join("firecracker.socket")
-    }
-
+    /// Returns the VM associated with `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::NotFound`] if the VM is not registered.
     pub fn vm(&self, vm_id: VmId) -> Result<Ref<'_, VmId, BarbirolliVm>> {
         self.vms.get(&vm_id).ok_or(LifecycleError::NotFound(vm_id))
     }
 
+    /// Returns mutable access to the VM associated with `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::NotFound`] if the VM is not registered.
     pub fn vm_mut(&self, vm_id: VmId) -> Result<RefMut<'_, VmId, BarbirolliVm>> {
         self.vms
             .get_mut(&vm_id)
             .ok_or(LifecycleError::NotFound(vm_id))
     }
 
+    /// Prune resources at the host machine by stopping idle vms, and by
+    /// removing idle vms it does free resources to be allocated to used vms
+    pub async fn autoscale(&self) {
+        let mut interval = interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        while self.is_app_alive().is_ok() {
+            interval.tick().await;
+            for mut vm in self.vms.iter_mut() {
+                let vm = vm.value_mut();
+                vm.heartbeat(self).await;
+            }
+        }
+    }
+
+    /// Persists a new discovered VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is draining, capacity is exhausted, or
+    /// the VM artifacts cannot be created.
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.is_app_alive()?;
-        let spec = self.store.create(input).await?;
+        let running_vms = self
+            .vms
+            .iter()
+            .filter(|vm| {
+                matches!(
+                    vm.value(),
+                    BarbirolliVm::Managed(managed) if !managed.failed
+                )
+            })
+            .count();
+        if running_vms >= self.provisioning.count as usize {
+            return Err(LifecycleError::CapacityReached {
+                running_vms,
+                max_running_vms: self.provisioning.count,
+            });
+        }
+        let spec = self
+            .store
+            .create(input, self.provisioning.default_vm_mem)
+            .await?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
         tracing::info!(
@@ -161,6 +182,12 @@ impl Barbirolli {
         .boxed()
     }
 
+    /// Shuts down and soft-deletes a VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is draining, the VM is not registered,
+    /// shutdown fails, or the deleted state cannot be persisted.
     #[tracing::instrument(skip(self), fields(%vm_id, operation = "delete"), err)]
     pub async fn delete(&self, vm_id: VmId) -> Result<(), LifecycleError> {
         self.is_app_alive()?;
@@ -170,36 +197,35 @@ impl Barbirolli {
         tracing::info!(status = "deleting", "VM state transition");
         let () = {
             let vm = vm.get_mut();
-            vm.shutdown(&self).await?;
-            self.store.delete(&vm.spec())?;
+            vm.shutdown(self).await?;
+            self.store.delete(vm.spec())?;
         };
         vm.remove();
         tracing::info!(status = "deleted", "VM state transition");
         Ok(())
     }
 
+    /// Drains the manager and shuts down every registered VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an aggregate error when one or more VMs fail to shut down.
     #[tracing::instrument(skip(self), fields(vm_count = self.vms.len()), err)]
     pub async fn shutdown(&self) -> Result<(), LifecycleError> {
         tracing::info!("draining barbirolli");
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
-        let ids = self.vms.iter().map(|vm| *vm.key()).collect::<Vec<_>>();
-        for id in ids {
-            tracing::info!(?id, "shutting down");
-            let Some(mut vm) = self.vms.get_mut(&id) else {
-                continue;
-            };
-            if let Err(err) = vm.shutdown(self).await {
-                errors.push(Box::new(err))
+        for mut vm in self.vms.iter_mut() {
+            tracing::info!(id = ?vm.key(), "shutting down");
+            if let Err(err) = vm.value_mut().shutdown(self).await {
+                errors.push(Box::new(err));
             }
         }
-        match NEVec::try_from_vec(errors) {
-            Some(errors) => Err(LifecycleError::Shutdown(Validated::Fail(errors))),
-            None => {
-                tracing::info!("barbirolli shutdown complete");
-                Ok(())
-            }
+        if let Some(errors) = NEVec::try_from_vec(errors) {
+            return Err(LifecycleError::Shutdown(Validated::Fail(errors)));
         }
+        tracing::info!("barbirolli shutdown complete");
+        Ok(())
     }
 
     fn is_app_alive(&self) -> Result<()> {
@@ -211,27 +237,28 @@ impl Barbirolli {
     }
 }
 
-pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathBuf> {
-    let firecracker = firecracker.into();
-    let output = tokio::process::Command::new(&firecracker)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
-    let version = if output.stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).trim().to_owned()
+async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {
+    let mut errors = vec![];
+    for spec in specs {
+        if spec.deleted {
+            continue;
+        }
+        match spec.reconcile(barbirolli).await {
+            Ok(()) => {
+                barbirolli
+                    .vms
+                    .insert(spec.id, BarbirolliVm::Discovered(spec));
+            }
+            Err(err) => {
+                errors.push(WarmupFailure::Reconcile(err));
+            }
+        }
+    }
+    if let Some(errors) = NEVec::try_from_vec(errors) {
+        Validated::Fail(errors)
     } else {
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-    if output.status.success() && version.starts_with("Firecracker v1.13.") {
-        tracing::debug!(
-            path = %firecracker.display(),
-            %version,
-            "verified Firecracker executable"
-        );
-        Ok(firecracker)
-    } else {
-        Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+        tracing::info!(vm_count = barbirolli.vms.len(), "reconciliation done");
+        Validated::Good(())
     }
 }
 
@@ -252,27 +279,92 @@ impl BarbirolliVm {
             Self::Discovered(spec) => VmSummary {
                 id: spec.id,
                 status: VmStatus::Discovered,
-                port_bindings: spec.port_bindings.clone(),
+                bindings: spec.bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Failed(spec) => VmSummary {
                 id: spec.id,
                 status: VmStatus::Failed,
-                port_bindings: spec.port_bindings.clone(),
+                bindings: spec.bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Managed(vm) if vm.failed => VmSummary {
                 id: vm.spec.id,
                 status: VmStatus::Failed,
-                port_bindings: vm.spec.port_bindings.clone(),
+                bindings: vm.spec.bindings.clone(),
                 network: vm.spec.network.clone(),
             },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
                 status: VmStatus::Running,
-                port_bindings: vm.spec.port_bindings.clone(),
+                bindings: vm.spec.bindings.clone(),
                 network: vm.spec.network.clone(),
             },
+        }
+    }
+
+    pub fn balloon_config<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+    ) -> BoxFuture<'a, Result<BalloonConfig>> {
+        async move {
+            barbirolli.is_app_alive()?;
+            let config = self
+                .managed_for("read balloon config")?
+                .balloon_config()
+                .await?;
+            Ok(BalloonConfig {
+                amount_mib: config.amount_mib,
+                deflate_on_oom: config.deflate_on_oom,
+                stats_polling_interval_s: config.stats_polling_interval_s,
+            })
+        }
+        .boxed()
+    }
+
+    pub fn update_balloon<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+        amount_mib: MemoryMib,
+    ) -> BoxFuture<'a, Result<()>> {
+        async move {
+            barbirolli.is_app_alive()?;
+            self.managed_for("update balloon")?
+                .update_balloon(amount_mib.into())
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    pub fn balloon_statistics<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+    ) -> BoxFuture<'a, Result<BalloonStatistics>> {
+        async move {
+            barbirolli.is_app_alive()?;
+            let statistics = self
+                .managed_for("read balloon statistics")?
+                .balloon_statistics()
+                .await?;
+            Ok(BalloonStatistics {
+                target_mib: statistics.target_mib,
+                actual_mib: statistics.actual_mib,
+            })
+        }
+        .boxed()
+    }
+
+    fn managed_for(&mut self, operation: &'static str) -> Result<&mut ManagedVm> {
+        let vm_id = self.id();
+        let status = self.summary().status;
+        match self {
+            Self::Managed(managed) if !managed.failed => Ok(managed),
+            _ => Err(LifecycleError::InvalidTransition {
+                vm_id,
+                operation,
+                status,
+            }),
         }
     }
 
@@ -301,7 +393,7 @@ impl BarbirolliVm {
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
-    fn check_idle<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, ()> {
+    fn heartbeat<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, ()> {
         let vm_id = self.id();
         async move {
             let Some(Observation {
@@ -333,24 +425,24 @@ impl BarbirolliVm {
                     "VM idle strike"
                 ),
                 IdleDecision::Shutdown => {
-                    self.final_idle_check_and_shutdown(sample.instance_pid, barbirolli)
+                    self.final_heartbeat_and_shutdown(sample.instance_pid, barbirolli)
                         .await;
                 }
             }
         }
-        .instrument(info_span!("check_idle", %vm_id, operation = "idle_check"))
+        .instrument(info_span!("heartbeat", %vm_id, operation = "heartbeat"))
         .boxed()
     }
 
     #[tracing::instrument(skip(self, barbirolli))]
-    fn final_idle_check_and_shutdown<'a>(
+    fn final_heartbeat_and_shutdown<'a>(
         &'a mut self,
         expected_pid: i32,
         barbirolli: &'a Barbirolli,
     ) -> BoxFuture<'a, ()> {
         let vm_id = self.id();
         async move {
-            if !matches!(self, Self::Managed(managed) if managed.pid == expected_pid) {
+            if !matches!(self, Self::Managed(managed) if managed.pid.as_raw_pid() == expected_pid) {
                 tracing::debug!("VM instance changed before final idle check");
                 return;
             }
@@ -368,7 +460,7 @@ impl BarbirolliVm {
             }
         }
         .instrument(info_span!(
-            "final_idle_check_and_shutdown",
+            "final_heartbeat_and_shutdown",
             %vm_id,
             operation = "idle_shutdown"
         ))
@@ -379,6 +471,7 @@ impl BarbirolliVm {
     pub fn start<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, Result<()>> {
         let vm_id = self.id();
         async move {
+            barbirolli.is_app_alive()?;
             let spec = match self {
                 BarbirolliVm::Discovered(spec) => spec.clone(),
                 BarbirolliVm::Failed(spec) => {
@@ -453,5 +546,102 @@ impl BarbirolliVm {
         }
         .instrument(info_span!("shutdown_vm", %vm_id, operation = "shutdown"))
         .boxed()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Firecracker {
+    pub bin: PathBuf,
+    pub api_socket_timeout: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PidError {
+    #[error("failed to access pid resource {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the Firecracker process could not be identified")]
+    ProcessNotFound,
+}
+
+impl crate::IoError for PidError {
+    fn from_io_error(path: PathBuf, source: std::io::Error) -> Self {
+        Self::Io { path, source }
+    }
+}
+
+impl Firecracker {
+    pub async fn new(firecracker: impl Into<PathBuf>) -> Result<Firecracker> {
+        let firecracker = firecracker.into();
+        let output = Command::new(&firecracker)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
+        let version = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        if output.status.success() && version.starts_with("Firecracker v1.13.") {
+            tracing::debug!(
+                path = %firecracker.display(),
+                %version,
+                "verified Firecracker executable"
+            );
+            Ok(Firecracker {
+                bin: firecracker,
+                api_socket_timeout: Duration::from_secs(10),
+            })
+        } else {
+            Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+        }
+    }
+
+    #[tracing::instrument(err)]
+    pub(crate) async fn pid(&self, spec: &VmSpec) -> Result<Pid, PidError> {
+        let api_socket: PathBuf = spec.api_socket.clone().into();
+        let expected_socket = api_socket.as_os_str().as_encoded_bytes();
+        let expected_firecracker = self.bin.as_os_str().as_encoded_bytes();
+        let expected_id = format!("barbirolli-{}", spec.id);
+        let mut proc = io_error!(
+            PidError,
+            tokio::fs::read_dir("/proc").await,
+            PathBuf::from("/proc")
+        )?;
+        while let Some(entry) =
+            io_error!(PidError, proc.next_entry().await, PathBuf::from("/proc"))?
+        {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(command) = tokio::fs::read(entry.path().join("cmdline")).await else {
+                continue;
+            };
+            let arguments = command
+                .split(|byte| *byte == 0)
+                .filter(|argument| !argument.is_empty())
+                .collect::<Vec<_>>();
+            if arguments
+                .first()
+                .is_some_and(|arg| *arg == expected_firecracker)
+                && arguments
+                    .windows(2)
+                    .any(|args| args[0] == b"--api-sock" && args[1] == expected_socket)
+                && arguments
+                    .windows(2)
+                    .any(|args| args[0] == b"--id" && args[1] == expected_id.as_bytes())
+            {
+                return Pid::from_raw(pid).ok_or(PidError::ProcessNotFound);
+            }
+        }
+        Err(PidError::ProcessNotFound)
     }
 }

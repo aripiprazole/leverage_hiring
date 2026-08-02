@@ -1,6 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, LifecycleError, VmId, VmSpec, VmStore, VmSummary};
+use barbirolli::{
+    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmId, VmSpec, VmStore, VmSummary,
+};
 use derive_more::{Deref, DerefMut};
 use futures::future::try_join_all;
 use tempfile::TempDir;
@@ -47,7 +49,14 @@ pub struct BehaviorVmFixture {
     pub storage: VmStorageFixture,
 }
 
+impl Default for BehaviorFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BehaviorFixture {
+    #[must_use]
     pub fn new() -> Self {
         let temporary = tempfile::tempdir().expect("failed to create temporary storage");
         let vm_root = temporary.path().join("vms");
@@ -87,15 +96,31 @@ impl BehaviorFixture {
     }
 
     pub async fn manager(&self) -> BehaviorManagerFixture {
-        let store = self.storage.open().store;
-        let manager = Barbirolli::new(store, self.firecracker.clone())
+        self.manager_with_provisioning(ProvisioningConfig::default())
             .await
-            .expect("failed to create Barbirolli");
+    }
+
+    pub async fn manager_with_provisioning(
+        &self,
+        provisioning: ProvisioningConfig,
+    ) -> BehaviorManagerFixture {
+        let store = self.storage.open().store;
+        let manager = Barbirolli::new(
+            store,
+            DaemonConfig {
+                provisioning,
+                firecracker: self.firecracker.clone(),
+                idle_policy: None,
+            },
+        )
+        .await
+        .expect("failed to create Barbirolli");
         BehaviorManagerFixture { manager }
     }
 }
 
 impl StorageEnvironmentFixture {
+    #[must_use]
     pub fn open(&self) -> StoreFixture {
         StoreFixture {
             store: VmStore::new(self.vm_root.clone(), self.image_root.clone())
@@ -108,7 +133,10 @@ impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
         let spec = self
             .store
-            .create(config.into_input())
+            .create(
+                config.into_input(),
+                ProvisioningConfig::default().default_vm_mem,
+            )
             .await
             .expect("failed to create stored VM");
         StoredVmFixture::new(spec)
@@ -176,6 +204,7 @@ impl BehaviorManagerFixture {
         vms
     }
 
+    #[must_use]
     pub fn vm(&self, id: VmId) -> BehaviorVmFixture {
         self.try_vm(id).expect("missing manager VM")
     }

@@ -13,10 +13,6 @@ categories.workspace = true
 keywords.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-local = ["elhone/local"]
-
 [workspace.dependencies]
 axum = "0.8.8"
 barbirolli = { path = "crates/barbirolli", default-features = false }

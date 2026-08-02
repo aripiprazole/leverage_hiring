@@ -35,7 +35,7 @@ pub(crate) struct PortForward {
     pub external: Port,
     pub guest_ip: Ipv4Addr,
     pub internal: Port,
-    pub destination_exclusion: Ipv4Network,
+    pub dest_exclusion: Ipv4Network,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -76,11 +76,15 @@ pub struct NetworkSpec {
 }
 
 impl NetworkSpec {
+    /// Builds the deterministic network allocation for `vm_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the derived TAP interface name is invalid.
     pub fn new(vm_id: VmId) -> std::result::Result<Self, ParseValueError> {
         let id = u16::from(vm_id);
         let offset = id * 4;
-        let third = (offset / 256) as u8;
-        let fourth = (offset % 256) as u8;
+        let [third, fourth] = offset.to_be_bytes();
         let guest = fourth + 2;
 
         Ok(Self {
@@ -93,10 +97,12 @@ impl NetworkSpec {
         })
     }
 
+    #[must_use]
     pub fn subnet_cidr(&self) -> String {
         format!("{}/30", self.subnet)
     }
 
+    #[must_use]
     pub fn kernel_boot_args(&self) -> String {
         format!(
             "keep_bootcon console=ttyS0 reboot=k panic=1 ip={}::{}:255.255.255.252::eth0:off nameserver=1.1.1.1",
@@ -110,7 +116,7 @@ impl NetworkSpec {
             internal: binding.internal,
             external: binding.external,
             guest_ip: self.guest_ip,
-            destination_exclusion: Ipv4Network {
+            dest_exclusion: Ipv4Network {
                 network: VM_NETWORK_POOL,
                 prefix: VM_NETWORK_POOL_PREFIX,
             },
@@ -224,7 +230,7 @@ mod tests {
                 external: Port::try_from(2222).expect("valid external port"),
                 guest_ip: Ipv4Addr::new(172, 16, 0, 2),
                 internal: Port::try_from(22).expect("valid internal port"),
-                destination_exclusion: Ipv4Network {
+                dest_exclusion: Ipv4Network {
                     network: Ipv4Addr::new(172, 16, 0, 0),
                     prefix: 16,
                 },
@@ -244,7 +250,7 @@ mod tests {
             external: Port::try_from(2222).expect("valid external port"),
             guest_ip: Ipv4Addr::new(172, 16, 0, 2),
             internal: Port::try_from(22).expect("valid internal port"),
-            destination_exclusion: Ipv4Network {
+            dest_exclusion: Ipv4Network {
                 network: Ipv4Addr::new(172, 16, 0, 0),
                 prefix: 16,
             },

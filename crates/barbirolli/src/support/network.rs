@@ -28,10 +28,12 @@ pub struct LimaHttpFixture {
 }
 
 impl VmNetworkFixture {
+    #[must_use]
     pub fn new(spec: NetworkSpec) -> Self {
         Self { spec }
     }
 
+    #[must_use]
     pub fn url(&self, port: u16) -> String {
         format!("http://{}:{port}", self.spec.guest_ip)
     }
@@ -95,6 +97,7 @@ impl LimaHttpFixture {
         Self { port, task }
     }
 
+    #[must_use]
     pub fn url_for(&self, vm: &VmNetworkFixture) -> String {
         format!("http://{}:{}", vm.spec.host_ip, self.port)
     }
@@ -106,6 +109,7 @@ impl Drop for LimaHttpFixture {
     }
 }
 
+#[must_use]
 pub fn available_tcp_port() -> u16 {
     StdTcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
         .expect("failed to reserve an available TCP port")

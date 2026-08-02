@@ -11,14 +11,13 @@ Usage: x create [options]
 
 Options:
   --vcpu-count <count>          Number of vCPUs (1-31). Default: 1.
-  --memory-mib <MiB>            VM memory in MiB (1-2047). Default: 256.
   --publish <external>:<internal>  Publish one external TCP port to one internal port.
   --authorized-key-file <path>   Add one additional authorized public key.
   --help, -h                    Show this help message.
 
 Examples:
   x create
-  x create --vcpu-count 2 --memory-mib 512 --publish 2222:22
+  x create --vcpu-count 2 --publish 2222:22
   x create --authorized-key-file ~/my_key.pub --publish 8080:80
 
 Note:
@@ -40,7 +39,6 @@ if (($# > 0)); then
 fi
 
 vcpu_count="$(validate_integer "vCPU count" 1 1 31)"
-memory_mib="$(validate_integer "memory MiB" 256 1 2047)"
 declare -a authorized_key_files=()
 declare -a publish_mappings=()
 
@@ -49,11 +47,6 @@ while (($# > 0)); do
         --vcpu-count)
             (($# < 2)) && usage_error "missing value for --vcpu-count"
             vcpu_count="$(validate_integer "vCPU count" "$2" 1 31)"
-            shift 2
-            ;;
-        --memory-mib)
-            (($# < 2)) && usage_error "missing value for --memory-mib"
-            memory_mib="$(validate_integer "memory MiB" "$2" 1 2047)"
             shift 2
             ;;
         --publish)
@@ -72,7 +65,7 @@ while (($# > 0)); do
     esac
 done
 
-port_bindings='[]'
+bindings='[]'
 for mapping in "${publish_mappings[@]}"; do
     if [[ "$mapping" != *:* ]]; then
         usage_error "invalid publish mapping $mapping; expected external:internal"
@@ -84,8 +77,8 @@ for mapping in "${publish_mappings[@]}"; do
 
     external="$(validate_integer external-port "${mapping%%:*}" 1 65535)"
     internal="$(validate_integer internal-port "${mapping##*:}" 1 65535)"
-    port_bindings="$(jq -c --argjson external "$external" --argjson internal "$internal" \
-        '. + [{internal: $internal, external: $external}]' <<<"$port_bindings")"
+    bindings="$(jq -c --argjson external "$external" --argjson internal "$internal" \
+        '. + [{internal: $internal, external: $external}]' <<<"$bindings")"
 done
 
 authorized_keys='[]'
@@ -113,9 +106,8 @@ done
 
 payload="$(jq -nc \
     --argjson vcpu_count "$vcpu_count" \
-    --argjson memory_mib "$memory_mib" \
     --argjson authorized_keys "$authorized_keys" \
-    --argjson port_bindings "$port_bindings" \
-    '{vcpu_count: $vcpu_count, memory_mib: $memory_mib, authorized_keys: $authorized_keys, port_bindings: $port_bindings}')"
+    --argjson bindings "$bindings" \
+    '{vcpu_count: $vcpu_count, authorized_keys: $authorized_keys, bindings: $bindings}')"
 
 api_request POST "/vms" "$payload"

@@ -1,11 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
-
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, Request, State, rejection::JsonRejection},
-    http::{StatusCode, header},
-    middleware::{self, Next},
+    extract::{Path, State, rejection::JsonRejection},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -15,49 +11,12 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 #[derive(Clone)]
-pub enum Auth {
-    Bearer(Arc<str>),
-    Local,
-}
-
-impl Auth {
-    pub fn bearer(token: impl Into<Arc<str>>) -> Self {
-        Self::Bearer(token.into())
-    }
-
-    pub fn from_env() -> Result<Self, ConfigError> {
-        if cfg!(feature = "local") {
-            Ok(Self::Local)
-        } else {
-            panic!("not happening")
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("required environment variable {0} is not set")]
-    MissingVariable(&'static str),
-    #[error("ELHONE_TOKEN must not be empty")]
-    EmptyToken,
-    #[error("the local feature requires ELHONE_ADDR to be loopback, got {0}")]
-    NonLoopbackLocal(SocketAddr),
-}
-
-pub fn validate_address(address: SocketAddr) -> Result<SocketAddr, ConfigError> {
-    if cfg!(feature = "local") && !address.ip().is_loopback() {
-        return Err(ConfigError::NonLoopbackLocal(address));
-    }
-    Ok(address)
-}
-
-#[derive(Clone)]
 struct AppState {
-    manager: Arc<Barbirolli>,
+    manager: Barbirolli,
 }
 
-pub fn router(manager: Arc<Barbirolli>, auth: Auth) -> Router {
-    let app = Router::new()
+pub fn router(manager: Barbirolli) -> Router {
+    Router::new()
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{id}", get(vm).delete(delete_vm))
         .route("/vms/{id}/status", get(vm_status))
@@ -70,34 +29,7 @@ pub fn router(manager: Arc<Barbirolli>, auth: Auth) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        );
-
-    if cfg!(feature = "local") {
-        app
-    } else {
-        app.layer(middleware::from_fn_with_state(auth, authorize))
-    }
-}
-
-async fn authorize(
-    State(auth): State<Auth>,
-    request: Request<Body>,
-    next: Next,
-) -> Result<Response, ApiError> {
-    let authorized = match auth {
-        Auth::Local => true,
-        Auth::Bearer(expected) => request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|actual| actual == expected.as_ref()),
-    };
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::Forbidden)
-    }
+        )
 }
 
 #[derive(Serialize)]
@@ -118,7 +50,7 @@ async fn vm(
     Path(id): Path<String>,
 ) -> Result<Json<barbirolli::VmSummary>, ApiError> {
     tracing::info!("get vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     Ok(Json(
         state.manager.vm_mut(id).map_err(ApiError::from)?.summary(),
     ))
@@ -147,7 +79,7 @@ async fn vm_status(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("vm status");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let summary = state.manager.vm_mut(id).map_err(ApiError::from)?.summary();
     Ok(Json(StatusResponse {
         id,
@@ -161,7 +93,7 @@ async fn start_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("start vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
@@ -177,7 +109,7 @@ async fn shutdown_vm(
     Path(id): Path<String>,
 ) -> Result<Json<StatusResponse>, ApiError> {
     tracing::info!("shutdown vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
     vm.shutdown(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
@@ -193,7 +125,7 @@ async fn delete_vm(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     tracing::info!("delete vm");
-    let id = parse_vm_id(id)?;
+    let id = parse_vm_id(&id)?;
     state.manager.delete(id).await.map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -210,8 +142,6 @@ async fn method_not_allowed() -> ApiError {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
-    #[error("forbidden")]
-    Forbidden,
     #[error("{0}")]
     NotFound(String),
     #[error("method not allowed")]
@@ -227,7 +157,6 @@ enum ApiError {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
-            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -245,9 +174,9 @@ impl From<LifecycleError> for ApiError {
             LifecycleError::Storage(StorageError::InvalidInput(_) | StorageError::IdsExhausted) => {
                 Self::UnprocessableEntity(message)
             }
-            LifecycleError::Draining | LifecycleError::InvalidTransition { .. } => {
-                Self::Conflict(message)
-            }
+            LifecycleError::Draining
+            | LifecycleError::CapacityReached { .. }
+            | LifecycleError::InvalidTransition { .. } => Self::Conflict(message),
             LifecycleError::Storage(
                 StorageError::SocketDirectory
                 | StorageError::CreatingDirectory
@@ -290,7 +219,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn parse_vm_id(value: String) -> Result<VmId, ApiError> {
+fn parse_vm_id(value: &str) -> Result<VmId, ApiError> {
     let raw = value
         .parse::<u16>()
         .map_err(|_| ApiError::UnprocessableEntity(format!("invalid VM ID {value:?}")))?;
@@ -306,8 +235,7 @@ mod tests {
     fn vm_input_rejects_artifact_selection() {
         for (field, value) in [("kernel", "vmlinux"), ("rootfs", "alpine.ext4")] {
             let mut input = json!({
-                "vcpu_count": 1,
-                "memory_mib": 128
+                "vcpu_count": 1
             });
             input[field] = value.into();
 
@@ -325,8 +253,7 @@ mod tests {
     fn vm_input_rejects_user() {
         let error = serde_json::from_value::<VmInput>(json!({
             "user": "alice",
-            "vcpu_count": 1,
-            "memory_mib": 128
+            "vcpu_count": 1
         }))
         .expect_err("user must not be accepted");
 
@@ -334,27 +261,25 @@ mod tests {
     }
 
     #[test]
-    fn vm_input_accepts_typed_port_bindings_and_defaults_to_none() {
+    fn vm_input_accepts_typed_bindings_and_defaults_to_none() {
         let without_bindings = serde_json::from_value::<VmInput>(json!({
-            "vcpu_count": 1,
-            "memory_mib": 128
+            "vcpu_count": 1
         }))
-        .expect("port bindings should be optional");
-        assert!(without_bindings.port_bindings.is_empty());
+        .expect("bindings should be optional");
+        assert!(without_bindings.bindings.is_empty());
 
         let with_bindings = serde_json::from_value::<VmInput>(json!({
             "vcpu_count": 1,
-            "memory_mib": 128,
-            "port_bindings": [
+            "bindings": [
                 {
                     "internal": 22,
                     "external": 2222
                 }
             ]
         }))
-        .expect("valid port bindings should deserialize");
+        .expect("valid bindings should deserialize");
         assert_eq!(
-            with_bindings.port_bindings,
+            with_bindings.bindings,
             vec![PortBinding {
                 internal: Port::try_from(22).expect("valid internal port"),
                 external: Port::try_from(2222).expect("valid external port"),
@@ -363,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_input_rejects_zero_port_bindings() {
+    fn vm_input_rejects_zero_bindings() {
         for field in ["internal", "external"] {
             let mut binding = json!({
                 "internal": 22,
@@ -373,12 +298,22 @@ mod tests {
 
             let error = serde_json::from_value::<VmInput>(json!({
                 "vcpu_count": 1,
-                "memory_mib": 128,
-                "port_bindings": [binding]
+                "bindings": [binding]
             }))
             .expect_err("port zero must be rejected");
             assert!(error.to_string().contains("invalid network port"));
         }
+    }
+
+    #[test]
+    fn vm_input_rejects_port_bindings() {
+        let error = serde_json::from_value::<VmInput>(json!({
+            "vcpu_count": 1,
+            "port_bindings": []
+        }))
+        .expect_err("port_bindings must not be accepted");
+
+        assert!(error.to_string().contains("unknown field `port_bindings`"));
     }
 
     #[test]
@@ -388,7 +323,7 @@ mod tests {
             id,
             status: VmStatus::Running,
             network: NetworkSpec::new(id).expect("valid network"),
-            port_bindings: vec![PortBinding {
+            bindings: vec![PortBinding {
                 internal: Port::try_from(22).expect("valid internal port"),
                 external: Port::try_from(2222).expect("valid external port"),
             }],
@@ -399,7 +334,7 @@ mod tests {
             json!({
                 "id": 0,
                 "status": "running",
-                "port_bindings": [
+                "bindings": [
                     {
                         "internal": 22,
                         "external": 2222

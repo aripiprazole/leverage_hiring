@@ -9,8 +9,8 @@ usage() {
 Usage: x <command> [args]
 
 Commands:
-  setup_service    Download and prepare service/runtime artifacts.
-  run_service      Build and run the HTTP service with required privileges.
+  setup_daemon     Download and prepare daemon/runtime artifacts.
+  run_daemon       Build and run the HTTP daemon with required privileges.
   create           Create a new VM.
   ps               List VMs.
   show             Show details for a VM.
@@ -38,8 +38,8 @@ is_supported_command() {
 }
 
 commands=(
-    setup_service
-    run_service
+    setup_daemon
+    run_daemon
     create
     ps
     show
@@ -86,4 +86,3 @@ case "$1" in
         "$SCRIPT_DIR/scripts/$command" "$@"
         ;;
 esac
-

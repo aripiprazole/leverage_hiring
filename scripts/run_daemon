@@ -7,10 +7,10 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x run_service
+Usage: x run_daemon
 
-Build the service with local authentication, then run it with the
-privileges required for KVM, TAP, nftables, and IPv4 forwarding.
+Build the daemon, then run it with the privileges required for KVM,
+TAP, nftables, and IPv4 forwarding.
 EOF
 }
 
@@ -33,10 +33,10 @@ require_runtime_artifacts
 
 mkdir -p "$VM_ROOT" "$CARGO_TARGET_DIR"
 
-info "building the service"
+info "building the daemon"
 (
     cd "$REPO_ROOT"
-    cargo build --features local
+    cargo build
 )
 
 info "starting HTTP at $ELHONE_ADDR"
