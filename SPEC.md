@@ -222,6 +222,7 @@ enum LifecycleError {
 Each `$VM_ROOT/<vm_id>` contains:
 
 - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
+- `vmlinux.config`: the pinned kernel config fragment installed by `scripts/setup_daemon`.
 - `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
 - `config.json`: versioned `VmSpec`.
 
@@ -234,7 +235,7 @@ Each `$VM_ROOT/<vm_id>` contains:
   `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
   file. No key sidecar is written beside the VM artifacts.
 - With no supplied keys, the rootfs keeps the default key embedded in the source image.
-- `scripts/setup_service` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
+- `scripts/setup_daemon` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
 
 ## Host and guest networking
 

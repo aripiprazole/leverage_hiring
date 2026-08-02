@@ -51,8 +51,8 @@ limactl shell --workdir "$PWD" provisioning
 Then, inside Lima:
 
 ```bash
-./x setup_service
-./x run_service
+./x setup_daemon
+./x run_daemon
 ```
 
 ## Example commands
@@ -105,7 +105,7 @@ nix develop --command x help
 ## Examples
 
 Run these from the repository root inside the Linux/Lima guest. Keep
-`./x run_service` running in another Linux/Lima terminal.
+`./x run_daemon` running in another Linux/Lima terminal.
 
 ### SQLite
 
