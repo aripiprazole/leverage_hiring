@@ -1,11 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
-
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, Request, State, rejection::JsonRejection},
-    http::{StatusCode, header},
-    middleware::{self, Next},
+    extract::{Path, State, rejection::JsonRejection},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -15,49 +11,12 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 #[derive(Clone)]
-pub enum Auth {
-    Bearer(Arc<str>),
-    Local,
-}
-
-impl Auth {
-    pub fn bearer(token: impl Into<Arc<str>>) -> Self {
-        Self::Bearer(token.into())
-    }
-
-    pub fn from_env() -> Result<Self, ConfigError> {
-        if cfg!(feature = "local") {
-            Ok(Self::Local)
-        } else {
-            panic!("not happening")
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("required environment variable {0} is not set")]
-    MissingVariable(&'static str),
-    #[error("ELHONE_TOKEN must not be empty")]
-    EmptyToken,
-    #[error("the local feature requires ELHONE_ADDR to be loopback, got {0}")]
-    NonLoopbackLocal(SocketAddr),
-}
-
-pub fn new_addr(address: SocketAddr) -> Result<SocketAddr, ConfigError> {
-    if cfg!(feature = "local") && !address.ip().is_loopback() {
-        return Err(ConfigError::NonLoopbackLocal(address));
-    }
-    Ok(address)
-}
-
-#[derive(Clone)]
 struct AppState {
     manager: Barbirolli,
 }
 
-pub fn router(manager: Barbirolli, auth: Auth) -> Router {
-    let app = Router::new()
+pub fn router(manager: Barbirolli) -> Router {
+    Router::new()
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{id}", get(vm).delete(delete_vm))
         .route("/vms/{id}/status", get(vm_status))
@@ -70,34 +29,7 @@ pub fn router(manager: Barbirolli, auth: Auth) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        );
-
-    if cfg!(feature = "local") {
-        app
-    } else {
-        app.layer(middleware::from_fn_with_state(auth, authorize))
-    }
-}
-
-async fn authorize(
-    State(auth): State<Auth>,
-    request: Request<Body>,
-    next: Next,
-) -> Result<Response, ApiError> {
-    let authorized = match auth {
-        Auth::Local => true,
-        Auth::Bearer(expected) => request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|actual| actual == expected.as_ref()),
-    };
-    if authorized {
-        Ok(next.run(request).await)
-    } else {
-        Err(ApiError::Forbidden)
-    }
+        )
 }
 
 #[derive(Serialize)]
@@ -210,8 +142,6 @@ async fn method_not_allowed() -> ApiError {
 
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
-    #[error("forbidden")]
-    Forbidden,
     #[error("{0}")]
     NotFound(String),
     #[error("method not allowed")]
@@ -227,7 +157,6 @@ enum ApiError {
 impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
-            Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -245,9 +174,9 @@ impl From<LifecycleError> for ApiError {
             LifecycleError::Storage(StorageError::InvalidInput(_) | StorageError::IdsExhausted) => {
                 Self::UnprocessableEntity(message)
             }
-            LifecycleError::Draining | LifecycleError::InvalidTransition { .. } => {
-                Self::Conflict(message)
-            }
+            LifecycleError::Draining
+            | LifecycleError::CapacityReached { .. }
+            | LifecycleError::InvalidTransition { .. } => Self::Conflict(message),
             LifecycleError::Storage(
                 StorageError::SocketDirectory
                 | StorageError::CreatingDirectory

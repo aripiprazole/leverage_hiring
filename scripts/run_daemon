@@ -9,8 +9,8 @@ usage() {
     cat <<'EOF'
 Usage: x run_daemon
 
-Build the daemon with local authentication, then run it with the
-privileges required for KVM, TAP, nftables, and IPv4 forwarding.
+Build the daemon, then run it with the privileges required for KVM,
+TAP, nftables, and IPv4 forwarding.
 EOF
 }
 
@@ -36,7 +36,7 @@ mkdir -p "$VM_ROOT" "$CARGO_TARGET_DIR"
 info "building the daemon"
 (
     cd "$REPO_ROOT"
-    cargo build --features local
+    cargo build
 )
 
 info "starting HTTP at $ELHONE_ADDR"

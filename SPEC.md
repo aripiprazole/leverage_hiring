@@ -10,10 +10,10 @@ Named after [Harry MacElhone](https://en.wikipedia.org/wiki/Harry_MacElhone), a 
 early-twentieth-century New York.
 
 - Built with `axum` around an `Arc<Barbirolli>`.
-- Binds to `ELHONE_ADDR`, defaulting to `127.0.0.1:3000`; `local` rejects non-loopback values.
+- Binds to `ELHONE_ADDR`, defaulting to `127.0.0.1:3000`.
 - JSON responses, including `{"error": "..."}` for errors.
-- Unknown VMs return `404`, invalid state transitions return `409`, invalid input returns `422`,
-  and internal lifecycle failures return `500`.
+- Unknown VMs return `404`, invalid state transitions and exhausted VM capacity return `409`,
+  invalid input returns `422`, and internal lifecycle failures return `500`.
 - Mutating operations on the same VM are serialized.
 
 ## DELETE `/vms/:id`
@@ -59,6 +59,14 @@ responses expose these stable states:
 `starting` and `shutting_down` are transition events emitted in daemon logs. Mutating operations
 on the same VM are serialized, so API readers observe the resulting stable state.
 
+## GET `/vms/:id`
+
+```http
+GET /vms/:id
+```
+
+Returns the state, port bindings, and allocated network of one registered VM.
+
 ## GET `/vms/:id/status`
 
 ```http
@@ -103,7 +111,6 @@ of the request; the service copies both artifacts from `IMAGE_ROOT`. Memory is s
 daemon's provisioning configuration (256 MiB by default) and persisted in `VmSpec`; it is not a
 per-request input. Ports are nonzero `u16` values. A binding
 `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
-External-port uniqueness is a provisioning invariant.
 
 Every new VM is assigned the daemon's `default_vm_mem` (256 MiB), and that value is persisted in
 the VM specification. Provisioning uses integer division for these calculations:
@@ -116,8 +123,8 @@ the VM specification. Provisioning uses integer division for these calculations:
 Firecracker deflates the balloon on guest out-of-memory conditions and collects balloon
 statistics every 10 seconds.
 
-The calculated `count` and `max_daemon_mem` values are planning inputs; VM creation does not
-currently enforce a global VM-count limit or total-memory admission check.
+Before creating a VM, Barbirolli counts the currently running VMs and rejects creation when that
+count reaches the configured `count`. It does not perform a memory/count check.
 
 # Barbirolli: VM and host-resource boundary
 
@@ -229,6 +236,8 @@ struct ApiSocket(PathBuf);
 enum LifecycleError {
     InvalidInput,
     NotFound,
+    Draining,
+    CapacityReached { running_vms: usize, max_running_vms: u32 },
     InvalidTransition,
     Storage,
     Network,
@@ -370,6 +379,17 @@ Creation provisions a stopped VM.
 ```rust
 async fn create(&self, input: VmInput) -> Result<VmId> {
     self.is_app_alive()?;
+    let running_vms = self
+        .vms
+        .iter()
+        .filter(|vm| matches!(vm.value(), BarbirolliVm::Managed(vm) if !vm.failed))
+        .count();
+    if running_vms >= self.provisioning.count as usize {
+        return Err(CapacityReached {
+            running_vms,
+            max_running_vms: self.provisioning.count,
+        });
+    }
     let spec = self
         .store
         .create(input, self.provisioning.default_vm_mem)
@@ -382,10 +402,12 @@ async fn create(&self, input: VmInput) -> Result<VmId> {
 
 ### Starting a VM
 
-Starting replaces `Discovered(VmSpec)` with `Managed(ManagedVm)`.
+Starting follows `Discovered -> (Managed | Failed)`. Retrying a `Failed` VM first reconciles its
+stale resources and then attempts the same transition again.
 
 ```rust
 async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+    barbirolli.is_app_alive()?;
     let spec = match self {
         Self::Discovered(spec) => spec.clone(),
         Self::Failed(spec) => {
@@ -513,8 +535,9 @@ async fn delete(&self, vm_id: VmId) -> Result<()> {
 
 ### Warmup and recovery
 
-At startup Barbirolli reads every versioned config. Active VMs are reconciled and registered as
-`Discovered`; deleted VMs only count toward ID allocation. No VM starts automatically.
+At startup Barbirolli reads every versioned config. Every non-deleted VM is reconciled before it is
+registered as `Discovered`; any reconciliation failure prevents startup. Deleted VMs only count
+toward ID allocation. No VM starts automatically.
 
 ```rust
 /// kills all processe stale processes on the application startup, stale
@@ -579,18 +602,14 @@ The timing and CPU bands are configurable with `IDLE_INITIAL_INTERVAL_SECONDS`,
 
 ## Testing
 
-- `cargo-mutants` exercises meaningful business and lifecycle logic.
-- Unit tests exist to verify behavior rather than only to increase coverage.
-- The test suite covers API state transitions, concurrent operations, restart discovery, rollback,
-  cleanup, address allocation, network isolation, and one complete privileged Firecracker
-  lifecycle.
+- `cargo-mutants` + unit tests for agents + integration tests
+- Test suite covers concurrent operations, restart discovery, cleanup, address allocation,
+  network isolation, and one complete privileged Firecracker lifecycle.
 
 ```rust
 #[firecracker_test]
 fn bla_test() {}
 ```
 
-Every test that queries the Firecracker API uses this macro from `barbirolli_derive`. The macro
-allocates a unique VM ID and serializes privileged tests. It runs locally when Linux, KVM,
-Firecracker, and the image artifacts are available; otherwise `RUN_ON_LIMA` reruns the selected
-test inside Lima.
+Every test that queries the Firecracker API uses this macro from `barbirolli_derive`.
+`RUN_ON_LIMA` handles the complete test environment and reruns the selected test inside Lima.

@@ -55,9 +55,11 @@ mod tests {
 
     use barbirolli::support::{firecracker::FirecrackerFixture, ssh::SshKeyFixture};
 
+    use crate::ProvisioningConfig;
+
     #[firecracker_test]
     async fn authorized_key_allows_an_ssh_connection_to_the_vm() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let key = SshKeyFixture::generate().await;
         let vm = fixture
             .create_vm(TestVmConfig::new(1).authorized_key(key.public_key.clone()))

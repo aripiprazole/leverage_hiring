@@ -402,7 +402,7 @@ mod tests {
         Connection, DefaultRouteCandidate, Family, NetworkError, NetworkSpec, Nftables,
         overlaps_vm_pool, select_default_route,
     };
-    use crate::{Port, PortBinding, support};
+    use crate::{Port, PortBinding, ProvisioningConfig, support};
     use barbirolli::VmStatus;
     use barbirolli_derive::firecracker_test;
     use nlink::netlink::nftables::{CmpOp, RuleExpr};
@@ -449,7 +449,7 @@ mod tests {
 
     #[firecracker_test]
     async fn vms_are_isolated_and_can_reach_an_http_server_on_lima() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let vms = fixture
             .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |_| {})
             .await;
@@ -499,7 +499,7 @@ mod tests {
 
     #[firecracker_test]
     async fn a_published_binding_permits_one_vm_to_reach_another() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let allowed_port = 18_081;
         let blocked_port = 18_082;
         let external_port = available_tcp_port();

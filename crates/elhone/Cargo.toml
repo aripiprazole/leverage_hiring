@@ -4,10 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-default = []
-local = []
-
 [dependencies]
 axum.workspace = true
 barbirolli.workspace = true

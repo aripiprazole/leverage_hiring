@@ -30,7 +30,7 @@ pub struct FirecrackerVmFixture {
 }
 
 impl FirecrackerFixture {
-    pub async fn new() -> Self {
+    pub async fn new(provisioning: ProvisioningConfig) -> Self {
         let temporary = tempfile::Builder::new()
             .prefix("barbirolli-firecracker-")
             .tempdir_in("/var/tmp")
@@ -53,7 +53,7 @@ impl FirecrackerFixture {
         let manager = Barbirolli::new(
             store,
             DaemonConfig {
-                provisioning: ProvisioningConfig::default(),
+                provisioning,
                 firecracker: firecracker.clone(),
                 idle_policy: None,
             },
@@ -72,12 +72,17 @@ impl FirecrackerFixture {
     }
 
     pub async fn create_vm(&self, config: TestVmConfig) -> FirecrackerVmFixture {
-        let id = self
-            .manager
-            .create(config.into_input())
+        self.try_create_vm(config)
             .await
-            .expect("failed to create fixture VM");
-        self.vm(id)
+            .expect("failed to create fixture VM")
+    }
+
+    pub async fn try_create_vm(
+        &self,
+        config: TestVmConfig,
+    ) -> Result<FirecrackerVmFixture, barbirolli::LifecycleError> {
+        let id = self.manager.create(config.into_input()).await?;
+        Ok(self.vm(id))
     }
 
     pub async fn create_vms_concurrently<const N: usize>(

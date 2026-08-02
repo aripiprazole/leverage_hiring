@@ -1,4 +1,4 @@
-use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 
 use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, VmStore};
 use serde::Deserialize;
@@ -72,12 +72,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    let addr = elhone::new_addr(config.elhone_addr)?;
-    let listener = TcpListener::bind(addr).await?;
-    let elhone = axum::serve(
-        listener,
-        elhone::router(daemon.clone(), elhone::Auth::from_env()?),
-    );
+    let listener = TcpListener::bind(config.elhone_addr).await?;
+    let elhone = axum::serve(listener, elhone::router(daemon.clone()));
 
     tracing::info!(%addr, "HTTP service started");
     let service = tokio::select! {

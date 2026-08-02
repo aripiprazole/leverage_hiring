@@ -118,6 +118,22 @@ impl Barbirolli {
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.is_app_alive()?;
+        let running_vms = self
+            .vms
+            .iter()
+            .filter(|vm| {
+                matches!(
+                    vm.value(),
+                    BarbirolliVm::Managed(managed) if !managed.failed
+                )
+            })
+            .count();
+        if running_vms >= self.provisioning.count as usize {
+            return Err(LifecycleError::CapacityReached {
+                running_vms,
+                max_running_vms: self.provisioning.count,
+            });
+        }
         let spec = self
             .store
             .create(input, self.provisioning.default_vm_mem)

@@ -111,6 +111,13 @@ pub enum LifecycleError {
     NotFound(VmId),
     #[error("lifecycle operations are draining")]
     Draining,
+    #[error(
+        "cannot create VM: {running_vms} running VMs reached the configured limit of {max_running_vms}"
+    )]
+    CapacityReached {
+        running_vms: usize,
+        max_running_vms: u32,
+    },
     #[error("cannot {operation} VM {vm_id} while it is {status:?}")]
     InvalidTransition {
         vm_id: VmId,
@@ -132,7 +139,7 @@ pub enum LifecycleError {
 #[cfg(test)]
 mod tests {
     use barbirolli::support;
-    use barbirolli::{BalloonConfig, ProvisioningConfig, VmStatus};
+    use barbirolli::{BalloonConfig, LifecycleError, ProvisioningConfig, VmStatus};
     use barbirolli_derive::firecracker_test;
 
     use support::{config::TestVmConfig, firecracker::FirecrackerFixture};
@@ -149,8 +156,28 @@ mod tests {
     }
 
     #[firecracker_test]
+    async fn creation_rejects_when_running_vm_capacity_is_reached() {
+        let mut provisioning = ProvisioningConfig::default();
+        provisioning.count = 1;
+        let fixture = FirecrackerFixture::new(provisioning).await;
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+        vm.lifecycle.start(|_| {}).await;
+
+        let result = fixture.try_create_vm(TestVmConfig::new(1)).await;
+
+        assert!(matches!(
+            result,
+            Err(LifecycleError::CapacityReached {
+                running_vms: 1,
+                max_running_vms: 1,
+            })
+        ));
+        fixture.finish().await;
+    }
+
+    #[firecracker_test]
     async fn guest_balloon_inflates_and_deflates() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let vm = fixture.create_vm(TestVmConfig::new(1)).await;
 
         vm.lifecycle.start(|_| {}).await;
@@ -173,7 +200,7 @@ mod tests {
 
     #[firecracker_test]
     async fn per_vm_api_sockets_support_concurrent_vms_and_repeated_lifecycle_calls() {
-        let fixture = FirecrackerFixture::new().await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
 
         let first = fixture.create_vm(TestVmConfig::new(1)).await;
         first
@@ -218,7 +245,7 @@ mod tests {
 
     #[firecracker_test]
     async fn concurrent_vms_keep_private_disks_across_manager_restart_and_delete_together() {
-        let mut fixture = FirecrackerFixture::new().await;
+        let mut fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         let mut vms = fixture
             .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |vms| {
                 assert_eq!(vms.len(), 2);
@@ -306,7 +333,66 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod behavior {
         use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
-        use barbirolli::{LifecycleError, MemoryMib, NetworkSpec, VmId, VmStatus};
+        use barbirolli::{
+            LifecycleError, MemoryMib, NetworkSpec, ProvisioningConfig, VmId, VmStatus,
+        };
+
+        #[tokio::test]
+        async fn manager_rejects_creation_when_running_vm_capacity_is_reached() {
+            let fixture = BehaviorFixture::new();
+            let mut provisioning = ProvisioningConfig::default();
+            provisioning.count = 0;
+            let manager = fixture.manager_with_provisioning(provisioning).await;
+
+            let result = manager.try_create_vm(TestVmConfig::new(1)).await;
+
+            assert!(matches!(
+                result,
+                Err(LifecycleError::CapacityReached {
+                    running_vms: 0,
+                    max_running_vms: 0,
+                })
+            ));
+            assert!(manager.list().await.is_empty());
+            assert!(fixture.storage.open().discover().is_empty());
+            manager.finish().await;
+        }
+
+        #[tokio::test]
+        async fn manager_capacity_does_not_count_discovered_or_failed_vms() {
+            let fixture = BehaviorFixture::new();
+            let mut provisioning = ProvisioningConfig::default();
+            provisioning.count = 1;
+            let manager = fixture.manager_with_provisioning(provisioning).await;
+
+            let discovered = manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("discovered VM should not consume running capacity");
+            manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("another discovered VM should not consume running capacity");
+            let failed_spec = barbirolli::Barbirolli::vm(&manager, discovered.id)
+                .expect("missing discovered VM")
+                .spec()
+                .clone();
+            manager.vms.insert(
+                discovered.id,
+                super::super::BarbirolliVm::Failed(failed_spec.clone()),
+            );
+
+            manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("failed VM should not consume running capacity");
+            assert_eq!(manager.list().await.len(), 3);
+            manager.vms.insert(
+                discovered.id,
+                super::super::BarbirolliVm::Discovered(failed_spec),
+            );
+            manager.finish().await;
+        }
 
         #[tokio::test]
         async fn manager_exposes_discovered_state_and_missing_vm_errors() {
