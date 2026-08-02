@@ -59,6 +59,7 @@ impl FirecrackerFixture {
             store,
             DaemonConfig {
                 provisioning,
+                provision_rootfs: true,
                 firecracker: firecracker.clone(),
                 entrypoint: entrypoint.clone(),
                 idle_policy: None,
@@ -176,6 +177,7 @@ impl FirecrackerFixture {
             store,
             DaemonConfig {
                 provisioning: ProvisioningConfig::default(),
+                provision_rootfs: true,
                 firecracker: self.firecracker.clone(),
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,

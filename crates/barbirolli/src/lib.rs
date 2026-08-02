@@ -26,6 +26,8 @@ pub use lifecycle::{
     VmStatus, VmSummary,
 };
 pub use network::{InterfaceName, NetworkSpec};
+#[cfg(target_os = "linux")]
+pub use storage::{RootfsBuilder, RootfsProvisionError};
 pub use storage::{StorageError, VmStore};
 pub use vm::{
     ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, Rootfs, VcpuCount,

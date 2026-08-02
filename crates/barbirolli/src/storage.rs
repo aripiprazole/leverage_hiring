@@ -47,7 +47,7 @@ impl StorageError {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::fs;
+    use std::{fs, io};
 
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
     use barbirolli::{Port, PortBinding, Rootfs};
@@ -56,16 +56,26 @@ mod tests {
 
     use barbirolli::support::{firecracker::FirecrackerFixture, ssh::SshKeyFixture};
 
+    use super::RootfsProvisionError;
     use crate::ProvisioningConfig;
+
+    fn read_entrypoint(rootfs: &Rootfs) -> Result<Option<Vec<u8>>, RootfsProvisionError> {
+        rootfs.provision(|builder| match builder.read("barbirolli_entrypoint") {
+            Ok(contents) => Ok(Some(contents)),
+            Err(RootfsProvisionError::Operation { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        })
+    }
 
     #[firecracker_test]
     async fn daemon_installs_the_entrypoint_and_authorized_key_before_boot() {
         let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
         assert_eq!(
-            fixture
-                .source_rootfs()
-                .read_entrypoint()
-                .expect("failed to inspect source rootfs"),
+            read_entrypoint(&fixture.source_rootfs()).expect("failed to inspect source rootfs"),
             None,
             "the input rootfs must not already contain the daemon-owned entrypoint"
         );
@@ -74,8 +84,7 @@ mod tests {
             .create_vm(TestVmConfig::new(1).authorized_key(key.public_key.clone()))
             .await;
         assert_eq!(
-            Rootfs::from(vm.storage.rootfs())
-                .read_entrypoint()
+            read_entrypoint(&Rootfs::from(vm.storage.rootfs()))
                 .expect("failed to inspect private rootfs"),
             Some(fs::read(&fixture.entrypoint).expect("failed to read daemon entrypoint")),
             "Barbirolli must install the entrypoint into the copied input rootfs"

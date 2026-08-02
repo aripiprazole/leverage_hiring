@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             firecracker: config.firecracker,
             entrypoint: config.barbirolli_entrypoint,
             provisioning: ProvisioningConfig::default(),
+            provision_rootfs: true,
             idle_policy: Some(IdlePolicy {
                 initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
                 strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),

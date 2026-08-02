@@ -3,13 +3,12 @@ use super::{Result, StorageError};
 use std::{
     collections::HashMap,
     fs::{
-        canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
-        set_permissions,
+        Permissions, canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all,
+        rename, set_permissions,
     },
     future::Future,
     io,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use nonempty_collections::NEVec;
@@ -17,13 +16,15 @@ use rustix::mount;
 use serde::{Deserialize, Serialize};
 use validated::Validated;
 
-use crate::{ApiSocket, AuthorizedKey, MemoryMib, NetworkSpec, Rootfs, VmId, VmInput, VmSpec};
+use crate::{ApiSocket, MemoryMib, NetworkSpec, Rootfs, VmId, VmInput, VmSpec};
 
 const CONFIG_VERSION: u16 = 4;
 const SOCKET_DIRECTORY: &str = ".sockets";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RootfsProvisionError {
+    #[error("rootfs provisioning path must be relative: {path}")]
+    InvalidPath { path: PathBuf },
     #[error("{operation} failed for {path}: {source}")]
     Operation {
         operation: &'static str,
@@ -288,134 +289,103 @@ impl RootfsProvisionError {
     }
 }
 
-#[tracing::instrument(err)]
-fn install_authorized_keys(
-    rootfs: &Path,
-    authorized_keys: &[u8],
-) -> Result<(), RootfsProvisionError> {
-    tracing::info!("installing authorized keys");
-    let ssh_directory = rootfs.join("root/.ssh");
-    create_dir_all(&ssh_directory).map_err(|error| {
-        RootfsProvisionError::operation("create root SSH directory", &ssh_directory, error)
-    })?;
-    set_permissions(&ssh_directory, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
-        RootfsProvisionError::operation("set root SSH directory permissions", &ssh_directory, error)
-    })?;
-
-    let destination = ssh_directory.join("authorized_keys");
-    std::fs::write(&destination, authorized_keys).map_err(|error| {
-        RootfsProvisionError::operation("install authorized keys", &destination, error)
-    })?;
-    set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
-        RootfsProvisionError::operation("set authorized keys permissions", &destination, error)
-    })?;
-    tracing::info!("installed authorized keys");
-    Ok(())
+pub struct RootfsBuilder<'rootfs> {
+    rootfs: &'rootfs Path,
 }
 
-#[tracing::instrument(err)]
-fn install_entrypoint(rootfs: &Path, entrypoint: &Path) -> Result<(), RootfsProvisionError> {
-    tracing::info!(source = %entrypoint.display(), "installing guest entrypoint");
-    let destination = rootfs.join("barbirolli_entrypoint");
-    copy(entrypoint, &destination).map_err(|error| {
-        RootfsProvisionError::operation("install guest entrypoint", &destination, error)
-    })?;
-    set_permissions(&destination, std::fs::Permissions::from_mode(0o755)).map_err(|error| {
-        RootfsProvisionError::operation("set guest entrypoint permissions", &destination, error)
-    })?;
-    tracing::info!(destination = %destination.display(), "installed guest entrypoint");
-    Ok(())
+impl RootfsBuilder<'_> {
+    /// Creates a directory inside the mounted rootfs and applies `permissions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` escapes the rootfs or the directory cannot
+    /// be created or have its permissions changed.
+    pub fn create_folder(
+        &self,
+        path: impl AsRef<Path>,
+        permissions: Permissions,
+    ) -> Result<(), RootfsProvisionError> {
+        let path = self.resolve(path.as_ref())?;
+        create_dir_all(&path).map_err(|error| {
+            RootfsProvisionError::operation("create rootfs directory", &path, error)
+        })?;
+        set_permissions(&path, permissions).map_err(|error| {
+            RootfsProvisionError::operation("set rootfs directory permissions", &path, error)
+        })
+    }
+
+    /// Writes a file inside the mounted rootfs and applies `permissions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` escapes the rootfs or the file cannot be
+    /// written or have its permissions changed.
+    pub fn write(
+        &self,
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+        permissions: Permissions,
+    ) -> Result<(), RootfsProvisionError> {
+        let path = self.resolve(path.as_ref())?;
+        std::fs::write(&path, contents)
+            .map_err(|error| RootfsProvisionError::operation("write rootfs file", &path, error))?;
+        set_permissions(&path, permissions).map_err(|error| {
+            RootfsProvisionError::operation("set rootfs file permissions", &path, error)
+        })
+    }
+
+    /// Reads a file inside the mounted rootfs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` escapes the rootfs or the file cannot be
+    /// read.
+    pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, RootfsProvisionError> {
+        let path = self.resolve(path.as_ref())?;
+        std::fs::read(&path)
+            .map_err(|error| RootfsProvisionError::operation("read rootfs file", path, error))
+    }
+
+    fn resolve(&self, path: &Path) -> Result<PathBuf, RootfsProvisionError> {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+        {
+            return Err(RootfsProvisionError::InvalidPath {
+                path: path.to_owned(),
+            });
+        }
+        Ok(self.rootfs.join(path))
+    }
 }
 
 impl Rootfs {
-    /// Mounts this ext4 filesystem and installs daemon-owned guest artifacts.
-    ///
-    /// The entrypoint is always replaced. An empty key list preserves the keys
-    /// already present in the filesystem.
+    /// Mounts this ext4 filesystem and provisions it with `provision`.
     ///
     /// # Errors
     ///
     /// Returns an error if the filesystem cannot be mounted, modified, or
     /// cleanly unmounted.
-    pub fn provision(
+    pub fn provision<T>(
         &self,
-        entrypoint: &Path,
-        authorized_keys: &[AuthorizedKey],
-    ) -> Result<(), RootfsProvisionError> {
+        provision: impl FnOnce(&RootfsBuilder<'_>) -> Result<T, RootfsProvisionError>,
+    ) -> Result<T, RootfsProvisionError> {
         let mounted = MountedRootfs::new(self.as_ref())?;
-        let setup = (|| {
-            install_entrypoint(mounted.path(), entrypoint)?;
-            if !authorized_keys.is_empty() {
-                let mut contents = authorized_keys
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                contents.push('\n');
-                install_authorized_keys(mounted.path(), contents.as_bytes())?;
-            }
-            Ok(())
-        })();
-        finish_rootfs_setup(mounted, setup)
-    }
-
-    /// Mounts this ext4 filesystem and replaces root's authorized keys.
-    ///
-    /// An empty key list preserves the keys already present in the filesystem.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the filesystem cannot be mounted, modified, or
-    /// cleanly unmounted.
-    pub fn plant_authorized_keys(
-        &self,
-        authorized_keys: &[AuthorizedKey],
-    ) -> Result<(), RootfsProvisionError> {
-        if authorized_keys.is_empty() {
-            return Ok(());
+        let setup = provision(&RootfsBuilder {
+            rootfs: mounted.path(),
+        });
+        let cleanup = mounted.finish();
+        match (setup, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(setup), Ok(())) => Err(setup),
+            (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+            (Err(setup), Err(cleanup)) => Err(RootfsProvisionError::SetupCleanup {
+                setup: Box::new(setup),
+                cleanup,
+            }),
         }
-
-        let mut contents = authorized_keys
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<_>>()
-            .join("\n");
-        contents.push('\n');
-        let mounted = MountedRootfs::new(self.as_ref())?;
-        let setup = install_authorized_keys(mounted.path(), contents.as_bytes());
-        finish_rootfs_setup(mounted, setup)
-    }
-
-    #[cfg(test)]
-    pub fn read_entrypoint(&self) -> Result<Option<Vec<u8>>, RootfsProvisionError> {
-        let mounted = MountedRootfs::new(self.as_ref())?;
-        let path = mounted.path().join("barbirolli_entrypoint");
-        let setup = match std::fs::read(&path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(RootfsProvisionError::operation(
-                "read guest entrypoint",
-                path,
-                error,
-            )),
-        };
-        finish_rootfs_setup(mounted, setup)
-    }
-}
-
-fn finish_rootfs_setup<T>(
-    mounted: MountedRootfs,
-    setup: Result<T, RootfsProvisionError>,
-) -> Result<T, RootfsProvisionError> {
-    let cleanup = mounted.finish();
-    match (setup, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(setup), Ok(())) => Err(setup),
-        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
-        (Err(setup), Err(cleanup)) => Err(RootfsProvisionError::SetupCleanup {
-            setup: Box::new(setup),
-            cleanup,
-        }),
     }
 }
 
@@ -741,16 +711,25 @@ impl Iterator for VmRootFolder {
 mod tests {
     use std::{env, fs, os::unix::fs::PermissionsExt};
 
-    use super::{install_authorized_keys, install_entrypoint};
-
-    use super::{MountedRootfs, VmStore};
+    use super::{MountedRootfs, RootfsBuilder, VmStore};
     use crate::{AuthorizedKey, MemoryMib, Rootfs, VcpuCount, VmInput};
 
     #[test]
     fn authorized_keys_are_installed_for_root_with_strict_permissions() {
         let rootfs = tempfile::tempdir().expect("failed to create fake rootfs");
+        let builder = RootfsBuilder {
+            rootfs: rootfs.path(),
+        };
 
-        install_authorized_keys(rootfs.path(), b"ssh-ed25519 test-key root@example.com\n")
+        builder
+            .create_folder("root/.ssh", fs::Permissions::from_mode(0o700))
+            .expect("failed to create root SSH directory");
+        builder
+            .write(
+                "root/.ssh/authorized_keys",
+                b"ssh-ed25519 test-key root@example.com\n",
+                fs::Permissions::from_mode(0o600),
+            )
             .expect("failed to install authorized keys");
 
         assert_eq!(
@@ -778,15 +757,20 @@ mod tests {
 
     #[test]
     fn entrypoint_is_installed_at_the_kernel_init_path_and_made_executable() {
-        let temporary = tempfile::tempdir().expect("failed to create temporary directory");
-        let source = temporary.path().join("source-entrypoint");
-        let rootfs = temporary.path().join("rootfs");
-        fs::write(&source, b"static entrypoint").expect("failed to create source entrypoint");
-        fs::create_dir(&rootfs).expect("failed to create fake rootfs");
+        let rootfs = tempfile::tempdir().expect("failed to create fake rootfs");
+        let builder = RootfsBuilder {
+            rootfs: rootfs.path(),
+        };
 
-        install_entrypoint(&rootfs, &source).expect("failed to install entrypoint");
+        builder
+            .write(
+                "barbirolli_entrypoint",
+                b"static entrypoint",
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("failed to install entrypoint");
 
-        let destination = rootfs.join("barbirolli_entrypoint");
+        let destination = rootfs.path().join("barbirolli_entrypoint");
         assert_eq!(
             fs::read(&destination).expect("failed to read installed entrypoint"),
             b"static entrypoint"
@@ -833,9 +817,23 @@ mod tests {
             .create(input, MemoryMib::from(128))
             .await
             .expect("failed to create VM");
+        let mut authorized_keys = authorized_keys
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        authorized_keys.push(b'\n');
         creation
             .rootfs
-            .plant_authorized_keys(&authorized_keys)
+            .provision(|builder| {
+                builder.create_folder("root/.ssh", fs::Permissions::from_mode(0o700))?;
+                builder.write(
+                    "root/.ssh/authorized_keys",
+                    authorized_keys,
+                    fs::Permissions::from_mode(0o600),
+                )
+            })
             .expect("failed to plant authorized keys");
         let spec = creation.finish().expect("failed to persist VM");
 

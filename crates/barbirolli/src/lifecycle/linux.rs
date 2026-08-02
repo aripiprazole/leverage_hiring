@@ -4,7 +4,9 @@ use super::{
 
 use std::{
     fmt::Debug,
-    path::PathBuf,
+    fs::{Permissions, read},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,7 +32,8 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    DaemonConfig, MemoryMib, ProvisioningConfig, StorageError, VmId, VmInput, VmSpec, VmStore,
+    AuthorizedKey, DaemonConfig, MemoryMib, ProvisioningConfig, Rootfs, StorageError, VmId,
+    VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
     io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
@@ -168,10 +171,7 @@ impl Barbirolli {
             .create(input, self.provisioning.default_vm_mem)
             .await?;
         if self.provision_rootfs {
-            creation
-                .rootfs
-                .provision(&self.entrypoint, &authorized_keys)
-                .map_err(StorageError::from)?;
+            provision_rootfs(&creation.rootfs, &self.entrypoint, &authorized_keys)?;
         }
         let spec = creation.finish()?;
         let id = spec.id;
@@ -249,6 +249,48 @@ impl Barbirolli {
             Ok(())
         }
     }
+}
+
+fn provision_rootfs(
+    rootfs: &Rootfs,
+    entrypoint: &Path,
+    authorized_keys: &[AuthorizedKey],
+) -> Result<(), StorageError> {
+    let entrypoint_contents = read(entrypoint).map_err(|source| StorageError::Io {
+        path: entrypoint.to_owned(),
+        source,
+    })?;
+    rootfs
+        .provision(|builder| {
+            builder.write(
+                "barbirolli_entrypoint",
+                entrypoint_contents,
+                Permissions::from_mode(0o755),
+            )?;
+            if !authorized_keys.is_empty() {
+                builder.create_folder("root/.ssh", Permissions::from_mode(0o700))?;
+                builder.write(
+                    "root/.ssh/authorized_keys",
+                    authorized_keys_into_bytes(authorized_keys),
+                    Permissions::from_mode(0o600),
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(StorageError::from)
+}
+
+fn authorized_keys_into_bytes(authorized_keys: &[AuthorizedKey]) -> Vec<u8> {
+    let capacity = authorized_keys
+        .iter()
+        .map(|authorized_key| authorized_key.as_ref().len() + 1)
+        .sum();
+    let mut contents = Vec::with_capacity(capacity);
+    for authorized_key in authorized_keys {
+        contents.extend_from_slice(authorized_key.as_ref().as_bytes());
+        contents.push(b'\n');
+    }
+    contents
 }
 
 async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {

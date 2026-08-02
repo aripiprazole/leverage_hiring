@@ -112,10 +112,11 @@ impl BehaviorFixture {
         provisioning: ProvisioningConfig,
     ) -> BehaviorManagerFixture {
         let store = self.storage.open().store;
-        let manager = Barbirolli::new_without_rootfs_provisioning(
+        let manager = Barbirolli::new(
             store,
             DaemonConfig {
                 provisioning,
+                provision_rootfs: false,
                 firecracker: self.firecracker.clone(),
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
@@ -143,16 +144,11 @@ impl StorageEnvironmentFixture {
 impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
         let input = config.into_input(Rootfs::from(self.store.image_root.join("alpine.ext4")));
-        let authorized_keys = input.authorized_keys.clone();
         let creation = self
             .store
             .create(input, ProvisioningConfig::default().default_vm_mem)
             .await
             .expect("failed to create stored VM");
-        creation
-            .rootfs
-            .plant_authorized_keys(&authorized_keys)
-            .expect("failed to plant authorized keys");
         let spec = creation.finish().expect("failed to persist stored VM");
         StoredVmFixture::new(spec)
     }
