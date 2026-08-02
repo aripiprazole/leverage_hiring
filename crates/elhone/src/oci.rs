@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fmt::{self, Display},
     sync::Once,
 };
@@ -8,10 +7,9 @@ use axum::{Extension, Json, extract::rejection::JsonRejection};
 use futures::TryStreamExt;
 use reqwest::{
     Client, Response, StatusCode, Url,
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap, WWW_AUTHENTICATE},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap},
     redirect::Policy,
 };
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::ApiError;
@@ -103,12 +101,17 @@ impl OciFetcher {
         Self::new(TransportPolicy::HttpLoopback, Some(platform))
     }
 
-    #[tracing::instrument(skip(self), fields(url = %location), err)]
-    async fn fetch(&self, location: registry::RegistryLoc) -> Result<api_schema::Run, OciError> {
-        let initial_url = self.transport.parse(&location.manifest)?;
+    #[tracing::instrument(skip(self, token), fields(url = %loc), err)]
+    async fn fetch(&self, loc: registry::Loc, token: String) -> Result<api_schema::Run, OciError> {
+        if token.trim().is_empty() {
+            return Err(OciError::InvalidInput(
+                "OCI bearer token must not be empty".to_owned(),
+            ));
+        }
+        let initial_url = self.transport.parse(&loc.manifest)?;
         tracing::warn!(
-            url = %location.manifest,
-            host = location.manifest.host_str().unwrap_or_default(),
+            url = %loc.manifest,
+            host = loc.manifest.host_str().unwrap_or_default(),
             "fetching OCI data from a caller-supplied registry URL"
         );
 
@@ -116,7 +119,7 @@ impl OciFetcher {
             Some(ref platform) => platform.clone(),
             None => platform::HostPlatform::current()?,
         };
-        let mut session = FetchSession::new(&self.client, self.transport);
+        let mut session = FetchSession::new(&self.client, token);
         let initial = session.fetch_manifest(initial_url, None).await?;
 
         let (index, selected_platform, manifest) = match initial {
@@ -126,7 +129,7 @@ impl OciFetcher {
                 media_kind,
             } => {
                 let selected = host.select_platform(&document.manifests)?;
-                let manifest_url = location.manifest_url(&selected.digest)?;
+                let manifest_url = loc.manifest_url(&selected.digest)?;
                 let manifest_url = self.transport.parse(&manifest_url)?;
                 let fetched = session
                     .fetch_manifest(manifest_url, Some(&selected))
@@ -150,26 +153,23 @@ impl OciFetcher {
             FetchedManifest::Manifest(fetched) => (None, None, fetched),
         };
 
-        let config_url = location.blob_url(&manifest.document.config.digest)?;
-        let config = session
-            .fetch_config(
-                self.transport.parse(&config_url)?,
-                &manifest.document.config,
-            )
-            .await?;
-        let config = image::Config::new(config, &host, &manifest.document.layers)?;
+        let config = image::Config::new(&host, &manifest.document.layers, {
+            let url = loc.blob_url(&manifest.document.config.digest)?;
+            let url = self.transport.parse(&url)?;
+            session.fetch_config(url, &manifest.document.config).await?
+        })?;
 
         let platform = config.platform(selected_platform);
         let image = config.response();
         let mut layers = Vec::with_capacity(manifest.document.layers.len());
         for descriptor in &manifest.document.layers {
-            let layer_url = location.blob_url(&descriptor.digest)?;
+            let layer_url = loc.blob_url(&descriptor.digest)?;
             let layer_url = self.transport.parse(&layer_url)?;
             layers.push(session.fetch_layer(layer_url, descriptor).await?);
         }
 
         Ok(api_schema::Run {
-            url: location.manifest.to_string(),
+            url: loc.manifest.to_string(),
             platform,
             index,
             manifest: api_schema::Manifest {
@@ -208,7 +208,7 @@ pub async fn run(
 ) -> Result<Json<api_schema::Run>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     fetcher
-        .fetch(input.url)
+        .fetch(input.url, input.token)
         .await
         .map(Json)
         .map_err(ApiError::from)
@@ -216,17 +216,15 @@ pub async fn run(
 
 struct FetchSession<'a> {
     client: &'a Client,
-    transport: TransportPolicy,
-    bearer_token: Option<String>,
+    bearer_token: String,
 }
 
 impl<'a> FetchSession<'a> {
-    #[tracing::instrument(skip(client))]
-    fn new(client: &'a Client, transport: TransportPolicy) -> Self {
+    #[tracing::instrument(skip(client, bearer_token))]
+    fn new(client: &'a Client, bearer_token: String) -> Self {
         Self {
             client,
-            transport,
-            bearer_token: None,
+            bearer_token,
         }
     }
 
@@ -236,32 +234,32 @@ impl<'a> FetchSession<'a> {
         url: OutboundUrl<'_>,
         expected: Option<&descriptor::Manifest>,
     ) -> Result<FetchedManifest, OciError> {
-        let fetched = self
+        let bytes = self
             .fetch_bytes(
                 url,
                 media::ACCEPT,
                 expected.map(|descriptor| descriptor.expectation()),
             )
             .await?;
-        let document = serde_json::from_slice::<oci_schema::ManifestDocument>(&fetched.body)
+        let document = serde_json::from_slice::<oci_schema::ManifestDocument>(&bytes.body)
             .map_err(|source| OciError::Json {
                 url: url.to_string(),
                 source,
             })?;
         match document {
             oci_schema::ManifestDocument::Index(document) => Ok(FetchedManifest::Index {
-                digest: fetched.digest,
-                media_kind: resolve_media_kind::<media::IndexMedia>(
-                    fetched.content_type.as_deref(),
+                digest: bytes.digest,
+                media_kind: resolve_media_kind(
+                    bytes.content_type.as_deref(),
                     document.media_kind.clone(),
                 )?,
                 document,
             }),
             oci_schema::ManifestDocument::Manifest(document) => {
                 Ok(FetchedManifest::Manifest(FetchedImageManifest {
-                    digest: fetched.digest,
+                    digest: bytes.digest,
                     kind: resolve_media_kind(
-                        fetched.content_type.as_deref(),
+                        bytes.content_type.as_deref(),
                         document.media_kind.clone(),
                     )?,
                     document,
@@ -276,10 +274,10 @@ impl<'a> FetchSession<'a> {
         url: OutboundUrl<'_>,
         desc: &descriptor::Config,
     ) -> Result<oci_schema::ImageConfig, OciError> {
-        let fetched = self
+        let bytes = self
             .fetch_bytes(url, desc.media_kind.as_ref(), Some(desc.expectation()))
             .await?;
-        serde_json::from_slice(&fetched.body).map_err(|source| OciError::Json {
+        serde_json::from_slice(&bytes.body).map_err(|source| OciError::Json {
             url: url.to_string(),
             source,
         })
@@ -372,66 +370,21 @@ impl<'a> FetchSession<'a> {
     }
 
     #[tracing::instrument(skip(self), fields(url = %url), err)]
-    async fn get(&mut self, url: OutboundUrl<'_>, accept: &str) -> Result<Response, OciError> {
-        let response = self.send(url, accept).await?;
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return ensure_success(url.as_ref(), response);
-        }
-
-        let challenge = bearer_challenge(response.headers(), url.as_ref())?;
-        self.bearer_token = Some(self.fetch_token(&challenge).await?);
+    async fn get(&self, url: OutboundUrl<'_>, accept: &str) -> Result<Response, OciError> {
         ensure_success(url.as_ref(), self.send(url, accept).await?)
     }
 
     #[tracing::instrument(skip(self), fields(url = %url), err)]
     async fn send(&self, url: OutboundUrl<'_>, accept: &str) -> Result<Response, OciError> {
-        let mut request = self.client.get(url.as_ref().clone()).header(ACCEPT, accept);
-        if let Some(token) = &self.bearer_token {
-            request = request.bearer_auth(token);
-        }
-        request.send().await.map_err(|source| OciError::Request {
-            url: url.to_string(),
-            source,
-        })
-    }
-
-    #[tracing::instrument(skip(self, challenge), fields(realm = %challenge.realm), err)]
-    async fn fetch_token(&self, challenge: &BearerChallenge) -> Result<String, OciError> {
-        let mut token_url = challenge.realm.clone();
-        {
-            let mut query = token_url.query_pairs_mut();
-            if let Some(service) = &challenge.service {
-                query.append_pair("service", service);
-            }
-            if let Some(scope) = &challenge.scope {
-                query.append_pair("scope", scope);
-            }
-        }
-        let token_url = self.transport.parse(&token_url)?;
-
-        let response = self
-            .client
-            .get(token_url.as_ref().clone())
+        self.client
+            .get(url.as_ref().clone())
+            .header(ACCEPT, accept)
+            .bearer_auth(&self.bearer_token)
             .send()
             .await
             .map_err(|source| OciError::Request {
-                url: token_url.to_string(),
+                url: url.to_string(),
                 source,
-            })?;
-        let response = ensure_success(token_url.as_ref(), response)?;
-        let token = response
-            .json::<TokenResponse>()
-            .await
-            .map_err(|source| OciError::Request {
-                url: token_url.to_string(),
-                source,
-            })?;
-        token
-            .token
-            .or(token.access_token)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                OciError::Authentication("token service returned no bearer token".to_owned())
             })
     }
 }
@@ -510,76 +463,6 @@ struct FetchedImageManifest {
     document: oci_schema::ImageManifest,
     digest: digest::Sha256Digest,
     kind: media::ManifestMediaKind,
-}
-
-#[derive(Debug)]
-struct BearerChallenge {
-    realm: Url,
-    service: Option<String>,
-    scope: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    token: Option<String>,
-    access_token: Option<String>,
-}
-
-#[tracing::instrument(skip(headers), fields(url = %url), err)]
-fn bearer_challenge(headers: &HeaderMap, url: &Url) -> Result<BearerChallenge, OciError> {
-    let value = headers
-        .get(WWW_AUTHENTICATE)
-        .ok_or_else(|| {
-            OciError::Authentication("registry returned 401 without a challenge".to_owned())
-        })?
-        .to_str()
-        .map_err(|source| OciError::Header {
-            url: url.to_string(),
-            source,
-        })?;
-    let (scheme, parameters) = value.split_once(' ').ok_or_else(|| {
-        OciError::Authentication(
-            "registry returned a malformed authentication challenge".to_owned(),
-        )
-    })?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return Err(OciError::Authentication(format!(
-            "unsupported registry authentication scheme {scheme:?}"
-        )));
-    }
-
-    let parameters = parse_auth_parameters(parameters)?;
-    let realm = parameters
-        .get("realm")
-        .ok_or_else(|| OciError::Authentication("bearer challenge has no realm".to_owned()))?;
-    let realm = Url::parse(realm)
-        .map_err(|error| OciError::Authentication(format!("invalid bearer realm: {error}")))?;
-    Ok(BearerChallenge {
-        realm,
-        service: parameters.get("service").cloned(),
-        scope: parameters.get("scope").cloned(),
-    })
-}
-
-#[tracing::instrument(err)]
-fn parse_auth_parameters(value: &str) -> Result<BTreeMap<String, String>, OciError> {
-    let mut parameters = BTreeMap::new();
-    for parameter in value.split(',') {
-        let (key, value) = parameter.trim().split_once('=').ok_or_else(|| {
-            OciError::Authentication("malformed bearer challenge parameter".to_owned())
-        })?;
-        let value = value.trim();
-        if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
-            return Err(OciError::Authentication(
-                "bearer challenge values must be quoted".to_owned(),
-            ));
-        }
-        parameters.insert(
-            key.to_ascii_lowercase(),
-            value[1..value.len() - 1].to_owned(),
-        );
-    }
-    Ok(parameters)
 }
 
 #[tracing::instrument(skip(headers))]
@@ -770,7 +653,8 @@ mod api_schema {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RunInput {
-        pub url: registry::RegistryLoc,
+        pub url: registry::Loc,
+        pub token: String,
     }
 
     #[derive(Debug, Serialize)]
@@ -1038,9 +922,9 @@ mod image {
 
     impl Config {
         pub fn new(
-            doc: oci_schema::ImageConfig,
             host: &platform::HostPlatform,
             layers: &[descriptor::Layer],
+            doc: oci_schema::ImageConfig,
         ) -> Result<Self> {
             let platform = Platform::new(doc.platform, host)?;
             let oci_schema::Rootfs::Layers { diff_ids } = &doc.rootfs;
@@ -1164,11 +1048,11 @@ mod registry {
     use super::{OciError, digest};
 
     #[derive(Debug)]
-    pub struct RegistryLoc {
+    pub struct Loc {
         pub manifest: Url,
     }
 
-    impl FromStr for RegistryLoc {
+    impl FromStr for Loc {
         type Err = OciError;
 
         fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -1203,7 +1087,7 @@ mod registry {
         }
     }
 
-    impl<'de> Deserialize<'de> for RegistryLoc {
+    impl<'de> Deserialize<'de> for Loc {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>,
@@ -1214,13 +1098,13 @@ mod registry {
         }
     }
 
-    impl Display for RegistryLoc {
+    impl Display for Loc {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             self.manifest.fmt(formatter)
         }
     }
 
-    impl RegistryLoc {
+    impl Loc {
         #[tracing::instrument(err)]
         pub fn manifest_url(&self, digest: &digest::Sha256Digest) -> Result<Url, OciError> {
             self.descriptor_url("manifests", digest)
@@ -1358,7 +1242,7 @@ mod platform {
                 "macos" => "darwin",
                 os => os,
             };
-            let architecture = match std::env::consts::ARCH {
+            let arch = match std::env::consts::ARCH {
                 "x86_64" => "amd64",
                 "aarch64" => "arm64",
                 architecture => {
@@ -1371,7 +1255,7 @@ mod platform {
                 os: os
                     .parse()
                     .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
-                architecture: architecture
+                architecture: arch
                     .parse()
                     .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
             })
@@ -1504,8 +1388,6 @@ pub enum OciError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("registry authentication failed: {0}")]
-    Authentication(String),
     #[error("invalid OCI document: {0}")]
     InvalidDocument(String),
     #[error("digest mismatch for {url}: expected {expected}, got {actual}")]
@@ -1559,12 +1441,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::{
-        Extension, Json, Router,
+        Extension, Router,
         body::Body,
         extract::State,
         http::{
             HeaderMap, Request, StatusCode, Uri,
-            header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+            header::{AUTHORIZATION, CONTENT_TYPE},
         },
         response::{IntoResponse, Response},
         routing::{get, post},
@@ -1761,7 +1643,6 @@ mod tests {
 
     #[derive(Clone)]
     struct RegistryState {
-        base_url: String,
         documents: Arc<RegistryDocuments>,
         requests: Arc<Mutex<Vec<String>>>,
     }
@@ -1783,12 +1664,10 @@ mod tests {
             let base_url = format!("http://{address}");
             let requests = Arc::new(Mutex::new(Vec::new()));
             let state = RegistryState {
-                base_url: base_url.clone(),
                 documents: Arc::new(documents),
                 requests: requests.clone(),
             };
             let app = Router::new()
-                .route("/token", get(token))
                 .route("/v2/{*path}", get(registry))
                 .with_state(state);
             let task = tokio::spawn(async move {
@@ -1817,15 +1696,6 @@ mod tests {
         }
     }
 
-    async fn token(State(state): State<RegistryState>) -> Json<Value> {
-        state
-            .requests
-            .lock()
-            .expect("fixture request log should not be poisoned")
-            .push("token".to_owned());
-        Json(json!({ "token": TOKEN }))
-    }
-
     async fn registry(
         State(state): State<RegistryState>,
         headers: HeaderMap,
@@ -1841,15 +1711,7 @@ mod tests {
             .expect("fixture request log should not be poisoned")
             .push(format!("{} authorized={authorized}", uri.path()));
         if !authorized {
-            let challenge = format!(
-                "Bearer realm=\"{}/token\",service=\"fixture-registry\",scope=\"repository:library/fixture:pull\"",
-                state.base_url
-            );
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(WWW_AUTHENTICATE, challenge)
-                .body(Body::empty())
-                .expect("fixture unauthorized response should build");
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
         let path = uri.path();
@@ -1889,7 +1751,7 @@ mod tests {
             .expect("fixture document response should build")
     }
 
-    async fn request_run(fetcher: OciFetcher, url: &str) -> (StatusCode, Value) {
+    async fn request_run(fetcher: OciFetcher, url: &str, token: &str) -> (StatusCode, Value) {
         let app = Router::new()
             .route("/run", post(run))
             .layer(Extension(fetcher));
@@ -1900,7 +1762,7 @@ mod tests {
                     .uri("/run")
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        serde_json::to_vec(&json!({ "url": url }))
+                        serde_json::to_vec(&json!({ "url": url, "token": token }))
                             .expect("request JSON should serialize"),
                     ))
                     .expect("request should build"),
@@ -1975,7 +1837,7 @@ mod tests {
             "amd64".parse().expect("fixture architecture should parse")
         };
 
-        let error = image::Config::new(document, &platform, &layer_descriptors(1))
+        let error = image::Config::new(&platform, &layer_descriptors(1), document)
             .expect_err("a different platform must not produce an image configuration");
 
         assert!(matches!(
@@ -1989,7 +1851,7 @@ mod tests {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let document = configuration_document(&platform, 1);
 
-        let error = image::Config::new(document, &platform, &layer_descriptors(2))
+        let error = image::Config::new(&platform, &layer_descriptors(2), document)
             .expect_err("a mismatched rootfs must not produce an image configuration");
 
         assert!(matches!(
@@ -2002,7 +1864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_fetches_anonymous_host_image_and_verifies_every_layer() {
+    async fn run_forwards_token_and_verifies_every_layer() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2014,6 +1876,7 @@ mod tests {
         let (status, body) = request_run(
             OciFetcher::for_test(platform.clone()),
             &registry.manifest_url,
+            TOKEN,
         )
         .await;
 
@@ -2061,13 +1924,12 @@ mod tests {
         }
 
         let requests = registry.requests();
-        assert!(requests.iter().any(|request| request == "token"));
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.ends_with("authorized=false"))
                 .count(),
-            1
+            0
         );
         assert_eq!(
             requests
@@ -2090,8 +1952,12 @@ mod tests {
         ))
         .await;
 
-        let (status, body) =
-            request_run(OciFetcher::for_test(platform), &registry.manifest_url).await;
+        let (status, body) = request_run(
+            OciFetcher::for_test(platform),
+            &registry.manifest_url,
+            TOKEN,
+        )
+        .await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(body["index"].is_null());
@@ -2107,6 +1973,7 @@ mod tests {
         let (status, body) = request_run(
             OciFetcher::default(),
             "http://registry.example/v2/library/alpine/manifests/latest",
+            TOKEN,
         )
         .await;
 
@@ -2136,8 +2003,12 @@ mod tests {
         ))
         .await;
 
-        let (status, body) =
-            request_run(OciFetcher::for_test(platform), &registry.manifest_url).await;
+        let (status, body) = request_run(
+            OciFetcher::for_test(platform),
+            &registry.manifest_url,
+            TOKEN,
+        )
+        .await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
@@ -2157,8 +2028,12 @@ mod tests {
         ))
         .await;
 
-        let (status, body) =
-            request_run(OciFetcher::for_test(platform), &registry.manifest_url).await;
+        let (status, body) = request_run(
+            OciFetcher::for_test(platform),
+            &registry.manifest_url,
+            TOKEN,
+        )
+        .await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
