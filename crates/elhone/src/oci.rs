@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
     fmt::{self, Display},
-    marker::PhantomData,
     str::FromStr,
+    sync::Once,
 };
 
 use axum::{Extension, Json, extract::rejection::JsonRejection};
@@ -79,9 +79,14 @@ impl Default for OciFetcher {
 impl OciFetcher {
     #[tracing::instrument]
     fn new(transport: TransportPolicy, platform: Option<HostPlatform>) -> Self {
+        install_ring_crypto_provider();
         let client = Client::builder()
             .redirect(Policy::custom(move |attempt| {
-                redirect_policy(attempt, transport)
+                if transport.allows(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
             }))
             .build()
             .expect("static OCI HTTP client configuration should be valid");
@@ -100,7 +105,7 @@ impl OciFetcher {
     }
 
     #[tracing::instrument(skip(self), fields(url = %location), err)]
-    async fn fetch(&self, location: RegistryLoc) -> Result<api_schema::RunResponse, OciError> {
+    async fn fetch(&self, location: RegistryLoc) -> Result<api_schema::Run, OciError> {
         let initial_url = self.transport.parse(&location.manifest)?;
         tracing::warn!(
             url = %location.manifest,
@@ -133,9 +138,9 @@ impl OciFetcher {
                     ));
                 };
                 (
-                    Some(api_schema::DocumentResponse {
+                    Some(api_schema::Document {
                         schema_version: document.schema_version,
-                        media_type,
+                        media_kind,
                         digest,
                         annotations: document.annotations,
                     }),
@@ -151,8 +156,6 @@ impl OciFetcher {
             .fetch_config(
                 self.transport.parse(&config_url)?,
                 &manifest.document.config,
-                &host,
-                &manifest.document.layers,
             )
             .await?;
 
@@ -165,17 +168,17 @@ impl OciFetcher {
             layers.push(session.fetch_layer(layer_url, descriptor).await?);
         }
 
-        Ok(api_schema::RunResponse {
+        Ok(api_schema::Run {
             url: location.manifest.to_string(),
             platform,
             index,
-            manifest: api_schema::ManifestResponse {
+            manifest: api_schema::Manifest {
                 schema_version: manifest.document.schema_version,
-                media_type: manifest.kind,
+                media_kind: manifest.kind,
                 digest: manifest.digest,
                 annotations: manifest.document.annotations,
-                config: api_schema::DescriptorResponse {
-                    media_type: manifest.document.config.media_type,
+                config: api_schema::Descriptor {
+                    media_kind: manifest.document.config.media_kind,
                     digest: manifest.document.config.digest,
                     size: manifest.document.config.size,
                 },
@@ -188,20 +191,21 @@ impl OciFetcher {
     }
 }
 
-#[tracing::instrument]
-fn redirect_policy(attempt: Attempt<'_>, transport: TransportPolicy) -> reqwest::redirect::Action {
-    if transport.allows(attempt.url()) {
-        attempt.follow()
-    } else {
-        attempt.stop()
-    }
+fn install_ring_crypto_provider() {
+    static INSTALL_RING_CRYPTO_PROVIDER: Once = Once::new();
+
+    INSTALL_RING_CRYPTO_PROVIDER.call_once(|| {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("ring should be the only installed rustls crypto provider");
+    });
 }
 
 #[tracing::instrument(skip(fetcher, input), err)]
 pub async fn run(
     Extension(fetcher): Extension<OciFetcher>,
     input: Result<Json<api_schema::RunInput>, JsonRejection>,
-) -> Result<Json<api_schema::RunResponse>, ApiError> {
+) -> Result<Json<api_schema::Run>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
     fetcher
         .fetch(input.url)
@@ -261,7 +265,7 @@ impl<'a> FetchSession<'a> {
             ManifestDocument::Manifest(document) => {
                 let kind = resolve_media_kind::<media::ManifestMedia>(
                     fetched.content_type.as_deref(),
-                    document.media_type.clone(),
+                    document.media_kind.clone(),
                 )?;
                 Ok(FetchedManifest::Manifest(FetchedImageManifest {
                     document,
@@ -277,26 +281,23 @@ impl<'a> FetchSession<'a> {
         &mut self,
         url: OutboundUrl<'_>,
         desc: &descriptor::Config,
-        host: &HostPlatform,
-        layers: &[descriptor::Layer],
     ) -> Result<ImageConfig, OciError> {
         let fetched = self
-            .fetch_bytes(url, desc.media_type.as_ref(), Some(desc.expectation()))
+            .fetch_bytes(url, desc.media_kind.as_ref(), Some(desc.expectation()))
             .await?;
-        let document = serde_json::from_slice(&fetched.body).map_err(|source| OciError::Json {
+        serde_json::from_slice(&fetched.body).map_err(|source| OciError::Json {
             url: url.to_string(),
             source,
-        })?;
-        ImageConfig::new(document, host, layers).map_err(OciError::from)
+        })
     }
 
-    #[tracing::instrument(skip(self, desc), fields(url = %url, digest = %descriptor.digest, expected_size = descriptor.size), err)]
+    #[tracing::instrument(skip(self, desc), fields(url = %url, digest = %desc.digest, expected_size = desc.size), err)]
     async fn fetch_layer(
         &mut self,
         url: OutboundUrl<'_>,
         desc: &descriptor::Layer,
     ) -> Result<api_schema::Layer, OciError> {
-        let response = self.get(url, desc.media_type.as_ref()).await?;
+        let response = self.get(url, desc.media_kind.as_ref()).await?;
         let mut stream = response.bytes_stream();
         let mut hasher = Sha256::new();
         let mut downloaded_size = 0_u64;
@@ -319,17 +320,14 @@ impl<'a> FetchSession<'a> {
             hasher.update(&chunk);
         }
 
-        verify_size(url.as_ref(), desc.size, downloaded_size)?;
-        let actual_digest = Sha256Digest(format_sha256(&hasher.finalize()));
-        verify_digest(url.as_ref(), &desc.digest, &actual_digest)?;
-
-        Ok(api_schema::Layer {
-            url: url.to_string(),
-            media_kind: desc.media_type.clone(),
-            digest: desc.digest.clone(),
-            declared_size: desc.size,
+        let downloaded_digest = digest::format(&hasher.finalize())
+            .parse()
+            .expect("a computed SHA-256 digest should parse");
+        api_schema::Layer::new(LayerResponseInput {
+            url: url.as_ref(),
+            descriptor: desc,
             downloaded_size,
-            verified: true,
+            downloaded_digest,
         })
     }
 
@@ -369,18 +367,14 @@ impl<'a> FetchSession<'a> {
         })?;
         let digest = sha256_digest(&body);
 
-        if let Some(expected) = expected {
-            verify_size(url.as_ref(), expected.size, size)?;
-            verify_digest(url.as_ref(), expected.digest, &digest)?;
-        }
-        if let Some(header_digest) = header_digest {
-            verify_digest(url.as_ref(), &header_digest, &digest)?;
-        }
-
-        Ok(FetchedBytes {
+        FetchedBytes::new(FetchedBytesInput {
+            url: url.as_ref(),
             body,
             digest,
+            size,
             content_type,
+            expected,
+            header_digest,
         })
     }
 
@@ -450,10 +444,70 @@ impl<'a> FetchSession<'a> {
 }
 
 #[derive(Debug)]
+struct FetchedBytesInput<'a> {
+    url: &'a Url,
+    body: Vec<u8>,
+    digest: Sha256Digest,
+    size: u64,
+    content_type: Option<String>,
+    expected: Option<descriptor::BlobExpectation<'a>>,
+    header_digest: Option<Sha256Digest>,
+}
+
+#[derive(Debug)]
 struct FetchedBytes {
     body: Vec<u8>,
     digest: Sha256Digest,
     content_type: Option<String>,
+}
+
+impl FetchedBytes {
+    fn new(input: FetchedBytesInput<'_>) -> Result<Self, OciError> {
+        if let Some(expected) = input.expected {
+            if expected.size != input.size {
+                return Err(OciError::SizeMismatch {
+                    url: input.url.to_string(),
+                    expected: expected.size,
+                    actual: input.size,
+                });
+            }
+            if expected.digest != &input.digest {
+                return Err(OciError::DigestMismatch {
+                    url: input.url.to_string(),
+                    expected: expected.digest.to_string(),
+                    actual: input.digest.to_string(),
+                });
+            }
+        }
+        if input
+            .header_digest
+            .as_ref()
+            .is_some_and(|header| header != &input.digest)
+        {
+            let header = input
+                .header_digest
+                .expect("a mismatched response digest should be present");
+            return Err(OciError::DigestMismatch {
+                url: input.url.to_string(),
+                expected: header.to_string(),
+                actual: input.digest.to_string(),
+            });
+        }
+
+        Ok(Self {
+            body: input.body,
+            digest: input.digest,
+            content_type: input.content_type,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct LayerResponseInput<'a> {
+    url: &'a Url,
+    descriptor: &'a descriptor::Layer,
+    downloaded_size: u64,
+    downloaded_digest: Sha256Digest,
 }
 
 #[derive(Debug)]
@@ -461,7 +515,7 @@ enum FetchedManifest {
     Index {
         document: ImageIndex,
         digest: Sha256Digest,
-        media_type: media::IndexMediaType,
+        media_type: media::IndexMediaKind,
     },
     Manifest(FetchedImageManifest),
 }
@@ -471,630 +525,6 @@ struct FetchedImageManifest {
     document: oci_schema::ImageManifest,
     digest: Sha256Digest,
     kind: media::ManifestMediaKind,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ManifestDocument {
-    Index(ImageIndex),
-    Manifest(oci_schema::ImageManifest),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageIndex {
-    schema_version: u32,
-    media_type: Option<media::IndexMediaType>,
-    manifests: Vec<descriptor::Manifest>,
-    #[serde(default)]
-    annotations: BTreeMap<String, String>,
-}
-
-mod media {
-    use super::*;
-
-    pub const ACCEPT: &str = concat!(
-        "application/vnd.oci.image.index.v1+json, ",
-        "application/vnd.docker.distribution.manifest.list.v2+json, ",
-        "application/vnd.oci.image.manifest.v1+json, ",
-        "application/vnd.docker.distribution.manifest.v2+json"
-    );
-
-    pub trait MediaTypeKind {
-        const NAME: &'static str;
-        const SUPPORTED: &'static [&'static str];
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct MediaType<K> {
-        value: String,
-        kind: PhantomData<fn() -> K>,
-    }
-
-    impl<K: MediaTypeKind> FromStr for MediaType<K> {
-        type Err = ParseValueError;
-
-        fn from_str(value: &str) -> Result<Self, Self::Err> {
-            K::SUPPORTED
-                .contains(&value)
-                .then(|| Self {
-                    value: value.to_owned(),
-                    kind: PhantomData,
-                })
-                .ok_or_else(|| ParseValueError::new(K::NAME, value))
-        }
-    }
-
-    impl<K> AsRef<str> for MediaType<K> {
-        fn as_ref(&self) -> &str {
-            &self.value
-        }
-    }
-
-    impl<K> Display for MediaType<K> {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            self.value.fmt(formatter)
-        }
-    }
-
-    impl<K> Serialize for MediaType<K> {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            self.value.serialize(serializer)
-        }
-    }
-
-    impl<'de, K: MediaTypeKind> Deserialize<'de> for MediaType<K> {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            String::deserialize(deserializer)?
-                .parse()
-                .map_err(de::Error::custom)
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct IndexMedia;
-
-    impl MediaTypeKind for IndexMedia {
-        const NAME: &'static str = "image index media type";
-        const SUPPORTED: &'static [&'static str] = &[
-            "application/vnd.oci.image.index.v1+json",
-            "application/vnd.docker.distribution.manifest.list.v2+json",
-        ];
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ManifestMedia;
-
-    impl MediaTypeKind for ManifestMedia {
-        const NAME: &'static str = "image manifest media type";
-        const SUPPORTED: &'static [&'static str] = &[
-            "application/vnd.oci.image.manifest.v1+json",
-            "application/vnd.docker.distribution.manifest.v2+json",
-        ];
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ConfigMedia;
-
-    impl MediaTypeKind for ConfigMedia {
-        const NAME: &'static str = "image config media type";
-        const SUPPORTED: &'static [&'static str] = &[
-            "application/vnd.oci.image.config.v1+json",
-            "application/vnd.docker.container.image.v1+json",
-        ];
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct LayerMedia;
-
-    impl MediaTypeKind for LayerMedia {
-        const NAME: &'static str = "image layer media type";
-        const SUPPORTED: &'static [&'static str] = &[
-            "application/vnd.oci.image.layer.v1.tar",
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            "application/vnd.oci.image.layer.v1.tar+zstd",
-            "application/vnd.docker.image.rootfs.diff.tar.gzip",
-        ];
-    }
-
-    pub type IndexMediaType = MediaType<IndexMedia>;
-    pub type ManifestMediaKind = MediaType<ManifestMedia>;
-    pub type ConfigMediaType = MediaType<ConfigMedia>;
-    pub type LayerMediaKind = MediaType<LayerMedia>;
-}
-
-mod api_schema {
-    use super::*;
-    use super::{
-        descriptor::{History, Rootfs},
-        media::{ConfigMediaType, IndexMediaType, ManifestMediaKind},
-    };
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunInput {
-        pub url: RegistryLoc,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct RunResponse {
-        pub url: String,
-        pub platform: PlatformResponse,
-        pub index: Option<DocumentResponse>,
-        pub manifest: ManifestResponse,
-        pub image: ImageResponse,
-        pub rootfs: Rootfs,
-        pub history: Vec<History>,
-        pub layers: Vec<Layer>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct PlatformResponse {
-        pub os: OS,
-        pub architecture: Arch,
-        pub variant: Option<String>,
-        pub os_version: Option<String>,
-        pub os_features: Vec<String>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct DocumentResponse {
-        pub schema_version: u32,
-        pub media_type: IndexMediaType,
-        pub digest: Sha256Digest,
-        pub annotations: BTreeMap<String, String>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct ManifestResponse {
-        pub schema_version: u32,
-        pub media_type: ManifestMediaKind,
-        pub digest: Sha256Digest,
-        pub annotations: BTreeMap<String, String>,
-        pub config: DescriptorResponse,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct DescriptorResponse {
-        pub media_type: ConfigMediaType,
-        pub digest: Sha256Digest,
-        pub size: u64,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct ImageResponse {
-        pub created: Option<String>,
-        pub author: Option<String>,
-        pub user: Option<String>,
-        pub exposed_ports: Vec<String>,
-        pub env: Vec<String>,
-        pub entrypoint: Vec<String>,
-        pub cmd: Vec<String>,
-        pub volumes: Vec<String>,
-        pub working_dir: Option<String>,
-        pub labels: BTreeMap<String, String>,
-        pub stop_signal: Option<String>,
-        pub args_escaped: Option<bool>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub struct Layer {
-        pub url: String,
-        pub media_kind: media::LayerMediaKind,
-        pub digest: Sha256Digest,
-        pub declared_size: u64,
-        pub downloaded_size: u64,
-        pub verified: bool,
-    }
-}
-
-mod oci_schema {
-    use super::*;
-    use super::{
-        descriptor::{Config, History, Layer, RootfsDoc, RuntimeConfig},
-        media::ManifestMediaKind,
-    };
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct PlatformDesc {
-        #[serde(rename = "architecture")]
-        pub arch: Arch,
-        pub os: OS,
-        pub variant: Option<String>,
-        #[serde(rename = "os.version", default)]
-        pub os_version: Option<String>,
-        #[serde(rename = "os.features", default)]
-        pub os_features: Vec<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct ImageConfigDoc {
-        pub created: Option<String>,
-        pub author: Option<String>,
-        #[serde(flatten)]
-        pub platform: PlatformDesc,
-        #[serde(default)]
-        pub config: RuntimeConfig,
-        pub rootfs: RootfsDoc,
-        #[serde(default)]
-        pub history: Vec<History>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct ImageManifest {
-        pub schema_version: u32,
-        pub media_type: Option<ManifestMediaKind>,
-        pub config: Config,
-        pub layers: Vec<Layer>,
-        #[serde(default)]
-        pub annotations: BTreeMap<String, String>,
-    }
-}
-
-mod descriptor {
-    use super::*;
-    use super::{
-        media::{ConfigMedia, LayerMedia, ManifestMedia, MediaType, MediaTypeKind},
-        oci_schema::PlatformDesc,
-    };
-
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase", bound(deserialize = ""))]
-    pub struct Descriptor<K: MediaTypeKind> {
-        pub media_type: MediaType<K>,
-        pub digest: Sha256Digest,
-        pub size: u64,
-        #[serde(default)]
-        pub platform: Option<PlatformDesc>,
-    }
-
-    impl<K: MediaTypeKind> Descriptor<K> {
-        pub fn expectation(&self) -> BlobExpectation<'_> {
-            BlobExpectation {
-                digest: &self.digest,
-                size: self.size,
-            }
-        }
-    }
-
-    pub type Manifest = Descriptor<ManifestMedia>;
-    pub type Config = Descriptor<ConfigMedia>;
-    pub type Layer = Descriptor<LayerMedia>;
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct BlobExpectation<'a> {
-        pub digest: &'a Sha256Digest,
-        pub size: u64,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    pub struct RuntimeConfig {
-        #[serde(rename = "User")]
-        pub user: Option<String>,
-        #[serde(rename = "ExposedPorts", default)]
-        pub exposed_ports: BTreeMap<String, serde_json::Value>,
-        #[serde(rename = "Env", default)]
-        pub env: Vec<String>,
-        #[serde(rename = "Entrypoint", default)]
-        pub entrypoint: Vec<String>,
-        #[serde(rename = "Cmd", default)]
-        pub cmd: Vec<String>,
-        #[serde(rename = "Volumes", default)]
-        pub volumes: BTreeMap<String, serde_json::Value>,
-        #[serde(rename = "WorkingDir")]
-        pub working_dir: Option<String>,
-        #[serde(rename = "Labels", default)]
-        pub labels: BTreeMap<String, String>,
-        #[serde(rename = "StopSignal")]
-        pub stop_signal: Option<String>,
-        #[serde(rename = "ArgsEscaped")]
-        pub args_escaped: Option<bool>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(tag = "type")]
-    pub enum RootfsDoc {
-        #[serde(rename = "layers")]
-        Layers { diff_ids: Vec<Sha256Digest> },
-    }
-
-    #[derive(Debug, Serialize)]
-    #[serde(tag = "type")]
-    pub enum Rootfs {
-        #[serde(rename = "layers")]
-        Layers { diff_ids: Vec<Sha256Digest> },
-    }
-
-    impl Rootfs {
-        pub fn new(doc: RootfsDoc, layers: &[Layer]) -> Result<Self, ParseImageConfigError> {
-            let RootfsDoc::Layers { diff_ids } = doc;
-            if diff_ids.len() != layers.len() {
-                return Err(ParseImageConfigError::Rootfs {
-                    diff_id_count: diff_ids.len(),
-                    layer_count: layers.len(),
-                });
-            }
-            Ok(Self::Layers { diff_ids })
-        }
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    pub enum ParseImageConfigError {
-        #[error(
-            "image platform {image_os}/{image_architecture} does not match host {host_os}/{host_architecture}"
-        )]
-        Platform {
-            image_os: OS,
-            image_architecture: Arch,
-            host_os: OS,
-            host_architecture: Arch,
-        },
-        #[error("rootfs has {diff_id_count} diff IDs but manifest has {layer_count} layers")]
-        Rootfs {
-            diff_id_count: usize,
-            layer_count: usize,
-        },
-    }
-
-    #[derive(Debug, Deserialize, Serialize)]
-    pub struct History {
-        pub created: Option<String>,
-        pub created_by: Option<String>,
-        pub author: Option<String>,
-        pub comment: Option<String>,
-        #[serde(default)]
-        pub empty_layer: bool,
-    }
-}
-
-#[derive(Debug)]
-struct ImageConfig {
-    created: Option<String>,
-    author: Option<String>,
-    platform: ImagePlatform,
-    config: descriptor::RuntimeConfig,
-    rootfs: descriptor::Rootfs,
-    history: Vec<descriptor::History>,
-}
-
-impl ImageConfig {
-    fn new(
-        doc: oci_schema::ImageConfigDoc,
-        host: &HostPlatform,
-        layers: &[descriptor::Layer],
-    ) -> Result<Self, descriptor::ParseImageConfigError> {
-        Ok(Self {
-            created: doc.created,
-            author: doc.author,
-            platform: ImagePlatform::new(doc.platform, host)?,
-            config: doc.config,
-            rootfs: descriptor::Rootfs::new(doc.rootfs, layers)?,
-            history: doc.history,
-        })
-    }
-
-    #[tracing::instrument(skip(self, selected))]
-    fn platform(&self, selected: Option<oci_schema::PlatformDesc>) -> api_schema::PlatformResponse {
-        api_schema::PlatformResponse {
-            os: self.platform.os.clone(),
-            architecture: self.platform.architecture.clone(),
-            variant: selected
-                .as_ref()
-                .and_then(|platform| platform.variant.clone())
-                .or_else(|| self.platform.variant.clone()),
-            os_version: selected
-                .as_ref()
-                .and_then(|platform| platform.os_version.clone())
-                .or_else(|| self.platform.os_version.clone()),
-            os_features: selected
-                .filter(|platform| !platform.os_features.is_empty())
-                .map_or_else(
-                    || self.platform.os_features.clone(),
-                    |platform| platform.os_features,
-                ),
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn response(&self) -> api_schema::ImageResponse {
-        let config = &self.config;
-        api_schema::ImageResponse {
-            created: self.created.clone(),
-            author: self.author.clone(),
-            user: config.user.clone(),
-            exposed_ports: config.exposed_ports.keys().cloned().collect(),
-            env: config.env.clone(),
-            entrypoint: config.entrypoint.clone(),
-            cmd: config.cmd.clone(),
-            volumes: config.volumes.keys().cloned().collect(),
-            working_dir: config.working_dir.clone(),
-            labels: config.labels.clone(),
-            stop_signal: config.stop_signal.clone(),
-            args_escaped: config.args_escaped,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ImagePlatform {
-    architecture: Arch,
-    os: OS,
-    variant: Option<String>,
-    os_version: Option<String>,
-    os_features: Vec<String>,
-}
-
-impl ImagePlatform {
-    fn new(
-        platform: oci_schema::PlatformDesc,
-        host: &HostPlatform,
-    ) -> Result<Self, descriptor::ParseImageConfigError> {
-        if platform.os != host.os || platform.arch != host.architecture {
-            return Err(descriptor::ParseImageConfigError::Platform {
-                image_os: platform.os,
-                image_architecture: platform.arch,
-                host_os: host.os.clone(),
-                host_architecture: host.architecture.clone(),
-            });
-        }
-
-        Ok(Self {
-            architecture: platform.arch,
-            os: platform.os,
-            variant: platform.variant,
-            os_version: platform.os_version,
-            os_features: platform.os_features,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct HostPlatform {
-    os: OS,
-    architecture: Arch,
-}
-
-impl HostPlatform {
-    #[tracing::instrument(err)]
-    fn current() -> Result<Self, OciError> {
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            os => os,
-        };
-        let architecture = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            architecture => {
-                return Err(OciError::InvalidInput(format!(
-                    "unsupported host architecture {architecture:?}"
-                )));
-            }
-        };
-        Ok(Self {
-            os: os
-                .parse()
-                .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
-            architecture: architecture
-                .parse()
-                .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
-        })
-    }
-
-    #[tracing::instrument(skip(manifests), fields(os = %self.os, architecture = %self.architecture), err)]
-    fn select_platform(
-        &self,
-        manifests: &[descriptor::Manifest],
-    ) -> Result<descriptor::Manifest, OciError> {
-        manifests
-            .iter()
-            .find(|descriptor| {
-                descriptor.platform.as_ref().is_some_and(|platform| {
-                    platform.os == self.os && platform.arch == self.architecture
-                })
-            })
-            .cloned()
-            .ok_or_else(|| {
-                OciError::InvalidInput(format!(
-                    "image index has no {}/{} manifest",
-                    self.os, self.architecture
-                ))
-            })
-    }
-}
-
-#[derive(Debug)]
-pub struct RegistryLoc {
-    manifest: Url,
-}
-
-impl FromStr for RegistryLoc {
-    type Err = OciError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let url = Url::parse(value).map_err(|error| {
-            OciError::InvalidInput(format!("invalid OCI manifest URL: {error}"))
-        })?;
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(OciError::InvalidInput(
-                "OCI manifest URL must not contain credentials".to_owned(),
-            ));
-        }
-
-        let segments = url
-            .path_segments()
-            .ok_or_else(|| {
-                OciError::InvalidInput("OCI manifest URL cannot be a base URL".to_owned())
-            })?
-            .collect::<Vec<_>>();
-        if segments.len() < 4
-            || segments.first() != Some(&"v2")
-            || segments.get(segments.len() - 2) != Some(&"manifests")
-            || segments[1..segments.len() - 2]
-                .iter()
-                .any(|segment| segment.is_empty())
-            || segments.last().is_some_and(|segment| segment.is_empty())
-        {
-            return Err(OciError::InvalidInput(
-                "OCI URL must match /v2/<repository>/manifests/<tag-or-digest>".to_owned(),
-            ));
-        }
-        Ok(Self { manifest: url })
-    }
-}
-
-impl<'de> Deserialize<'de> for RegistryLoc {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
-impl Display for RegistryLoc {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.manifest.fmt(formatter)
-    }
-}
-
-impl RegistryLoc {
-    #[tracing::instrument(err)]
-    fn manifest_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
-        self.descriptor_url("manifests", digest)
-    }
-
-    #[tracing::instrument(err)]
-    fn blob_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
-        self.descriptor_url("blobs", digest)
-    }
-
-    #[tracing::instrument(err)]
-    fn descriptor_url(&self, kind: &str, digest: &Sha256Digest) -> Result<Url, OciError> {
-        let mut url = self.manifest.clone();
-        {
-            let mut segments = url.path_segments_mut().map_err(|()| {
-                OciError::InvalidInput("OCI manifest URL cannot be a base URL".to_owned())
-            })?;
-            segments.pop();
-            segments.pop();
-            segments.push(kind);
-            segments.push(digest.as_ref());
-        }
-        url.set_query(None);
-        url.set_fragment(None);
-        Ok(url)
-    }
 }
 
 #[derive(Debug)]
@@ -1181,10 +611,10 @@ fn response_content_type(headers: &HeaderMap) -> Option<String> {
 #[tracing::instrument(skip(response, document), err)]
 fn resolve_media_kind<K: media::MediaTypeKind + PartialEq>(
     response: Option<&str>,
-    document: Option<media::MediaType<K>>,
-) -> Result<media::MediaType<K>, OciError> {
+    document: Option<media::MediaKind<K>>,
+) -> Result<media::MediaKind<K>, OciError> {
     let response = response
-        .map(str::parse::<media::MediaType<K>>)
+        .map(str::parse::<media::MediaKind<K>>)
         .transpose()
         .map_err(OciError::from)?;
     match (response, document) {
@@ -1215,51 +645,816 @@ fn ensure_success(url: &Url, response: Response) -> Result<Response, OciError> {
     }
 }
 
-#[tracing::instrument(skip(bytes), fields(byte_count = bytes.len()))]
-fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
-    Sha256Digest(format_sha256(&Sha256::digest(bytes)))
-}
+mod media {
+    use std::{
+        fmt::{self, Display},
+        marker::PhantomData,
+        str::FromStr,
+    };
 
-#[tracing::instrument(skip(bytes))]
-fn format_sha256(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-    let mut digest = String::with_capacity("sha256:".len() + bytes.len() * 2);
-    digest.push_str("sha256:");
-    for byte in bytes {
-        digest.push(char::from(HEX[usize::from(byte >> 4)]));
-        digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    use super::{OciError, ParseValueError};
+
+    pub type IndexMediaKind = MediaKind<IndexMedia>;
+    pub type ManifestMediaKind = MediaKind<ManifestMedia>;
+    pub type ConfigMediaKind = MediaKind<ConfigMedia>;
+    pub type LayerMediaKind = MediaKind<LayerMedia>;
+
+    pub const ACCEPT: &str = concat!(
+        "application/vnd.oci.image.index.v1+json, ",
+        "application/vnd.docker.distribution.manifest.list.v2+json, ",
+        "application/vnd.oci.image.manifest.v1+json, ",
+        "application/vnd.docker.distribution.manifest.v2+json"
+    );
+
+    pub trait MediaTypeKind {
+        const NAME: &'static str;
+        const SUPPORTED: &'static [&'static str];
     }
-    digest
-}
 
-#[tracing::instrument(err)]
-fn verify_digest(
-    url: &Url,
-    expected: &Sha256Digest,
-    actual: &Sha256Digest,
-) -> Result<(), OciError> {
-    if expected.matches(actual) {
-        Ok(())
-    } else {
-        Err(OciError::DigestMismatch {
-            url: url.to_string(),
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        })
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct IndexMedia;
+
+    impl MediaTypeKind for IndexMedia {
+        const NAME: &'static str = "image index media type";
+        const SUPPORTED: &'static [&'static str] = &[
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        ];
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ManifestMedia;
+
+    impl MediaTypeKind for ManifestMedia {
+        const NAME: &'static str = "image manifest media type";
+        const SUPPORTED: &'static [&'static str] = &[
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        ];
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ConfigMedia;
+
+    impl MediaTypeKind for ConfigMedia {
+        const NAME: &'static str = "image config media type";
+        const SUPPORTED: &'static [&'static str] = &[
+            "application/vnd.oci.image.config.v1+json",
+            "application/vnd.docker.container.image.v1+json",
+        ];
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LayerMedia;
+
+    impl MediaTypeKind for LayerMedia {
+        const NAME: &'static str = "image layer media type";
+        const SUPPORTED: &'static [&'static str] = &[
+            "application/vnd.oci.image.layer.v1.tar",
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.docker.image.rootfs.diff.tar.gzip",
+        ];
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MediaKind<K> {
+        value: String,
+        kind: PhantomData<fn() -> K>,
+    }
+
+    impl<K: MediaTypeKind> FromStr for MediaKind<K> {
+        type Err = ParseValueError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            K::SUPPORTED
+                .contains(&value)
+                .then(|| Self {
+                    value: value.to_owned(),
+                    kind: PhantomData,
+                })
+                .ok_or_else(|| ParseValueError::new(K::NAME, value))
+        }
+    }
+
+    impl<K> AsRef<str> for MediaKind<K> {
+        fn as_ref(&self) -> &str {
+            &self.value
+        }
+    }
+
+    impl<K> Display for MediaKind<K> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.value.fmt(formatter)
+        }
+    }
+
+    impl<K> Serialize for MediaKind<K> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            self.value.serialize(serializer)
+        }
+    }
+
+    impl<'de, K: MediaTypeKind> Deserialize<'de> for MediaKind<K> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
     }
 }
 
-#[tracing::instrument(err)]
-fn verify_size(url: &Url, expected: u64, actual: u64) -> Result<(), OciError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(OciError::SizeMismatch {
-            url: url.to_string(),
-            expected,
-            actual,
-        })
+mod api_schema {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        Arch, LayerResponseInput, OS, OciError, RegistryLoc, Sha256Digest,
+        descriptor::{History, Rootfs},
+        media::{ConfigMediaKind, IndexMediaKind, ManifestMediaKind},
+    };
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunInput {
+        pub url: RegistryLoc,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Run {
+        pub url: String,
+        pub platform: Platform,
+        pub index: Option<Document>,
+        pub manifest: Manifest,
+        pub image: Image,
+        pub rootfs: Rootfs,
+        pub history: Vec<History>,
+        pub layers: Vec<Layer>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Platform {
+        pub os: OS,
+        pub architecture: Arch,
+        pub variant: Option<String>,
+        pub os_version: Option<String>,
+        pub os_features: Vec<String>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Document {
+        pub schema_version: u32,
+        pub media_kind: IndexMediaKind,
+        pub digest: Sha256Digest,
+        pub annotations: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Manifest {
+        pub schema_version: u32,
+        pub media_kind: ManifestMediaKind,
+        pub digest: Sha256Digest,
+        pub annotations: BTreeMap<String, String>,
+        pub config: Descriptor,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Descriptor {
+        pub media_kind: ConfigMediaKind,
+        pub digest: Sha256Digest,
+        pub size: u64,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Image {
+        pub created: Option<String>,
+        pub author: Option<String>,
+        pub user: Option<String>,
+        pub exposed_ports: Vec<String>,
+        pub env: Vec<String>,
+        pub entrypoint: Vec<String>,
+        pub cmd: Vec<String>,
+        pub volumes: Vec<String>,
+        pub working_dir: Option<String>,
+        pub labels: BTreeMap<String, String>,
+        pub stop_signal: Option<String>,
+        pub args_escaped: Option<bool>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Layer {
+        url: String,
+        media_kind: super::media::LayerMediaKind,
+        digest: Sha256Digest,
+        declared_size: u64,
+        downloaded_size: u64,
+    }
+
+    impl Layer {
+        pub fn new(input: LayerResponseInput<'_>) -> Result<Self, OciError> {
+            if input.descriptor.size != input.downloaded_size {
+                return Err(OciError::SizeMismatch {
+                    url: input.url.to_string(),
+                    expected: input.descriptor.size,
+                    actual: input.downloaded_size,
+                });
+            }
+            if input.descriptor.digest != input.downloaded_digest {
+                return Err(OciError::DigestMismatch {
+                    url: input.url.to_string(),
+                    expected: input.descriptor.digest.to_string(),
+                    actual: input.downloaded_digest.to_string(),
+                });
+            }
+
+            Ok(Self {
+                url: input.url.to_string(),
+                media_kind: input.descriptor.media_kind.clone(),
+                digest: input.descriptor.digest.clone(),
+                declared_size: input.descriptor.size,
+                downloaded_size: input.downloaded_size,
+            })
+        }
+    }
+}
+
+mod oci_schema {
+    use std::collections::BTreeMap;
+
+    use serde::Deserialize;
+
+    use super::{
+        Arch, OS,
+        descriptor::{Config, Layer},
+        media::ManifestMediaKind,
+    };
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PlatformDesc {
+        #[serde(rename = "architecture")]
+        pub arch: Arch,
+        pub os: OS,
+        pub variant: Option<String>,
+        #[serde(rename = "os.version", default)]
+        pub os_version: Option<String>,
+        #[serde(rename = "os.features", default)]
+        pub os_features: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ImageManifest {
+        pub schema_version: u32,
+        pub media_kind: Option<ManifestMediaKind>,
+        pub config: Config,
+        pub layers: Vec<Layer>,
+        #[serde(default)]
+        pub annotations: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    pub struct RuntimeConfig {
+        #[serde(rename = "User")]
+        pub user: Option<String>,
+        #[serde(rename = "ExposedPorts", default)]
+        pub exposed_ports: BTreeMap<String, serde_json::Value>,
+        #[serde(rename = "Env", default)]
+        pub env: Vec<String>,
+        #[serde(rename = "Entrypoint", default)]
+        pub entrypoint: Vec<String>,
+        #[serde(rename = "Cmd", default)]
+        pub cmd: Vec<String>,
+        #[serde(rename = "Volumes", default)]
+        pub volumes: BTreeMap<String, serde_json::Value>,
+        #[serde(rename = "WorkingDir")]
+        pub working_dir: Option<String>,
+        #[serde(rename = "Labels", default)]
+        pub labels: BTreeMap<String, String>,
+        #[serde(rename = "StopSignal")]
+        pub stop_signal: Option<String>,
+        #[serde(rename = "ArgsEscaped")]
+        pub args_escaped: Option<bool>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(tag = "type")]
+    pub enum Rootfs {
+        #[serde(rename = "layers")]
+        Layers { diff_ids: Vec<Sha256Digest> },
+    }
+
+    impl Rootfs {
+        pub fn new(doc: RootfsDoc, layers: &[Layer]) -> Result<Self, ParseImageConfigError> {
+            let RootfsDoc::Layers { diff_ids } = doc;
+            if diff_ids.len() != layers.len() {
+                return Err(ParseImageConfigError::Rootfs {
+                    diff_id_count: diff_ids.len(),
+                    layer_count: layers.len(),
+                });
+            }
+            Ok(Self::Layers { diff_ids })
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub struct History {
+        pub created: Option<String>,
+        pub created_by: Option<String>,
+        pub author: Option<String>,
+        pub comment: Option<String>,
+        #[serde(default)]
+        pub empty_layer: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum ManifestDocument {
+        Index(ImageIndex),
+        Manifest(oci_schema::ImageManifest),
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ImageIndex {
+        schema_version: u32,
+        media_type: Option<media::IndexMediaKind>,
+        manifests: Vec<descriptor::Manifest>,
+        #[serde(default)]
+        annotations: BTreeMap<String, String>,
+    }
+}
+
+mod descriptor {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        Sha256Digest,
+        media::{ConfigMedia, LayerMedia, ManifestMedia, MediaKind, MediaTypeKind},
+        oci_schema::PlatformDesc,
+    };
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase", bound(deserialize = ""))]
+    pub struct Descriptor<K: MediaTypeKind> {
+        pub media_kind: MediaKind<K>,
+        pub digest: Sha256Digest,
+        pub size: u64,
+        #[serde(default)]
+        pub platform: Option<PlatformDesc>,
+    }
+
+    impl<K: MediaTypeKind> Descriptor<K> {
+        pub fn expectation(&self) -> BlobExpectation<'_> {
+            BlobExpectation {
+                digest: &self.digest,
+                size: self.size,
+            }
+        }
+    }
+
+    pub type Manifest = Descriptor<ManifestMedia>;
+    pub type Config = Descriptor<ConfigMedia>;
+    pub type Layer = Descriptor<LayerMedia>;
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct BlobExpectation<'a> {
+        pub digest: &'a Sha256Digest,
+        pub size: u64,
+    }
+}
+
+mod image {
+    use super::*;
+
+    type Result<T, E = ParseImageConfigError> = std::result::Result<T, E>;
+
+    #[derive(Debug)]
+    struct Config {
+        created: Option<String>,
+        author: Option<String>,
+        platform: Platform,
+        config: oci_schema::RuntimeConfig,
+        rootfs: oci_schema::Rootfs,
+        history: Vec<oci_schema::History>,
+    }
+
+    impl ImageConfig {
+        fn new(
+            doc: ImageConfigDoc,
+            host: &HostPlatform,
+            layers: &[descriptor::Layer],
+        ) -> Result<Self> {
+            Ok(Self {
+                created: doc.created,
+                author: doc.author,
+                platform: ImagePlatform::new(doc.platform, host)?,
+                config: doc.config,
+                rootfs: descriptor::Rootfs::new(doc.rootfs, layers)?,
+                history: doc.history,
+            })
+        }
+
+        #[tracing::instrument(skip(self, selected))]
+        fn platform(&self, selected: Option<oci_schema::PlatformDesc>) -> api_schema::Platform {
+            api_schema::Platform {
+                os: self.platform.os.clone(),
+                architecture: self.platform.architecture.clone(),
+                variant: selected
+                    .as_ref()
+                    .and_then(|platform| platform.variant.clone())
+                    .or_else(|| self.platform.variant.clone()),
+                os_version: selected
+                    .as_ref()
+                    .and_then(|platform| platform.os_version.clone())
+                    .or_else(|| self.platform.os_version.clone()),
+                os_features: selected
+                    .filter(|platform| !platform.os_features.is_empty())
+                    .map_or_else(
+                        || self.platform.os_features.clone(),
+                        |platform| platform.os_features,
+                    ),
+            }
+        }
+
+        #[tracing::instrument(skip(self))]
+        fn response(&self) -> api_schema::Image {
+            let config = &self.config;
+            api_schema::Image {
+                created: self.created.clone(),
+                author: self.author.clone(),
+                user: config.user.clone(),
+                exposed_ports: config.exposed_ports.keys().cloned().collect(),
+                env: config.env.clone(),
+                entrypoint: config.entrypoint.clone(),
+                cmd: config.cmd.clone(),
+                volumes: config.volumes.keys().cloned().collect(),
+                working_dir: config.working_dir.clone(),
+                labels: config.labels.clone(),
+                stop_signal: config.stop_signal.clone(),
+                args_escaped: config.args_escaped,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ImagePlatform {
+        architecture: Arch,
+        os: OS,
+        variant: Option<String>,
+        os_version: Option<String>,
+        os_features: Vec<String>,
+    }
+
+    impl ImagePlatform {
+        fn new(platform: oci_schema::PlatformDesc, host: &HostPlatform) -> Result<Self> {
+            if platform.os != host.os || platform.arch != host.architecture {
+                return Err(oci_schema::ParseImageConfigError::Platform {
+                    image_os: platform.os,
+                    image_architecture: platform.arch,
+                    host_os: host.os.clone(),
+                    host_architecture: host.architecture.clone(),
+                });
+            }
+
+            Ok(Self {
+                architecture: platform.arch,
+                os: platform.os,
+                variant: platform.variant,
+                os_version: platform.os_version,
+                os_features: platform.os_features,
+            })
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum ParseImageConfigError {
+        #[error(
+            "image platform {image_os}/{image_architecture} does not match host {host_os}/{host_architecture}"
+        )]
+        Platform {
+            image_os: OS,
+            image_architecture: Arch,
+            host_os: OS,
+            host_architecture: Arch,
+        },
+        #[error("rootfs has {diff_id_count} diff IDs but manifest has {layer_count} layers")]
+        Rootfs {
+            diff_id_count: usize,
+            layer_count: usize,
+        },
+    }
+}
+
+mod registry {
+    use super::*;
+
+    #[derive(Debug)]
+    pub struct RegistryLoc {
+        manifest: Url,
+    }
+
+    impl FromStr for RegistryLoc {
+        type Err = OciError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            let url = Url::parse(value).map_err(|error| {
+                OciError::InvalidInput(format!("invalid OCI manifest URL: {error}"))
+            })?;
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(OciError::InvalidInput(
+                    "OCI manifest URL must not contain credentials".to_owned(),
+                ));
+            }
+
+            let segments = url
+                .path_segments()
+                .ok_or_else(|| {
+                    OciError::InvalidInput("OCI manifest URL cannot be a base URL".to_owned())
+                })?
+                .collect::<Vec<_>>();
+            if segments.len() < 4
+                || segments.first() != Some(&"v2")
+                || segments.get(segments.len() - 2) != Some(&"manifests")
+                || segments[1..segments.len() - 2]
+                    .iter()
+                    .any(|segment| segment.is_empty())
+                || segments.last().is_some_and(|segment| segment.is_empty())
+            {
+                return Err(OciError::InvalidInput(
+                    "OCI URL must match /v2/<repository>/manifests/<tag-or-digest>".to_owned(),
+                ));
+            }
+            Ok(Self { manifest: url })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for RegistryLoc {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
+    }
+
+    impl Display for RegistryLoc {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.manifest.fmt(formatter)
+        }
+    }
+
+    impl RegistryLoc {
+        #[tracing::instrument(err)]
+        fn manifest_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
+            self.descriptor_url("manifests", digest)
+        }
+
+        #[tracing::instrument(err)]
+        fn blob_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
+            self.descriptor_url("blobs", digest)
+        }
+
+        #[tracing::instrument(err)]
+        fn descriptor_url(&self, kind: &str, digest: &Sha256Digest) -> Result<Url, OciError> {
+            let mut url = self.manifest.clone();
+            {
+                let mut segments = url.path_segments_mut().map_err(|()| {
+                    OciError::InvalidInput("OCI manifest URL cannot be a base URL".to_owned())
+                })?;
+                segments.pop();
+                segments.pop();
+                segments.push(kind);
+                segments.push(digest.as_ref());
+            }
+            url.set_query(None);
+            url.set_fragment(None);
+            Ok(url)
+        }
+    }
+}
+
+mod digest {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct Sha256Digest(String);
+
+    impl From<&[u8]> for Sha256Digest {
+        #[tracing::instrument(skip(bytes), fields(byte_count = bytes.len()))]
+        fn from(bytes: &[u8]) -> Sha256Digest {
+            Sha256Digest(format(&Sha256::digest(bytes)))
+        }
+    }
+
+    #[tracing::instrument(skip(bytes))]
+    fn format(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut digest = String::with_capacity("sha256:".len() + bytes.len() * 2);
+        digest.push_str("sha256:");
+        for byte in bytes {
+            digest.push(char::from(HEX[usize::from(byte >> 4)]));
+            digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        digest
+    }
+
+    impl FromStr for Sha256Digest {
+        type Err = ParseValueError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            let hash = value
+                .strip_prefix("sha256:")
+                .filter(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| ParseValueError::new("SHA-256 digest", value))?;
+            Ok(Self(format!("sha256:{hash}")))
+        }
+    }
+
+    impl AsRef<str> for Sha256Digest {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Display for Sha256Digest {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl Serialize for Sha256Digest {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            self.0.serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Sha256Digest {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
+    }
+}
+
+mod platform {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct HostPlatform {
+        os: OS,
+        architecture: Arch,
+    }
+
+    impl HostPlatform {
+        #[tracing::instrument(err)]
+        fn current() -> Result<Self, OciError> {
+            let os = match std::env::consts::OS {
+                "macos" => "darwin",
+                os => os,
+            };
+            let architecture = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                architecture => {
+                    return Err(OciError::InvalidInput(format!(
+                        "unsupported host architecture {architecture:?}"
+                    )));
+                }
+            };
+            Ok(Self {
+                os: os
+                    .parse()
+                    .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
+                architecture: architecture
+                    .parse()
+                    .map_err(|error: ParseValueError| OciError::InvalidInput(error.to_string()))?,
+            })
+        }
+
+        #[tracing::instrument(skip(manifests), fields(os = %self.os, architecture = %self.architecture), err)]
+        fn select_platform(
+            &self,
+            manifests: &[descriptor::Manifest],
+        ) -> Result<descriptor::Manifest, OciError> {
+            manifests
+                .iter()
+                .find(|descriptor| {
+                    descriptor.platform.as_ref().is_some_and(|platform| {
+                        platform.os == self.os && platform.arch == self.architecture
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    OciError::InvalidInput(format!(
+                        "image index has no {}/{} manifest",
+                        self.os, self.architecture
+                    ))
+                })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[serde(transparent)]
+    pub struct OS(String);
+
+    impl FromStr for OS {
+        type Err = ParseValueError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            (!value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+            .then(|| Self(value.to_owned()))
+            .ok_or_else(|| ParseValueError::new("operating system", value))
+        }
+    }
+
+    impl AsRef<str> for OS {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Display for OS {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for OS {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+    #[serde(transparent)]
+    pub struct Arch(String);
+
+    impl FromStr for Arch {
+        type Err = ParseValueError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            (!value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+            .then(|| Self(value.to_owned()))
+            .ok_or_else(|| ParseValueError::new("architecture", value))
+        }
+    }
+
+    impl AsRef<str> for Arch {
+        fn as_ref(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Display for Arch {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Arch {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            String::deserialize(deserializer)?
+                .parse()
+                .map_err(de::Error::custom)
+        }
     }
 }
 
@@ -1311,146 +1506,13 @@ impl From<ParseValueError> for OciError {
     }
 }
 
-impl From<descriptor::ParseImageConfigError> for OciError {
-    fn from(error: descriptor::ParseImageConfigError) -> Self {
+impl From<oci_schema::ParseImageConfigError> for OciError {
+    fn from(error: oci_schema::ParseImageConfigError) -> Self {
         let message = error.to_string();
         match error {
-            descriptor::ParseImageConfigError::Platform { .. } => Self::InvalidInput(message),
-            descriptor::ParseImageConfigError::Rootfs { .. } => Self::InvalidDocument(message),
+            oci_schema::ParseImageConfigError::Platform { .. } => Self::InvalidInput(message),
+            oci_schema::ParseImageConfigError::Rootfs { .. } => Self::InvalidDocument(message),
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Sha256Digest(String);
-
-impl Sha256Digest {
-    fn matches(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
-    }
-}
-
-impl FromStr for Sha256Digest {
-    type Err = ParseValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let hash = value
-            .strip_prefix("sha256:")
-            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| ParseValueError::new("SHA-256 digest", value))?;
-        Ok(Self(format!("sha256:{hash}")))
-    }
-}
-
-impl AsRef<str> for Sha256Digest {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for Sha256Digest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl Serialize for Sha256Digest {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Sha256Digest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct OS(String);
-
-impl FromStr for OS {
-    type Err = ParseValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        (!value.is_empty()
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
-        .then(|| Self(value.to_owned()))
-        .ok_or_else(|| ParseValueError::new("operating system", value))
-    }
-}
-
-impl AsRef<str> for OS {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for OS {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl<'de> Deserialize<'de> for OS {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct Arch(String);
-
-impl FromStr for Arch {
-    type Err = ParseValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        (!value.is_empty()
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
-        .then(|| Self(value.to_owned()))
-        .ok_or_else(|| ParseValueError::new("architecture", value))
-    }
-}
-
-impl AsRef<str> for Arch {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for Arch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl<'de> Deserialize<'de> for Arch {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(de::Error::custom)
     }
 }
 
@@ -1841,7 +1903,7 @@ mod tests {
     fn layer_descriptors(count: usize) -> Vec<LayerDesc> {
         (0..count)
             .map(|index| Descriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar"
+                media_kind: "application/vnd.oci.image.layer.v1.tar"
                     .parse()
                     .expect("fixture media type should parse"),
                 digest: sha256_digest(index.to_string().as_bytes()),
