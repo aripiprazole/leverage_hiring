@@ -227,7 +227,7 @@ impl OciFetcher {
         loc: &registry::Loc,
         descriptors: &[descriptor::Layer],
         diff_ids: &[digest::Sha256Digest],
-    ) -> Result<(Vec<api_schema::Layer>, rootfs::Filesystem), OciError> {
+    ) -> Result<(Vec<api_schema::Layer>, rootfs::FileSystem), OciError> {
         let workspace = rootfs::Workspace::new()?;
         let mut layers = Vec::with_capacity(descriptors.len());
         for (index, (descriptor, diff_id)) in descriptors.iter().zip(diff_ids).enumerate() {
@@ -772,7 +772,7 @@ mod api_schema {
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,
         pub layers: Vec<Layer>,
-        pub filesystem: Filesystem,
+        pub filesystem: FileSystem,
     }
 
     #[derive(Debug, Serialize)]
@@ -875,15 +875,15 @@ mod api_schema {
     }
 
     #[derive(Debug, Serialize)]
-    pub struct Filesystem {
+    pub struct FileSystem {
         format: &'static str,
         path: std::path::PathBuf,
         size: u64,
         digest: digest::Sha256Digest,
     }
 
-    impl From<super::rootfs::Filesystem> for Filesystem {
-        fn from(filesystem: super::rootfs::Filesystem) -> Self {
+    impl From<super::rootfs::FileSystem> for FileSystem {
+        fn from(filesystem: super::rootfs::FileSystem) -> Self {
             Self {
                 format: "ext4",
                 path: filesystem.path,
@@ -1045,7 +1045,7 @@ mod image {
     pub struct Config {
         pub created: Option<String>,
         pub author: Option<String>,
-        pub platform: Platform,
+        platform: Platform,
         pub runtime: oci_schema::RuntimeConfig,
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,

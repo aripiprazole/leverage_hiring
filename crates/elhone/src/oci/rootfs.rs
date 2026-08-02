@@ -26,6 +26,8 @@ const CAPACITY_ALIGNMENT: u64 = 64 * MIB;
 const BYTES_PER_INODE: u64 = 16 * 1024;
 const MINIMUM_INODES: u64 = 8192;
 
+type Result<T, E = Error> = std::result::Result<T, E>;
+
 #[derive(Clone)]
 pub struct ArtifactStore {
     retained: Arc<Mutex<Vec<TempDir>>>,
@@ -33,23 +35,11 @@ pub struct ArtifactStore {
     preserve_ownerships: bool,
 }
 
-impl Default for ArtifactStore {
-    fn default() -> Self {
-        Self {
-            retained: Arc::new(Mutex::new(Vec::new())),
-            builder: FilesystemBuilder::Ext4,
-            preserve_ownerships: true,
-        }
-    }
-}
-
 impl ArtifactStore {
     #[tracing::instrument(
-        skip(self, workspace, index, media_kind, expected_diff_id),
+        skip(self, workspace, expected_diff_id),
         fields(
             root = %workspace.root.display(),
-            layer_index = index,
-            media_kind = %media_kind.as_ref(),
             layer = %expected_diff_id
         ),
         err
@@ -60,7 +50,7 @@ impl ArtifactStore {
         index: usize,
         media_kind: &media::LayerMediaKind,
         expected_diff_id: digest::Sha256Digest,
-    ) -> Result<AppliedLayer, Error> {
+    ) -> Result<AppliedLayer> {
         let root = workspace.root.clone();
         let blob = workspace.layer_blob(index);
         let archive = workspace.layer_archive(index);
@@ -84,7 +74,8 @@ impl ArtifactStore {
         })?
     }
 
-    pub async fn finish(&self, workspace: Workspace) -> Result<Filesystem, Error> {
+    #[tracing::instrument(skip(self), err)]
+    pub async fn finish(&self, workspace: Workspace) -> Result<FileSystem> {
         let root = workspace.root.clone();
         let path = workspace.filesystem();
         let builder = self.builder;
@@ -107,7 +98,7 @@ impl ArtifactStore {
             .map_err(|_| Error::RetentionLock)?
             .push(workspace.temp);
 
-        Ok(Filesystem {
+        Ok(FileSystem {
             path: result_path,
             size: built.size,
             digest: built.digest,
@@ -136,13 +127,15 @@ impl ArtifactStore {
     }
 }
 
+#[derive(Debug)]
 pub struct Workspace {
     temp: TempDir,
     root: PathBuf,
 }
 
 impl Workspace {
-    pub fn new() -> Result<Self, Error> {
+    #[tracing::instrument(err)]
+    pub fn new() -> Result<Self> {
         let temp = tempfile::Builder::new()
             .prefix("elhone-oci-")
             .tempdir()
@@ -192,10 +185,639 @@ pub struct AppliedLayer {
 }
 
 #[derive(Debug)]
-pub struct Filesystem {
+pub struct FileSystem {
     pub path: PathBuf,
     pub size: u64,
     pub digest: digest::Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FilesystemBuilder {
+    Ext4,
+    #[cfg(test)]
+    Test,
+    #[cfg(test)]
+    TestFailure,
+}
+
+impl FilesystemBuilder {
+    fn build(self, root: &Path, output: &Path) -> Result<BuiltFileSystem> {
+        match self {
+            Self::Ext4 => BuiltFileSystem::new(root, output),
+            #[cfg(test)]
+            Self::Test => build_test_filesystem(root, output),
+            #[cfg(test)]
+            Self::TestFailure => Err(Error::TestBuilder),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BuiltFileSystem {
+    size: u64,
+    digest: digest::Sha256Digest,
+}
+
+impl BuiltFileSystem {
+    fn new(root: &Path, output: &Path) -> Result<Self> {
+        let layout = FilesystemLayout::new(root)?;
+        let file = File::create(output)
+            .map_err(|source| Error::io("create ext4 filesystem", output, source))?;
+        file.set_len(layout.capacity)
+            .map_err(|source| Error::io("size ext4 filesystem", output, source))?;
+        drop(file);
+
+        let result = Command::new("mkfs.ext4")
+            .args(["-F", "-m", "0", "-L", "rootfs", "-N"])
+            .arg(layout.inodes.to_string())
+            .arg("-d")
+            .arg(root)
+            .arg(output)
+            .output()
+            .map_err(|source| Error::io("execute mkfs.ext4", output, source))?;
+        if !result.status.success() {
+            return Err(Error::Mkfs {
+                status: result.status,
+                stderr: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
+            });
+        }
+
+        Ok(Self {
+            size: fs::metadata(output)
+                .map_err(|source| Error::io("inspect ext4 filesystem", output, source))?
+                .len(),
+            digest: hash_file(output)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Compression {
+    Tar,
+    Gzip,
+    Zstd,
+}
+
+impl Compression {
+    fn from_media_type(media_type: &str, layer: &digest::Sha256Digest) -> Result<Self> {
+        match media_type {
+            "application/vnd.oci.image.layer.v1.tar" => Ok(Self::Tar),
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+            | "application/vnd.docker.image.rootfs.diff.tar.gzip" => Ok(Self::Gzip),
+            "application/vnd.oci.image.layer.v1.tar+zstd" => Ok(Self::Zstd),
+            value => Err(Error::invalid(
+                layer,
+                format!("unsupported layer media type {value:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchivePlan {
+    entries: Vec<ArchiveEntry>,
+}
+
+impl ArchivePlan {
+    fn whiteouts(&self) -> impl Iterator<Item = &Whiteout> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.whiteout.as_ref())
+    }
+
+    #[tracing::instrument(err)]
+    fn apply_whiteouts(&self, root: &Path, layer: &digest::Sha256Digest) -> Result<()> {
+        for whiteout in self.whiteouts() {
+            let Whiteout::Opaque { directory, .. } = whiteout else {
+                continue;
+            };
+            ensure_no_symlink_parents(root, directory, layer)?;
+            let directory = root.join(directory);
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    remove_path(&directory, "replace opaque whiteout target")?;
+                    fs::create_dir_all(&directory).map_err(|source| {
+                        Error::io("create opaque whiteout directory", &directory, source)
+                    })?;
+                }
+                Ok(_) => {
+                    for entry in fs::read_dir(&directory).map_err(|source| {
+                        Error::io("read opaque whiteout directory", &directory, source)
+                    })? {
+                        let entry = entry.map_err(|source| {
+                            Error::io("read opaque whiteout entry", &directory, source)
+                        })?;
+                        remove_path(&entry.path(), "apply opaque whiteout")?;
+                    }
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir_all(&directory).map_err(|source| {
+                        Error::io("create opaque whiteout directory", &directory, source)
+                    })?;
+                }
+                Err(source) => {
+                    return Err(Error::io(
+                        "inspect opaque whiteout directory",
+                        &directory,
+                        source,
+                    ));
+                }
+            }
+        }
+        for whiteout in self.whiteouts() {
+            if let Whiteout::Remove { target, .. } = whiteout {
+                ensure_no_symlink_parents(root, target, layer)?;
+                remove_path(&root.join(target), "apply whiteout")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    fn prepare_replacements(&self, root: &Path, layer: &digest::Sha256Digest) -> Result<()> {
+        let mut directories = self
+            .entries
+            .iter()
+            .filter(|entry| entry.directory)
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|entry| entry.path.components().count());
+        for entry in directories {
+            ensure_no_symlink_parents(root, &entry.path, layer)?;
+            let target = root.join(&entry.path);
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    remove_path(&target, "replace layer target with directory")?;
+                    fs::create_dir_all(&target).map_err(|source| {
+                        Error::io("create replacement layer directory", &target, source)
+                    })?;
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir_all(&target).map_err(|source| {
+                        Error::io("create replacement layer directory", &target, source)
+                    })?;
+                }
+                Err(source) => return Err(Error::io("inspect layer directory", &target, source)),
+            }
+        }
+
+        for entry in self.entries.iter().filter(|entry| !entry.directory) {
+            ensure_no_symlink_parents(root, &entry.path, layer)?;
+            remove_path(&root.join(&entry.path), "replace layer target")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum Whiteout {
+    Remove { marker: PathBuf, target: PathBuf },
+    Opaque { marker: PathBuf, directory: PathBuf },
+}
+
+impl Whiteout {
+    fn new<R: Read>(
+        entry: &tar::Entry<'_, R>,
+        path: &Path,
+        layer: &digest::Sha256Digest,
+    ) -> Result<Option<Self>> {
+        let Some(name) = path.file_name().map(OsStrExt::as_bytes) else {
+            return Ok(None);
+        };
+        let opaque = name == b".wh..wh..opq";
+        let target = name.strip_prefix(b".wh.");
+        if !opaque && target.is_none() {
+            return Ok(None);
+        }
+
+        let size = entry
+            .header()
+            .size()
+            .map_err(|source| Error::invalid(layer, format!("invalid whiteout size: {source}")))?;
+        if !entry.header().entry_type().is_file() || size != 0 {
+            return Err(Error::invalid(
+                layer,
+                format!("whiteout {} must be an empty regular file", path.display()),
+            ));
+        }
+
+        let marker = path.to_path_buf();
+        if opaque {
+            return Ok(Some(Self::Opaque {
+                marker,
+                directory: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+            }));
+        }
+
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        if target.is_empty() {
+            return Err(Error::invalid(
+                layer,
+                "whiteout .wh. has no target basename",
+            ));
+        }
+        if matches!(target, b"." | b"..") {
+            return Err(Error::invalid(
+                layer,
+                format!("whiteout {} has an unsafe target basename", path.display()),
+            ));
+        }
+        let mut target_path = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        target_path.push(OsString::from_vec(target.to_vec()));
+        Ok(Some(Self::Remove {
+            marker,
+            target: target_path,
+        }))
+    }
+
+    fn marker(&self) -> &Path {
+        match self {
+            Self::Remove { marker, .. } | Self::Opaque { marker, .. } => marker,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveEntry {
+    path: PathBuf,
+    directory: bool,
+    whiteout: Option<Whiteout>,
+}
+
+impl ArchiveEntry {
+    fn new<R: Read>(
+        entry: &mut tar::Entry<'_, R>,
+        layer: &digest::Sha256Digest,
+    ) -> Result<Option<Self>> {
+        let raw_path = entry
+            .path()
+            .map_err(|source| Error::invalid(layer, format!("invalid tar path: {source}")))?;
+        let path = normalize_relative(&raw_path)
+            .map_err(|message| Error::invalid(layer, format!("unsafe tar path: {message}")))?;
+        if path.as_os_str().is_empty() {
+            if !entry.header().entry_type().is_dir() {
+                return Err(Error::invalid(
+                    layer,
+                    "the archive root entry is not a directory",
+                ));
+            }
+            return Ok(None);
+        }
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_hard_link() || entry_type.is_symlink() {
+            let target = entry
+                .link_name()
+                .map_err(|source| Error::invalid(layer, format!("invalid link target: {source}")))?
+                .ok_or_else(|| Error::invalid(layer, "link entry has no target"))?;
+            if entry_type.is_hard_link() {
+                normalize_relative(&target).map_err(|message| {
+                    Error::invalid(layer, format!("unsafe hardlink target: {message}"))
+                })?;
+            }
+        }
+
+        Ok(Some(Self {
+            directory: entry_type.is_dir(),
+            whiteout: Whiteout::new(entry, &path, layer)?,
+            path,
+        }))
+    }
+}
+
+impl Archive {
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn apply_layer_sync(
+        &self,
+        root: &Path,
+        blob: &Path,
+        media_type: &str,
+        expected_diff_id: digest::Sha256Digest,
+        preserve_ownerships: bool,
+    ) -> Result<AppliedLayer> {
+        let compression = Compression::from_media_type(media_type, &expected_diff_id)?;
+        let (actual_diff_id, uncompressed_size) =
+            self.decompress_layer(blob, compression, &expected_diff_id)?;
+        if actual_diff_id != expected_diff_id {
+            return Err(Error::invalid(
+                &expected_diff_id,
+                format!("diff ID mismatch: expected {expected_diff_id}, got {actual_diff_id}"),
+            ));
+        }
+
+        self.apply(root, &expected_diff_id, preserve_ownerships)?;
+        fs::remove_file(blob)
+            .map_err(|source| Error::io("remove downloaded layer", blob, source))?;
+        fs::remove_file(self.as_ref())
+            .map_err(|source| Error::io("remove uncompressed layer", self.as_ref(), source))?;
+
+        Ok(AppliedLayer {
+            diff_id: actual_diff_id,
+            uncompressed_size,
+        })
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn decompress_layer(
+        &self,
+        blob: &Path,
+        compression: Compression,
+        layer: &digest::Sha256Digest,
+    ) -> Result<(digest::Sha256Digest, u64)> {
+        let input =
+            File::open(blob).map_err(|source| Error::io("open downloaded layer", blob, source))?;
+        let output = File::create(self.as_ref())
+            .map_err(|source| Error::io("create uncompressed layer", self.as_ref(), source))?;
+        let output = BufWriter::new(output);
+
+        match compression {
+            Compression::Tar => self.copy_layer(BufReader::new(input), output, layer),
+            Compression::Gzip => {
+                self.copy_layer(MultiGzDecoder::new(BufReader::new(input)), output, layer)
+            }
+            Compression::Zstd => {
+                let decoder =
+                    zstd::stream::read::Decoder::new(BufReader::new(input)).map_err(|source| {
+                        Error::invalid(layer, format!("invalid zstd stream: {source}"))
+                    })?;
+                self.copy_layer(decoder, output, layer)
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        skip(self, input, output),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn copy_layer(
+        &self,
+        mut input: impl Read,
+        mut output: BufWriter<File>,
+        layer: &digest::Sha256Digest,
+    ) -> Result<(digest::Sha256Digest, u64)> {
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+
+        loop {
+            let count = input.read(&mut buffer).map_err(|source| {
+                Error::invalid(layer, format!("decompression failed: {source}"))
+            })?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|source| Error::io("write uncompressed layer", self.as_ref(), source))?;
+            hasher.update(&buffer[..count]);
+            size = size
+                .checked_add(u64::try_from(count).map_err(|_| {
+                    Error::invalid(layer, "uncompressed layer chunk length does not fit in u64")
+                })?)
+                .ok_or_else(|| Error::invalid(layer, "uncompressed layer size overflowed u64"))?;
+        }
+        output
+            .flush()
+            .map_err(|source| Error::io("flush uncompressed layer", self.as_ref(), source))?;
+
+        let digest = digest::format(&hasher.finalize())
+            .parse()
+            .expect("a computed SHA-256 digest should parse");
+        Ok((digest, size))
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn apply(
+        &self,
+        root: &Path,
+        layer: &digest::Sha256Digest,
+        preserve_ownerships: bool,
+    ) -> Result<()> {
+        let plan = self.inspect(layer)?;
+        plan.apply_whiteouts(root, layer)?;
+        plan.prepare_replacements(root, layer)?;
+
+        let file = File::open(self.as_ref())
+            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
+        let mut unpacker = tar::Archive::new(BufReader::new(file));
+        unpacker.set_overwrite(true);
+        unpacker.set_preserve_permissions(true);
+        unpacker.set_preserve_ownerships(preserve_ownerships);
+        unpacker.set_preserve_mtime(true);
+        unpacker.set_unpack_xattrs(true);
+        unpacker
+            .unpack(root)
+            .map_err(|source| Error::invalid(layer, format!("tar extraction failed: {source}")))?;
+
+        for whiteout in plan.whiteouts() {
+            ensure_no_symlink_parents(root, whiteout.marker(), layer)?;
+            remove_path(&root.join(whiteout.marker()), "remove extracted whiteout")?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn inspect(&self, layer: &digest::Sha256Digest) -> Result<ArchivePlan> {
+        let file = File::open(self.as_ref())
+            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
+        let mut reader = tar::Archive::new(BufReader::new(file));
+        let entries = reader
+            .entries()
+            .map_err(|source| Error::invalid(layer, format!("invalid tar archive: {source}")))?;
+        let mut seen = HashSet::new();
+        let mut planned_entries = Vec::new();
+
+        for entry in entries {
+            let mut entry = entry
+                .map_err(|source| Error::invalid(layer, format!("invalid tar entry: {source}")))?;
+            let Some(entry) = ArchiveEntry::new(&mut entry, layer)? else {
+                continue;
+            };
+            if !seen.insert(entry.path.clone()) {
+                return Err(Error::invalid(
+                    layer,
+                    format!("duplicate tar entry {}", entry.path.display()),
+                ));
+            }
+            planned_entries.push(entry);
+        }
+
+        Ok(ArchivePlan {
+            entries: planned_entries,
+        })
+    }
+}
+
+fn normalize_relative(path: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!("{} contains a parent component", path.display()));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("{} is absolute", path.display()));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn ensure_no_symlink_parents(root: &Path, path: &Path, layer: &digest::Sha256Digest) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(Error::invalid(
+                    layer,
+                    format!("path {} traverses a symlink", path.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(Error::invalid(
+                    layer,
+                    format!("path {} traverses a non-directory", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => break,
+            Err(source) => return Err(Error::io("inspect layer path", &current, source)),
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path, operation: &'static str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path).map_err(|source| Error::io(operation, path, source))
+        }
+        Ok(_) => fs::remove_file(path).map_err(|source| Error::io(operation, path, source)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::io(operation, path, source)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilesystemLayout {
+    capacity: u64,
+    inodes: u64,
+}
+
+impl FilesystemLayout {
+    fn new(root: &Path) -> Result<Self> {
+        let mut seen = HashSet::new();
+        let mut bytes = 0_u64;
+        let mut inodes = 0_u64;
+        measure_tree(root, &mut seen, &mut bytes, &mut inodes)?;
+
+        let inode_headroom = inodes.div_ceil(4);
+        let inode_budget = inodes
+            .checked_add(inode_headroom)
+            .ok_or_else(|| Error::io("calculate inode budget", root, overflow_error()))?
+            .max(MINIMUM_INODES);
+        let data_headroom = bytes.div_ceil(4).max(MINIMUM_DATA_HEADROOM);
+        let data_budget = bytes
+            .checked_add(data_headroom)
+            .ok_or_else(|| Error::io("calculate data budget", root, overflow_error()))?;
+        let inode_capacity = inode_budget
+            .checked_mul(BYTES_PER_INODE)
+            .ok_or_else(|| Error::io("calculate inode capacity", root, overflow_error()))?;
+        let capacity = data_budget.max(inode_capacity).max(MINIMUM_CAPACITY);
+        let capacity = round_up(capacity, CAPACITY_ALIGNMENT)
+            .ok_or_else(|| Error::io("align ext4 capacity", root, overflow_error()))?;
+
+        Ok(Self {
+            capacity,
+            inodes: inode_budget,
+        })
+    }
+}
+
+fn measure_tree(
+    path: &Path,
+    seen: &mut HashSet<(u64, u64)>,
+    bytes: &mut u64,
+    inodes: &mut u64,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| Error::io("inspect merged rootfs", path, source))?;
+    if seen.insert((metadata.dev(), metadata.ino())) {
+        *inodes = inodes
+            .checked_add(1)
+            .ok_or_else(|| Error::io("count rootfs inodes", path, overflow_error()))?;
+        if metadata.is_file() {
+            *bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| Error::io("count rootfs bytes", path, overflow_error()))?;
+        }
+    }
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in
+            fs::read_dir(path).map_err(|source| Error::io("read merged rootfs", path, source))?
+        {
+            let entry =
+                entry.map_err(|source| Error::io("read merged rootfs entry", path, source))?;
+            measure_tree(&entry.path(), seen, bytes, inodes)?;
+        }
+    }
+    Ok(())
+}
+
+fn round_up(value: u64, alignment: u64) -> Option<u64> {
+    value
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|value| value / alignment * alignment)
+}
+
+fn overflow_error() -> io::Error {
+    io::Error::other("filesystem size calculation overflowed")
+}
+
+fn hash_file(path: &Path) -> Result<digest::Sha256Digest> {
+    let file = File::open(path)
+        .map_err(|source| Error::io("open filesystem for hashing", path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut hasher = Sha256::new();
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| Error::io("hash ext4 filesystem", path, source))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(digest::format(&hasher.finalize())
+        .parse()
+        .expect("a computed SHA-256 digest should parse"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -245,623 +867,23 @@ impl Error {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum FilesystemBuilder {
-    Ext4,
-    #[cfg(test)]
-    Test,
-    #[cfg(test)]
-    TestFailure,
-}
-
-impl FilesystemBuilder {
-    fn build(self, root: &Path, output: &Path) -> Result<BuiltFilesystem, Error> {
-        match self {
-            Self::Ext4 => build_ext4(root, output),
-            #[cfg(test)]
-            Self::Test => build_test_filesystem(root, output),
-            #[cfg(test)]
-            Self::TestFailure => Err(Error::TestBuilder),
+impl Default for ArtifactStore {
+    fn default() -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(Vec::new())),
+            builder: FilesystemBuilder::Ext4,
+            preserve_ownerships: true,
         }
     }
-}
-
-#[derive(Debug)]
-struct BuiltFilesystem {
-    size: u64,
-    digest: digest::Sha256Digest,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Compression {
-    Tar,
-    Gzip,
-    Zstd,
-}
-
-impl Compression {
-    fn from_media_type(media_type: &str, layer: &digest::Sha256Digest) -> Result<Self, Error> {
-        match media_type {
-            "application/vnd.oci.image.layer.v1.tar" => Ok(Self::Tar),
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-            | "application/vnd.docker.image.rootfs.diff.tar.gzip" => Ok(Self::Gzip),
-            "application/vnd.oci.image.layer.v1.tar+zstd" => Ok(Self::Zstd),
-            value => Err(Error::invalid(
-                layer,
-                format!("unsupported layer media type {value:?}"),
-            )),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum Whiteout {
-    Remove(PathBuf),
-    Opaque(PathBuf),
-}
-
-#[derive(Debug)]
-struct ArchivePlan {
-    entries: Vec<ArchiveEntry>,
-    markers: Vec<PathBuf>,
-    whiteouts: Vec<Whiteout>,
-}
-
-#[derive(Debug)]
-struct ArchiveEntry {
-    path: PathBuf,
-    directory: bool,
-}
-
-impl Archive {
-    #[tracing::instrument(
-        skip(self, expected_diff_id),
-        fields(archive = %self.0.display(), layer = %expected_diff_id),
-        err
-    )]
-    fn apply_layer_sync(
-        &self,
-        root: &Path,
-        blob: &Path,
-        media_type: &str,
-        expected_diff_id: digest::Sha256Digest,
-        preserve_ownerships: bool,
-    ) -> Result<AppliedLayer, Error> {
-        let compression = Compression::from_media_type(media_type, &expected_diff_id)?;
-        let (actual_diff_id, uncompressed_size) =
-            self.decompress_layer(blob, compression, &expected_diff_id)?;
-        if actual_diff_id != expected_diff_id {
-            return Err(Error::invalid(
-                &expected_diff_id,
-                format!("diff ID mismatch: expected {expected_diff_id}, got {actual_diff_id}"),
-            ));
-        }
-
-        self.apply(root, &expected_diff_id, preserve_ownerships)?;
-        fs::remove_file(blob)
-            .map_err(|source| Error::io("remove downloaded layer", blob, source))?;
-        fs::remove_file(self.as_ref())
-            .map_err(|source| Error::io("remove uncompressed layer", self.as_ref(), source))?;
-
-        Ok(AppliedLayer {
-            diff_id: actual_diff_id,
-            uncompressed_size,
-        })
-    }
-
-    #[tracing::instrument(
-        skip(self),
-        fields(archive = %self.0.display()),
-        err
-    )]
-    fn decompress_layer(
-        &self,
-        blob: &Path,
-        compression: Compression,
-        layer: &digest::Sha256Digest,
-    ) -> Result<(digest::Sha256Digest, u64), Error> {
-        let input =
-            File::open(blob).map_err(|source| Error::io("open downloaded layer", blob, source))?;
-        let output = File::create(self.as_ref())
-            .map_err(|source| Error::io("create uncompressed layer", self.as_ref(), source))?;
-        let output = BufWriter::new(output);
-
-        match compression {
-            Compression::Tar => self.copy_layer(BufReader::new(input), output, layer),
-            Compression::Gzip => {
-                self.copy_layer(MultiGzDecoder::new(BufReader::new(input)), output, layer)
-            }
-            Compression::Zstd => {
-                let decoder =
-                    zstd::stream::read::Decoder::new(BufReader::new(input)).map_err(|source| {
-                        Error::invalid(layer, format!("invalid zstd stream: {source}"))
-                    })?;
-                self.copy_layer(decoder, output, layer)
-            }
-        }
-    }
-
-    #[tracing::instrument(
-        skip(self, input, output),
-        fields(archive = %self.0.display()),
-        err
-    )]
-    fn copy_layer(
-        &self,
-        mut input: impl Read,
-        mut output: BufWriter<File>,
-        layer: &digest::Sha256Digest,
-    ) -> Result<(digest::Sha256Digest, u64), Error> {
-        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-        let mut hasher = Sha256::new();
-        let mut size = 0_u64;
-
-        loop {
-            let count = input.read(&mut buffer).map_err(|source| {
-                Error::invalid(layer, format!("decompression failed: {source}"))
-            })?;
-            if count == 0 {
-                break;
-            }
-            output
-                .write_all(&buffer[..count])
-                .map_err(|source| Error::io("write uncompressed layer", self.as_ref(), source))?;
-            hasher.update(&buffer[..count]);
-            size = size
-                .checked_add(u64::try_from(count).map_err(|_| {
-                    Error::invalid(layer, "uncompressed layer chunk length does not fit in u64")
-                })?)
-                .ok_or_else(|| Error::invalid(layer, "uncompressed layer size overflowed u64"))?;
-        }
-        output
-            .flush()
-            .map_err(|source| Error::io("flush uncompressed layer", self.as_ref(), source))?;
-
-        let digest = digest::format(&hasher.finalize())
-            .parse()
-            .expect("a computed SHA-256 digest should parse");
-        Ok((digest, size))
-    }
-
-    #[tracing::instrument(
-        skip(self),
-        fields(archive = %self.0.display()),
-        err
-    )]
-    fn apply(
-        &self,
-        root: &Path,
-        layer: &digest::Sha256Digest,
-        preserve_ownerships: bool,
-    ) -> Result<(), Error> {
-        let plan = self.inspect(layer)?;
-        apply_whiteouts(root, &plan.whiteouts, layer)?;
-        prepare_replacements(root, &plan.entries, layer)?;
-
-        let file = File::open(self.as_ref())
-            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
-        let mut unpacker = tar::Archive::new(BufReader::new(file));
-        unpacker.set_overwrite(true);
-        unpacker.set_preserve_permissions(true);
-        unpacker.set_preserve_ownerships(preserve_ownerships);
-        unpacker.set_preserve_mtime(true);
-        unpacker.set_unpack_xattrs(true);
-        unpacker
-            .unpack(root)
-            .map_err(|source| Error::invalid(layer, format!("tar extraction failed: {source}")))?;
-
-        for marker in plan.markers {
-            ensure_no_symlink_parents(root, &marker, layer)?;
-            remove_path(&root.join(marker), "remove extracted whiteout")?;
-        }
-        Ok(())
-    }
-
-    #[tracing::instrument(
-        skip(self),
-        fields(archive = %self.0.display()),
-        err
-    )]
-    fn inspect(&self, layer: &digest::Sha256Digest) -> Result<ArchivePlan, Error> {
-        let file = File::open(self.as_ref())
-            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
-        let mut reader = tar::Archive::new(BufReader::new(file));
-        let entries = reader
-            .entries()
-            .map_err(|source| Error::invalid(layer, format!("invalid tar archive: {source}")))?;
-        let mut seen = HashSet::new();
-        let mut planned_entries = Vec::new();
-        let mut markers = Vec::new();
-        let mut whiteouts = Vec::new();
-
-        for entry in entries {
-            let mut entry = entry
-                .map_err(|source| Error::invalid(layer, format!("invalid tar entry: {source}")))?;
-            let raw_path = entry
-                .path()
-                .map_err(|source| Error::invalid(layer, format!("invalid tar path: {source}")))?;
-            let path = normalize_relative(&raw_path)
-                .map_err(|message| Error::invalid(layer, format!("unsafe tar path: {message}")))?;
-            if path.as_os_str().is_empty() {
-                if !entry.header().entry_type().is_dir() {
-                    return Err(Error::invalid(
-                        layer,
-                        "the archive root entry is not a directory",
-                    ));
-                }
-                continue;
-            }
-            if !seen.insert(path.clone()) {
-                return Err(Error::invalid(
-                    layer,
-                    format!("duplicate tar entry {}", path.display()),
-                ));
-            }
-
-            validate_link(&mut entry, layer)?;
-            planned_entries.push(ArchiveEntry {
-                path: path.clone(),
-                directory: entry.header().entry_type().is_dir(),
-            });
-
-            let Some(name) = path.file_name() else {
-                continue;
-            };
-            let name = name.as_bytes();
-            if name == b".wh..wh..opq" {
-                validate_whiteout(&entry, &path, layer)?;
-                markers.push(path.clone());
-                whiteouts.push(Whiteout::Opaque(
-                    path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-                ));
-            } else if let Some(target) = name.strip_prefix(b".wh.") {
-                validate_whiteout(&entry, &path, layer)?;
-                if target.is_empty() {
-                    return Err(Error::invalid(
-                        layer,
-                        "whiteout .wh. has no target basename",
-                    ));
-                }
-                if matches!(target, b"." | b"..") {
-                    return Err(Error::invalid(
-                        layer,
-                        format!("whiteout {} has an unsafe target basename", path.display()),
-                    ));
-                }
-                let mut target_path = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-                target_path.push(OsString::from_vec(target.to_vec()));
-                markers.push(path);
-                whiteouts.push(Whiteout::Remove(target_path));
-            }
-        }
-
-        Ok(ArchivePlan {
-            entries: planned_entries,
-            markers,
-            whiteouts,
-        })
-    }
-}
-
-fn prepare_replacements(
-    root: &Path,
-    entries: &[ArchiveEntry],
-    layer: &digest::Sha256Digest,
-) -> Result<(), Error> {
-    let mut directories = entries
-        .iter()
-        .filter(|entry| entry.directory)
-        .collect::<Vec<_>>();
-    directories.sort_by_key(|entry| entry.path.components().count());
-    for entry in directories {
-        ensure_no_symlink_parents(root, &entry.path, layer)?;
-        let target = root.join(&entry.path);
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                remove_path(&target, "replace layer target with directory")?;
-                fs::create_dir_all(&target).map_err(|source| {
-                    Error::io("create replacement layer directory", &target, source)
-                })?;
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&target).map_err(|source| {
-                    Error::io("create replacement layer directory", &target, source)
-                })?;
-            }
-            Err(source) => return Err(Error::io("inspect layer directory", &target, source)),
-        }
-    }
-
-    for entry in entries.iter().filter(|entry| !entry.directory) {
-        ensure_no_symlink_parents(root, &entry.path, layer)?;
-        remove_path(&root.join(&entry.path), "replace layer target")?;
-    }
-    Ok(())
-}
-
-fn validate_link<R: Read>(
-    entry: &mut tar::Entry<'_, R>,
-    layer: &digest::Sha256Digest,
-) -> Result<(), Error> {
-    let entry_type = entry.header().entry_type();
-    if !entry_type.is_hard_link() && !entry_type.is_symlink() {
-        return Ok(());
-    }
-    let target = entry
-        .link_name()
-        .map_err(|source| Error::invalid(layer, format!("invalid link target: {source}")))?
-        .ok_or_else(|| Error::invalid(layer, "link entry has no target"))?;
-    if entry_type.is_hard_link() {
-        normalize_relative(&target).map_err(|message| {
-            Error::invalid(layer, format!("unsafe hardlink target: {message}"))
-        })?;
-    }
-    Ok(())
-}
-
-fn validate_whiteout<R: Read>(
-    entry: &tar::Entry<'_, R>,
-    path: &Path,
-    layer: &digest::Sha256Digest,
-) -> Result<(), Error> {
-    let size = entry
-        .header()
-        .size()
-        .map_err(|source| Error::invalid(layer, format!("invalid whiteout size: {source}")))?;
-    if !entry.header().entry_type().is_file() || size != 0 {
-        return Err(Error::invalid(
-            layer,
-            format!("whiteout {} must be an empty regular file", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-fn normalize_relative(path: &Path) -> Result<PathBuf, String> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(format!("{} contains a parent component", path.display()));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("{} is absolute", path.display()));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn apply_whiteouts(
-    root: &Path,
-    whiteouts: &[Whiteout],
-    layer: &digest::Sha256Digest,
-) -> Result<(), Error> {
-    for whiteout in whiteouts {
-        let Whiteout::Opaque(directory) = whiteout else {
-            continue;
-        };
-        ensure_no_symlink_parents(root, directory, layer)?;
-        let directory = root.join(directory);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                remove_path(&directory, "replace opaque whiteout target")?;
-                fs::create_dir_all(&directory).map_err(|source| {
-                    Error::io("create opaque whiteout directory", &directory, source)
-                })?;
-            }
-            Ok(_) => {
-                for entry in fs::read_dir(&directory).map_err(|source| {
-                    Error::io("read opaque whiteout directory", &directory, source)
-                })? {
-                    let entry = entry.map_err(|source| {
-                        Error::io("read opaque whiteout entry", &directory, source)
-                    })?;
-                    remove_path(&entry.path(), "apply opaque whiteout")?;
-                }
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&directory).map_err(|source| {
-                    Error::io("create opaque whiteout directory", &directory, source)
-                })?;
-            }
-            Err(source) => {
-                return Err(Error::io(
-                    "inspect opaque whiteout directory",
-                    &directory,
-                    source,
-                ));
-            }
-        }
-    }
-    for whiteout in whiteouts {
-        if let Whiteout::Remove(path) = whiteout {
-            ensure_no_symlink_parents(root, path, layer)?;
-            remove_path(&root.join(path), "apply whiteout")?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_no_symlink_parents(
-    root: &Path,
-    path: &Path,
-    layer: &digest::Sha256Digest,
-) -> Result<(), Error> {
-    let mut current = root.to_path_buf();
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::invalid(
-                    layer,
-                    format!("path {} traverses a symlink", path.display()),
-                ));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(Error::invalid(
-                    layer,
-                    format!("path {} traverses a non-directory", path.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => break,
-            Err(source) => return Err(Error::io("inspect layer path", &current, source)),
-        }
-    }
-    Ok(())
-}
-
-fn remove_path(path: &Path, operation: &'static str) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir_all(path).map_err(|source| Error::io(operation, path, source))
-        }
-        Ok(_) => fs::remove_file(path).map_err(|source| Error::io(operation, path, source)),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(Error::io(operation, path, source)),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FilesystemLayout {
-    capacity: u64,
-    inodes: u64,
-}
-
-fn build_ext4(root: &Path, output: &Path) -> Result<BuiltFilesystem, Error> {
-    let layout = filesystem_layout(root)?;
-    let file = File::create(output)
-        .map_err(|source| Error::io("create ext4 filesystem", output, source))?;
-    file.set_len(layout.capacity)
-        .map_err(|source| Error::io("size ext4 filesystem", output, source))?;
-    drop(file);
-
-    let result = Command::new("mkfs.ext4")
-        .args(["-F", "-m", "0", "-L", "rootfs", "-N"])
-        .arg(layout.inodes.to_string())
-        .arg("-d")
-        .arg(root)
-        .arg(output)
-        .output()
-        .map_err(|source| Error::io("execute mkfs.ext4", output, source))?;
-    if !result.status.success() {
-        return Err(Error::Mkfs {
-            status: result.status,
-            stderr: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
-        });
-    }
-
-    Ok(BuiltFilesystem {
-        size: fs::metadata(output)
-            .map_err(|source| Error::io("inspect ext4 filesystem", output, source))?
-            .len(),
-        digest: hash_file(output)?,
-    })
-}
-
-fn filesystem_layout(root: &Path) -> Result<FilesystemLayout, Error> {
-    let mut seen = HashSet::new();
-    let mut bytes = 0_u64;
-    let mut inodes = 0_u64;
-    measure_tree(root, &mut seen, &mut bytes, &mut inodes)?;
-
-    let inode_headroom = inodes.div_ceil(4);
-    let inode_budget = inodes
-        .checked_add(inode_headroom)
-        .ok_or_else(|| Error::io("calculate inode budget", root, overflow_error()))?
-        .max(MINIMUM_INODES);
-    let data_headroom = bytes.div_ceil(4).max(MINIMUM_DATA_HEADROOM);
-    let data_budget = bytes
-        .checked_add(data_headroom)
-        .ok_or_else(|| Error::io("calculate data budget", root, overflow_error()))?;
-    let inode_capacity = inode_budget
-        .checked_mul(BYTES_PER_INODE)
-        .ok_or_else(|| Error::io("calculate inode capacity", root, overflow_error()))?;
-    let capacity = data_budget.max(inode_capacity).max(MINIMUM_CAPACITY);
-    let capacity = round_up(capacity, CAPACITY_ALIGNMENT)
-        .ok_or_else(|| Error::io("align ext4 capacity", root, overflow_error()))?;
-
-    Ok(FilesystemLayout {
-        capacity,
-        inodes: inode_budget,
-    })
-}
-
-fn measure_tree(
-    path: &Path,
-    seen: &mut HashSet<(u64, u64)>,
-    bytes: &mut u64,
-    inodes: &mut u64,
-) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| Error::io("inspect merged rootfs", path, source))?;
-    if seen.insert((metadata.dev(), metadata.ino())) {
-        *inodes = inodes
-            .checked_add(1)
-            .ok_or_else(|| Error::io("count rootfs inodes", path, overflow_error()))?;
-        if metadata.is_file() {
-            *bytes = bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| Error::io("count rootfs bytes", path, overflow_error()))?;
-        }
-    }
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        for entry in
-            fs::read_dir(path).map_err(|source| Error::io("read merged rootfs", path, source))?
-        {
-            let entry =
-                entry.map_err(|source| Error::io("read merged rootfs entry", path, source))?;
-            measure_tree(&entry.path(), seen, bytes, inodes)?;
-        }
-    }
-    Ok(())
-}
-
-fn round_up(value: u64, alignment: u64) -> Option<u64> {
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|value| value / alignment * alignment)
-}
-
-fn overflow_error() -> io::Error {
-    io::Error::other("filesystem size calculation overflowed")
-}
-
-fn hash_file(path: &Path) -> Result<digest::Sha256Digest, Error> {
-    let file = File::open(path)
-        .map_err(|source| Error::io("open filesystem for hashing", path, source))?;
-    let mut reader = BufReader::new(file);
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    let mut hasher = Sha256::new();
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|source| Error::io("hash ext4 filesystem", path, source))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(digest::format(&hasher.finalize())
-        .parse()
-        .expect("a computed SHA-256 digest should parse"))
 }
 
 #[cfg(test)]
-fn build_test_filesystem(root: &Path, output: &Path) -> Result<BuiltFilesystem, Error> {
-    let layout = filesystem_layout(root)?;
+fn build_test_filesystem(root: &Path, output: &Path) -> Result<BuiltFileSystem> {
+    let layout = FilesystemLayout::new(root)?;
     let body = format!("test ext4 capacity={}\n", layout.capacity);
     fs::write(output, body.as_bytes())
         .map_err(|source| Error::io("write test filesystem", output, source))?;
-    Ok(BuiltFilesystem {
+    Ok(BuiltFileSystem {
         size: u64::try_from(body.len()).expect("test filesystem length should fit in u64"),
         digest: hash_file(output)?,
     })
@@ -882,10 +904,8 @@ mod tests {
     use flate2::{Compression as GzipCompression, write::GzEncoder};
     use tar::{Builder, EntryType, Header};
 
-    use super::{
-        Archive, ArtifactStore, Error, FilesystemLayout, MIB, Workspace, filesystem_layout,
-    };
-    use crate::oci::{digest, media};
+    use super::{Archive, ArtifactStore, FilesystemLayout, MIB, Workspace};
+    use crate::oci::{digest, media, rootfs::Error};
 
     #[derive(Debug, Clone, Copy)]
     enum Encoding {
@@ -1313,7 +1333,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("test directory should be created");
         fs::write(temporary.path().join("small"), b"small").expect("small file should be written");
         assert_eq!(
-            filesystem_layout(temporary.path()).expect("small layout should calculate"),
+            FilesystemLayout::new(temporary.path()).expect("small layout should calculate"),
             FilesystemLayout {
                 capacity: 256 * MIB,
                 inodes: 8192,
@@ -1326,7 +1346,7 @@ mod tests {
             .set_len(300 * MIB)
             .expect("large file should be sized");
         assert_eq!(
-            filesystem_layout(temporary.path())
+            FilesystemLayout::new(temporary.path())
                 .expect("large layout should calculate")
                 .capacity,
             384 * MIB
@@ -1343,7 +1363,7 @@ mod tests {
             .expect("test os-release should be written");
         let output = temporary.path().join("rootfs.ext4");
 
-        let built = super::build_ext4(&root, &output).expect("ext4 should build");
+        let built = super::BuiltFileSystem::new(&root, &output).expect("ext4 should build");
 
         assert_eq!(built.size, 256 * MIB);
         let fsck = Command::new("e2fsck")
