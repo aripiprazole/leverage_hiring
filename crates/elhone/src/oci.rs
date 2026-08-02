@@ -1,8 +1,6 @@
 mod rootfs;
 
 use std::{
-    collections::HashMap,
-    fmt::{self, Display},
     path::Path,
     sync::{Arc, Once},
 };
@@ -13,6 +11,10 @@ use axum::{
     http::StatusCode as HttpStatusCode,
 };
 use barbirolli::{Barbirolli, LifecycleError, Rootfs, VcpuCount, VmId, VmInput, VmStatus};
+use dashmap::{
+    DashMap,
+    mapref::{entry::Entry, one::RefMut},
+};
 use futures::{FutureExt, TryStreamExt, future::BoxFuture};
 use reqwest::{
     Client, Response, StatusCode, Url,
@@ -21,7 +23,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::io::AsyncWriteExt;
 
 use super::{ApiError, AppState};
 
@@ -136,69 +138,71 @@ impl OciEntry {
 #[derive(Clone)]
 pub struct OciStore {
     fetcher: OciFetcher,
-    entries: Arc<Mutex<HashMap<image::Reference, OciEntry>>>,
+    entries: Arc<DashMap<image::Reference, OciEntry>>,
 }
 
 impl Default for OciStore {
+    #[tracing::instrument]
     fn default() -> Self {
+        tracing::info!("elhone starts to create the OCI store");
         Self {
             fetcher: OciFetcher::default(),
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(DashMap::new()),
         }
     }
 }
 
 impl OciStore {
     #[cfg(test)]
+    #[tracing::instrument(skip(fetcher))]
     fn for_test(fetcher: OciFetcher) -> Self {
+        tracing::info!("elhone starts to create the OCI test store");
         Self {
             fetcher,
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(DashMap::new()),
         }
     }
 
+    #[tracing::instrument(skip(self, reference, token), fields(%reference), err)]
     async fn ensure_pulled(
         &self,
-        entries: &mut HashMap<image::Reference, OciEntry>,
         reference: &image::Reference,
         token: String,
-    ) -> Result<(), OciStoreError> {
-        if entries.contains_key(reference) {
-            tracing::debug!(%reference, "the OCI image is already in the store");
-            return Ok(());
+    ) -> Result<RefMut<'_, image::Reference, OciEntry>, OciStoreError> {
+        tracing::info!(%reference, "elhone starts to check the OCI image");
+        match self.entries.entry(reference.clone()) {
+            Entry::Occupied(entry) => {
+                tracing::debug!(%reference, "the OCI image is already in the store");
+                Ok(entry.into_ref())
+            }
+            Entry::Vacant(entry) => {
+                let image = self
+                    .fetcher
+                    .fetch(reference.docker_hub_loc()?, token)
+                    .await?;
+                tracing::info!(%reference, "elhone stored the OCI image");
+                Ok(entry.insert(OciEntry { image, vm_id: None }))
+            }
         }
-        let image = self
-            .fetcher
-            .fetch(reference.docker_hub_loc()?, token)
-            .await?;
-        entries.insert(reference.clone(), OciEntry { image, vm_id: None });
-        tracing::info!(%reference, "elhone stored the OCI image");
-        Ok(())
     }
 
+    #[tracing::instrument(skip(self, input), fields(reference = %input.reference()), err)]
     async fn pull(&self, input: PullInput) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
-        let mut entries = self.entries.lock().await;
-        self.ensure_pulled(&mut entries, &reference, input.token)
-            .await?;
-        Ok(entries
-            .get(&reference)
-            .expect("ensured OCI entry must exist")
-            .response(&reference))
+        tracing::info!(%reference, "elhone starts to pull the OCI image");
+        let entry = self.ensure_pulled(&reference, input.token).await?;
+        Ok(entry.response(&reference))
     }
 
+    #[tracing::instrument(skip(self, manager, input), fields(reference = %input.reference()), err)]
     async fn run<M: OciVmManager>(
         &self,
         manager: &M,
         input: PullInput,
     ) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
-        let mut entries = self.entries.lock().await;
-        self.ensure_pulled(&mut entries, &reference, input.token)
-            .await?;
-        let entry = entries
-            .get_mut(&reference)
-            .expect("ensured OCI entry must exist");
+        tracing::info!(%reference, "elhone starts to run the OCI image");
+        let mut entry = self.ensure_pulled(&reference, input.token).await?;
 
         if let Some(vm_id) = entry.vm_id {
             match manager.start_oci_vm(vm_id).await {
@@ -234,14 +238,16 @@ impl OciStore {
         Ok(entry.response(&reference))
     }
 
+    #[tracing::instrument(skip(self, manager, input), fields(reference = %input.reference()), err)]
     async fn stop<M: OciVmManager>(
         &self,
         manager: &M,
         input: ReferenceInput,
     ) -> Result<api_schema::Container, OciStoreError> {
         let reference = input.reference();
-        let mut entries = self.entries.lock().await;
-        let entry = entries
+        tracing::info!(%reference, "elhone starts to stop the OCI VM");
+        let mut entry = self
+            .entries
             .get_mut(&reference)
             .ok_or_else(|| OciStoreError::NotFound(reference.clone()))?;
         if let Some(vm_id) = entry.vm_id {
@@ -262,16 +268,18 @@ impl OciStore {
         Ok(entry.response(&reference))
     }
 
+    #[tracing::instrument(skip(self, manager, input), fields(reference = %input.reference()), err)]
     async fn remove<M: OciVmManager>(
         &self,
         manager: &M,
         input: ReferenceInput,
     ) -> Result<(), OciStoreError> {
         let reference = input.reference();
-        let mut entries = self.entries.lock().await;
-        let entry = entries
-            .get_mut(&reference)
-            .ok_or_else(|| OciStoreError::NotFound(reference.clone()))?;
+        tracing::info!(%reference, "elhone starts to remove the OCI image");
+        let Entry::Occupied(mut stored) = self.entries.entry(reference.clone()) else {
+            return Err(OciStoreError::NotFound(reference));
+        };
+        let entry = stored.get_mut();
         if let Some(vm_id) = entry.vm_id {
             match manager.oci_vm_status(vm_id) {
                 Ok(VmStatus::Discovered) => {
@@ -283,7 +291,7 @@ impl OciStore {
                 Err(error) => return Err(error.into()),
             }
         }
-        entries.remove(&reference);
+        stored.remove();
         tracing::info!(%reference, "elhone removed the OCI image");
         Ok(())
     }
@@ -3031,8 +3039,6 @@ mod tests {
         let filesystem = image.filesystem.path.clone();
         store
             .entries
-            .lock()
-            .await
             .insert(fixture_reference(), OciEntry { image, vm_id: None });
         let manager = FakeManager::default();
 
@@ -3074,7 +3080,7 @@ mod tests {
             .remove(&manager, reference_input())
             .await
             .expect("stopped image should be removable");
-        assert!(store.entries.lock().await.is_empty());
+        assert!(store.entries.is_empty());
         assert!(!filesystem.exists());
     }
 

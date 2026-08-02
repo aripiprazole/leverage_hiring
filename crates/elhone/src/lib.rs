@@ -9,7 +9,7 @@ use axum::{
         Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -54,6 +54,13 @@ pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(|request: &Request<Body>, _span: &tracing::Span| {
+                    tracing::trace!(
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        "elhone starts to handle the http request"
+                    );
+                })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
 }

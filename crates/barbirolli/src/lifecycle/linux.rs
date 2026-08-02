@@ -531,7 +531,7 @@ impl BarbirolliVm {
             }
             let Some(observation) = self.observation(barbirolli.idle_policy) else {
                 tracing::warn!(
-                    "barbirolli postponed VM shutdown because the final idle observation failed"
+                    "barbirolli did not start VM shutdown because the final idle observation failed"
                 );
                 return;
             };

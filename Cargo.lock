@@ -561,6 +561,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "barbirolli",
+ "dashmap",
  "derive_more",
  "flate2",
  "futures",
