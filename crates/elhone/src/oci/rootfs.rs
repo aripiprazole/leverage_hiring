@@ -15,6 +15,7 @@ use std::{
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
+use tokio::task::spawn_blocking;
 
 use super::{digest, media};
 
@@ -43,23 +44,16 @@ impl Default for ArtifactStore {
 }
 
 impl ArtifactStore {
-    #[cfg(test)]
-    pub fn for_test(fail: bool) -> Self {
-        Self {
-            retained: Arc::new(Mutex::new(Vec::new())),
-            builder: if fail {
-                FilesystemBuilder::TestFailure
-            } else {
-                FilesystemBuilder::Test
-            },
-            preserve_ownerships: false,
-        }
-    }
-
-    pub fn workspace(&self) -> Result<Workspace, Error> {
-        Workspace::new()
-    }
-
+    #[tracing::instrument(
+        skip(self, workspace, index, media_kind, expected_diff_id),
+        fields(
+            root = %workspace.root.display(),
+            layer_index = index,
+            media_kind = %media_kind.as_ref(),
+            layer = %expected_diff_id
+        ),
+        err
+    )]
     pub async fn apply_layer(
         &self,
         workspace: &Workspace,
@@ -74,11 +68,10 @@ impl ArtifactStore {
         let preserve_ownerships = self.preserve_ownerships;
         let layer = expected_diff_id.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            apply_layer_sync(
+        spawn_blocking(move || {
+            archive.apply_layer_sync(
                 &root,
                 &blob,
-                &archive,
                 &media_kind,
                 expected_diff_id,
                 preserve_ownerships,
@@ -97,7 +90,7 @@ impl ArtifactStore {
         let builder = self.builder;
         let result_path = path.clone();
 
-        let built = tokio::task::spawn_blocking(move || {
+        let built = spawn_blocking(move || {
             let built = builder.build(&root, &path)?;
             fs::remove_dir_all(&root)
                 .map_err(|source| Error::io("remove merged rootfs", &root, source))?;
@@ -128,6 +121,19 @@ impl ArtifactStore {
             .expect("test artifact retention lock should not be poisoned")
             .len()
     }
+
+    #[cfg(test)]
+    pub fn for_test(fail: bool) -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(Vec::new())),
+            builder: if fail {
+                FilesystemBuilder::TestFailure
+            } else {
+                FilesystemBuilder::Test
+            },
+            preserve_ownerships: false,
+        }
+    }
 }
 
 pub struct Workspace {
@@ -136,7 +142,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         let temp = tempfile::Builder::new()
             .prefix("elhone-oci-")
             .tempdir()
@@ -156,8 +162,8 @@ impl Workspace {
         self.temp.path().join(format!("layer-{index}.blob"))
     }
 
-    fn layer_archive(&self, index: usize) -> PathBuf {
-        self.temp.path().join(format!("layer-{index}.tar"))
+    fn layer_archive(&self, index: usize) -> Archive {
+        Archive(self.temp.path().join(format!("layer-{index}.tar")))
     }
 
     fn filesystem(&self) -> PathBuf {
@@ -167,6 +173,15 @@ impl Workspace {
     #[cfg(test)]
     fn root(&self) -> &Path {
         &self.root
+    }
+}
+
+#[derive(Debug)]
+struct Archive(PathBuf);
+
+impl AsRef<Path> for Archive {
+    fn as_ref(&self) -> &Path {
+        &self.0
     }
 }
 
@@ -279,102 +294,6 @@ impl Compression {
     }
 }
 
-fn apply_layer_sync(
-    root: &Path,
-    blob: &Path,
-    archive: &Path,
-    media_type: &str,
-    expected_diff_id: digest::Sha256Digest,
-    preserve_ownerships: bool,
-) -> Result<AppliedLayer, Error> {
-    let compression = Compression::from_media_type(media_type, &expected_diff_id)?;
-    let (actual_diff_id, uncompressed_size) =
-        decompress_layer(blob, archive, compression, &expected_diff_id)?;
-    if actual_diff_id != expected_diff_id {
-        return Err(Error::invalid(
-            &expected_diff_id,
-            format!("diff ID mismatch: expected {expected_diff_id}, got {actual_diff_id}"),
-        ));
-    }
-
-    apply_archive(root, archive, &expected_diff_id, preserve_ownerships)?;
-    fs::remove_file(blob).map_err(|source| Error::io("remove downloaded layer", blob, source))?;
-    fs::remove_file(archive)
-        .map_err(|source| Error::io("remove uncompressed layer", archive, source))?;
-
-    Ok(AppliedLayer {
-        diff_id: actual_diff_id,
-        uncompressed_size,
-    })
-}
-
-fn decompress_layer(
-    blob: &Path,
-    archive: &Path,
-    compression: Compression,
-    layer: &digest::Sha256Digest,
-) -> Result<(digest::Sha256Digest, u64), Error> {
-    let input =
-        File::open(blob).map_err(|source| Error::io("open downloaded layer", blob, source))?;
-    let output = File::create(archive)
-        .map_err(|source| Error::io("create uncompressed layer", archive, source))?;
-    let output = BufWriter::new(output);
-
-    match compression {
-        Compression::Tar => copy_layer(BufReader::new(input), output, archive, layer),
-        Compression::Gzip => copy_layer(
-            MultiGzDecoder::new(BufReader::new(input)),
-            output,
-            archive,
-            layer,
-        ),
-        Compression::Zstd => {
-            let decoder =
-                zstd::stream::read::Decoder::new(BufReader::new(input)).map_err(|source| {
-                    Error::invalid(layer, format!("invalid zstd stream: {source}"))
-                })?;
-            copy_layer(decoder, output, archive, layer)
-        }
-    }
-}
-
-fn copy_layer(
-    mut input: impl Read,
-    mut output: BufWriter<File>,
-    output_path: &Path,
-    layer: &digest::Sha256Digest,
-) -> Result<(digest::Sha256Digest, u64), Error> {
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-
-    loop {
-        let count = input
-            .read(&mut buffer)
-            .map_err(|source| Error::invalid(layer, format!("decompression failed: {source}")))?;
-        if count == 0 {
-            break;
-        }
-        output
-            .write_all(&buffer[..count])
-            .map_err(|source| Error::io("write uncompressed layer", output_path, source))?;
-        hasher.update(&buffer[..count]);
-        size = size
-            .checked_add(u64::try_from(count).map_err(|_| {
-                Error::invalid(layer, "uncompressed layer chunk length does not fit in u64")
-            })?)
-            .ok_or_else(|| Error::invalid(layer, "uncompressed layer size overflowed u64"))?;
-    }
-    output
-        .flush()
-        .map_err(|source| Error::io("flush uncompressed layer", output_path, source))?;
-
-    let digest = digest::format(&hasher.finalize())
-        .parse()
-        .expect("a computed SHA-256 digest should parse");
-    Ok((digest, size))
-}
-
 #[derive(Debug)]
 enum Whiteout {
     Remove(PathBuf),
@@ -394,116 +313,234 @@ struct ArchiveEntry {
     directory: bool,
 }
 
-fn apply_archive(
-    root: &Path,
-    archive_path: &Path,
-    layer: &digest::Sha256Digest,
-    preserve_ownerships: bool,
-) -> Result<(), Error> {
-    let plan = inspect_archive(archive_path, layer)?;
-    apply_whiteouts(root, &plan.whiteouts, layer)?;
-    prepare_replacements(root, &plan.entries, layer)?;
-
-    let archive = File::open(archive_path)
-        .map_err(|source| Error::io("open uncompressed layer", archive_path, source))?;
-    let mut archive = tar::Archive::new(BufReader::new(archive));
-    archive.set_overwrite(true);
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(preserve_ownerships);
-    archive.set_preserve_mtime(true);
-    archive.set_unpack_xattrs(true);
-    archive
-        .unpack(root)
-        .map_err(|source| Error::invalid(layer, format!("tar extraction failed: {source}")))?;
-
-    for marker in plan.markers {
-        ensure_no_symlink_parents(root, &marker, layer)?;
-        remove_path(&root.join(marker), "remove extracted whiteout")?;
-    }
-    Ok(())
-}
-
-fn inspect_archive(
-    archive_path: &Path,
-    layer: &digest::Sha256Digest,
-) -> Result<ArchivePlan, Error> {
-    let archive = File::open(archive_path)
-        .map_err(|source| Error::io("open uncompressed layer", archive_path, source))?;
-    let mut archive = tar::Archive::new(BufReader::new(archive));
-    let entries = archive
-        .entries()
-        .map_err(|source| Error::invalid(layer, format!("invalid tar archive: {source}")))?;
-    let mut seen = HashSet::new();
-    let mut planned_entries = Vec::new();
-    let mut markers = Vec::new();
-    let mut whiteouts = Vec::new();
-
-    for entry in entries {
-        let mut entry = entry
-            .map_err(|source| Error::invalid(layer, format!("invalid tar entry: {source}")))?;
-        let raw_path = entry
-            .path()
-            .map_err(|source| Error::invalid(layer, format!("invalid tar path: {source}")))?;
-        let path = normalize_relative(&raw_path)
-            .map_err(|message| Error::invalid(layer, format!("unsafe tar path: {message}")))?;
-        if path.as_os_str().is_empty() {
-            if !entry.header().entry_type().is_dir() {
-                return Err(Error::invalid(
-                    layer,
-                    "the archive root entry is not a directory",
-                ));
-            }
-            continue;
-        }
-        if !seen.insert(path.clone()) {
+impl Archive {
+    #[tracing::instrument(
+        skip(self, expected_diff_id),
+        fields(archive = %self.0.display(), layer = %expected_diff_id),
+        err
+    )]
+    fn apply_layer_sync(
+        &self,
+        root: &Path,
+        blob: &Path,
+        media_type: &str,
+        expected_diff_id: digest::Sha256Digest,
+        preserve_ownerships: bool,
+    ) -> Result<AppliedLayer, Error> {
+        let compression = Compression::from_media_type(media_type, &expected_diff_id)?;
+        let (actual_diff_id, uncompressed_size) =
+            self.decompress_layer(blob, compression, &expected_diff_id)?;
+        if actual_diff_id != expected_diff_id {
             return Err(Error::invalid(
-                layer,
-                format!("duplicate tar entry {}", path.display()),
+                &expected_diff_id,
+                format!("diff ID mismatch: expected {expected_diff_id}, got {actual_diff_id}"),
             ));
         }
 
-        validate_link(&mut entry, layer)?;
-        planned_entries.push(ArchiveEntry {
-            path: path.clone(),
-            directory: entry.header().entry_type().is_dir(),
-        });
+        self.apply(root, &expected_diff_id, preserve_ownerships)?;
+        fs::remove_file(blob)
+            .map_err(|source| Error::io("remove downloaded layer", blob, source))?;
+        fs::remove_file(self.as_ref())
+            .map_err(|source| Error::io("remove uncompressed layer", self.as_ref(), source))?;
 
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let name = name.as_bytes();
-        if name == b".wh..wh..opq" {
-            validate_whiteout(&entry, &path, layer)?;
-            markers.push(path.clone());
-            whiteouts.push(Whiteout::Opaque(
-                path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-            ));
-        } else if let Some(target) = name.strip_prefix(b".wh.") {
-            validate_whiteout(&entry, &path, layer)?;
-            if target.is_empty() {
-                return Err(Error::invalid(
-                    layer,
-                    "whiteout .wh. has no target basename",
-                ));
+        Ok(AppliedLayer {
+            diff_id: actual_diff_id,
+            uncompressed_size,
+        })
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn decompress_layer(
+        &self,
+        blob: &Path,
+        compression: Compression,
+        layer: &digest::Sha256Digest,
+    ) -> Result<(digest::Sha256Digest, u64), Error> {
+        let input =
+            File::open(blob).map_err(|source| Error::io("open downloaded layer", blob, source))?;
+        let output = File::create(self.as_ref())
+            .map_err(|source| Error::io("create uncompressed layer", self.as_ref(), source))?;
+        let output = BufWriter::new(output);
+
+        match compression {
+            Compression::Tar => self.copy_layer(BufReader::new(input), output, layer),
+            Compression::Gzip => {
+                self.copy_layer(MultiGzDecoder::new(BufReader::new(input)), output, layer)
             }
-            if matches!(target, b"." | b"..") {
-                return Err(Error::invalid(
-                    layer,
-                    format!("whiteout {} has an unsafe target basename", path.display()),
-                ));
+            Compression::Zstd => {
+                let decoder =
+                    zstd::stream::read::Decoder::new(BufReader::new(input)).map_err(|source| {
+                        Error::invalid(layer, format!("invalid zstd stream: {source}"))
+                    })?;
+                self.copy_layer(decoder, output, layer)
             }
-            let mut target_path = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
-            target_path.push(OsString::from_vec(target.to_vec()));
-            markers.push(path);
-            whiteouts.push(Whiteout::Remove(target_path));
         }
     }
 
-    Ok(ArchivePlan {
-        entries: planned_entries,
-        markers,
-        whiteouts,
-    })
+    #[tracing::instrument(
+        skip(self, input, output),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn copy_layer(
+        &self,
+        mut input: impl Read,
+        mut output: BufWriter<File>,
+        layer: &digest::Sha256Digest,
+    ) -> Result<(digest::Sha256Digest, u64), Error> {
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+
+        loop {
+            let count = input.read(&mut buffer).map_err(|source| {
+                Error::invalid(layer, format!("decompression failed: {source}"))
+            })?;
+            if count == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|source| Error::io("write uncompressed layer", self.as_ref(), source))?;
+            hasher.update(&buffer[..count]);
+            size = size
+                .checked_add(u64::try_from(count).map_err(|_| {
+                    Error::invalid(layer, "uncompressed layer chunk length does not fit in u64")
+                })?)
+                .ok_or_else(|| Error::invalid(layer, "uncompressed layer size overflowed u64"))?;
+        }
+        output
+            .flush()
+            .map_err(|source| Error::io("flush uncompressed layer", self.as_ref(), source))?;
+
+        let digest = digest::format(&hasher.finalize())
+            .parse()
+            .expect("a computed SHA-256 digest should parse");
+        Ok((digest, size))
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn apply(
+        &self,
+        root: &Path,
+        layer: &digest::Sha256Digest,
+        preserve_ownerships: bool,
+    ) -> Result<(), Error> {
+        let plan = self.inspect(layer)?;
+        apply_whiteouts(root, &plan.whiteouts, layer)?;
+        prepare_replacements(root, &plan.entries, layer)?;
+
+        let file = File::open(self.as_ref())
+            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
+        let mut unpacker = tar::Archive::new(BufReader::new(file));
+        unpacker.set_overwrite(true);
+        unpacker.set_preserve_permissions(true);
+        unpacker.set_preserve_ownerships(preserve_ownerships);
+        unpacker.set_preserve_mtime(true);
+        unpacker.set_unpack_xattrs(true);
+        unpacker
+            .unpack(root)
+            .map_err(|source| Error::invalid(layer, format!("tar extraction failed: {source}")))?;
+
+        for marker in plan.markers {
+            ensure_no_symlink_parents(root, &marker, layer)?;
+            remove_path(&root.join(marker), "remove extracted whiteout")?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(
+        skip(self),
+        fields(archive = %self.0.display()),
+        err
+    )]
+    fn inspect(&self, layer: &digest::Sha256Digest) -> Result<ArchivePlan, Error> {
+        let file = File::open(self.as_ref())
+            .map_err(|source| Error::io("open uncompressed layer", self.as_ref(), source))?;
+        let mut reader = tar::Archive::new(BufReader::new(file));
+        let entries = reader
+            .entries()
+            .map_err(|source| Error::invalid(layer, format!("invalid tar archive: {source}")))?;
+        let mut seen = HashSet::new();
+        let mut planned_entries = Vec::new();
+        let mut markers = Vec::new();
+        let mut whiteouts = Vec::new();
+
+        for entry in entries {
+            let mut entry = entry
+                .map_err(|source| Error::invalid(layer, format!("invalid tar entry: {source}")))?;
+            let raw_path = entry
+                .path()
+                .map_err(|source| Error::invalid(layer, format!("invalid tar path: {source}")))?;
+            let path = normalize_relative(&raw_path)
+                .map_err(|message| Error::invalid(layer, format!("unsafe tar path: {message}")))?;
+            if path.as_os_str().is_empty() {
+                if !entry.header().entry_type().is_dir() {
+                    return Err(Error::invalid(
+                        layer,
+                        "the archive root entry is not a directory",
+                    ));
+                }
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                return Err(Error::invalid(
+                    layer,
+                    format!("duplicate tar entry {}", path.display()),
+                ));
+            }
+
+            validate_link(&mut entry, layer)?;
+            planned_entries.push(ArchiveEntry {
+                path: path.clone(),
+                directory: entry.header().entry_type().is_dir(),
+            });
+
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let name = name.as_bytes();
+            if name == b".wh..wh..opq" {
+                validate_whiteout(&entry, &path, layer)?;
+                markers.push(path.clone());
+                whiteouts.push(Whiteout::Opaque(
+                    path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+                ));
+            } else if let Some(target) = name.strip_prefix(b".wh.") {
+                validate_whiteout(&entry, &path, layer)?;
+                if target.is_empty() {
+                    return Err(Error::invalid(
+                        layer,
+                        "whiteout .wh. has no target basename",
+                    ));
+                }
+                if matches!(target, b"." | b"..") {
+                    return Err(Error::invalid(
+                        layer,
+                        format!("whiteout {} has an unsafe target basename", path.display()),
+                    ));
+                }
+                let mut target_path = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+                target_path.push(OsString::from_vec(target.to_vec()));
+                markers.push(path);
+                whiteouts.push(Whiteout::Remove(target_path));
+            }
+        }
+
+        Ok(ArchivePlan {
+            entries: planned_entries,
+            markers,
+            whiteouts,
+        })
+    }
 }
 
 fn prepare_replacements(
@@ -802,7 +839,7 @@ fn hash_file(path: &Path) -> Result<digest::Sha256Digest, Error> {
     let file = File::open(path)
         .map_err(|source| Error::io("open filesystem for hashing", path, source))?;
     let mut reader = BufReader::new(file);
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut hasher = Sha256::new();
     loop {
         let count = reader
@@ -846,7 +883,7 @@ mod tests {
     use tar::{Builder, EntryType, Header};
 
     use super::{
-        ArtifactStore, Error, FilesystemLayout, MIB, Workspace, apply_layer_sync, filesystem_layout,
+        Archive, ArtifactStore, Error, FilesystemLayout, MIB, Workspace, filesystem_layout,
     };
     use crate::oci::{digest, media};
 
@@ -969,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn layers_merge_whiteouts_links_permissions_and_xattrs() {
         let store = ArtifactStore::for_test(false);
-        let workspace = store.workspace().expect("test workspace should be created");
+        let workspace = Workspace::new().expect("test workspace should be created");
         let base = TestLayer::new(
             archive(|builder| {
                 append_file(builder, "remove", b"lower", 0o644);
@@ -1062,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn uncompressed_layers_are_supported() {
         let store = ArtifactStore::for_test(false);
-        let workspace = store.workspace().expect("test workspace should be created");
+        let workspace = Workspace::new().expect("test workspace should be created");
         let layer = TestLayer::new(
             archive(|builder| append_file(builder, "etc/plain", b"plain", 0o644)),
             Encoding::Tar,
@@ -1079,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn docker_gzip_layers_are_supported() {
         let store = ArtifactStore::for_test(false);
-        let workspace = store.workspace().expect("test workspace should be created");
+        let workspace = Workspace::new().expect("test workspace should be created");
         let mut layer = TestLayer::new(
             archive(|builder| append_file(builder, "etc/docker", b"docker", 0o644)),
             Encoding::Gzip,
@@ -1099,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_paths_and_invalid_whiteouts_are_rejected() {
         let store = ArtifactStore::for_test(false);
-        let duplicate_workspace = store.workspace().expect("test workspace should be created");
+        let duplicate_workspace = Workspace::new().expect("test workspace should be created");
         let duplicate = TestLayer::new(
             archive(|builder| {
                 append_file(builder, "same", b"first", 0o644);
@@ -1121,7 +1158,7 @@ mod tests {
         assert!(matches!(duplicate_error, Error::InvalidLayer { .. }));
         assert!(duplicate_error.to_string().contains("duplicate tar entry"));
 
-        let whiteout_workspace = store.workspace().expect("test workspace should be created");
+        let whiteout_workspace = Workspace::new().expect("test workspace should be created");
         let whiteout = TestLayer::new(
             archive(|builder| append_file(builder, ".wh.target", b"not empty", 0o644)),
             Encoding::Gzip,
@@ -1139,7 +1176,7 @@ mod tests {
         assert!(whiteout_error.to_string().contains("empty regular file"));
 
         for marker in [".wh..", ".wh..."] {
-            let workspace = store.workspace().expect("test workspace should be created");
+            let workspace = Workspace::new().expect("test workspace should be created");
             let layer = TestLayer::new(
                 archive(|builder| append_empty_file(builder, marker)),
                 Encoding::Gzip,
@@ -1157,7 +1194,7 @@ mod tests {
     #[tokio::test]
     async fn traversal_and_symlink_parent_escapes_are_rejected() {
         let store = ArtifactStore::for_test(false);
-        let traversal_workspace = store.workspace().expect("test workspace should be created");
+        let traversal_workspace = Workspace::new().expect("test workspace should be created");
         let traversal = TestLayer::new(
             archive(|builder| {
                 let body = b"escape";
@@ -1188,7 +1225,7 @@ mod tests {
         assert!(traversal_error.to_string().contains("parent component"));
 
         let outside = tempfile::tempdir().expect("outside directory should be created");
-        let symlink_workspace = store.workspace().expect("test workspace should be created");
+        let symlink_workspace = Workspace::new().expect("test workspace should be created");
         let base = TestLayer::new(
             archive(|builder| {
                 append_link(builder, "escape", outside.path(), EntryType::Symlink);
@@ -1208,7 +1245,7 @@ mod tests {
         assert!(symlink_error.to_string().contains("traverses a symlink"));
         assert!(!outside.path().join("pwned").exists());
 
-        let same_layer_workspace = store.workspace().expect("test workspace should be created");
+        let same_layer_workspace = Workspace::new().expect("test workspace should be created");
         let same_layer = TestLayer::new(
             archive(|builder| {
                 append_link(builder, "same-escape", outside.path(), EntryType::Symlink);
@@ -1237,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_compression_and_tar_are_rejected_as_invalid_layers() {
         let store = ArtifactStore::for_test(false);
-        let workspace = store.workspace().expect("test workspace should be created");
+        let workspace = Workspace::new().expect("test workspace should be created");
         fs::write(workspace.layer_blob(0), b"not a gzip stream")
             .expect("invalid layer should be written");
         let diff_id = digest::Sha256Digest::from(b"expected".as_slice());
@@ -1253,7 +1290,7 @@ mod tests {
         assert!(matches!(error, Error::InvalidLayer { .. }));
         assert!(error.to_string().contains("decompression failed"));
 
-        let tar_workspace = store.workspace().expect("test workspace should be created");
+        let tar_workspace = Workspace::new().expect("test workspace should be created");
         let invalid_tar = vec![b'x'; 512];
         fs::write(tar_workspace.layer_blob(0), &invalid_tar)
             .expect("invalid tar layer should be written");
@@ -1334,7 +1371,7 @@ mod tests {
         let root = temporary.path().join("root");
         fs::create_dir(&root).expect("test root should be created");
         let blob = temporary.path().join("layer.blob");
-        let tar = temporary.path().join("layer.tar");
+        let uncompressed = Archive(temporary.path().join("layer.tar"));
         let layer = TestLayer::new(
             archive(|builder| append_file(builder, "file", b"body", 0o644)),
             Encoding::Tar,
@@ -1342,7 +1379,8 @@ mod tests {
         fs::write(&blob, layer.body).expect("test layer should be written");
         let wrong = digest::Sha256Digest::from(b"wrong".as_slice());
 
-        let error = apply_layer_sync(&root, &blob, &tar, layer.media_kind.as_ref(), wrong, false)
+        let error = uncompressed
+            .apply_layer_sync(&root, &blob, layer.media_kind.as_ref(), wrong, false)
             .expect_err("wrong diff ID should fail");
 
         assert!(error.to_string().contains("diff ID mismatch"));

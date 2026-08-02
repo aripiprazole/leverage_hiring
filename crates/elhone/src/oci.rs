@@ -188,31 +188,10 @@ impl OciFetcher {
 
         let platform = config.platform(selected_platform);
         let image = config.response();
-        let workspace = self.artifacts.workspace()?;
         let oci_schema::Rootfs::Layers { diff_ids } = &config.rootfs;
-        let mut layers = Vec::with_capacity(manifest.document.layers.len());
-        for (index, (descriptor, diff_id)) in
-            manifest.document.layers.iter().zip(diff_ids).enumerate()
-        {
-            let layer_url = loc.blob_url(&descriptor.digest)?;
-            let layer_url = self.transport.parse(&layer_url)?;
-            let downloaded = session
-                .fetch_layer(layer_url, descriptor, &workspace.layer_blob(index))
-                .await?;
-            let applied = self
-                .artifacts
-                .apply_layer(&workspace, index, &descriptor.media_kind, diff_id.clone())
-                .await?;
-            layers.push(api_schema::Layer::new(api_schema::LayerInput {
-                url: layer_url.as_ref(),
-                descriptor,
-                downloaded_size: downloaded.size,
-                downloaded_digest: downloaded.digest,
-                diff_id: applied.diff_id,
-                uncompressed_size: applied.uncompressed_size,
-            })?);
-        }
-        let filesystem = self.artifacts.finish(workspace).await?;
+        let (layers, filesystem) = self
+            .fetch_layers(&mut session, &loc, &manifest.document.layers, diff_ids)
+            .await?;
 
         Ok(api_schema::Run {
             url: loc.manifest.to_string(),
@@ -235,6 +214,43 @@ impl OciFetcher {
             layers,
             filesystem: filesystem.into(),
         })
+    }
+
+    #[tracing::instrument(
+        skip(self, session, loc, descriptors, diff_ids),
+        fields(layer_count = descriptors.len()),
+        err
+    )]
+    async fn fetch_layers(
+        &self,
+        session: &mut FetchSession<'_>,
+        loc: &registry::Loc,
+        descriptors: &[descriptor::Layer],
+        diff_ids: &[digest::Sha256Digest],
+    ) -> Result<(Vec<api_schema::Layer>, rootfs::Filesystem), OciError> {
+        let workspace = rootfs::Workspace::new()?;
+        let mut layers = Vec::with_capacity(descriptors.len());
+        for (index, (descriptor, diff_id)) in descriptors.iter().zip(diff_ids).enumerate() {
+            let layer_url = loc.blob_url(&descriptor.digest)?;
+            let layer_url = self.transport.parse(&layer_url)?;
+            let downloaded = session
+                .fetch_layer(layer_url, descriptor, &workspace.layer_blob(index))
+                .await?;
+            let applied = self
+                .artifacts
+                .apply_layer(&workspace, index, &descriptor.media_kind, diff_id.clone())
+                .await?;
+            layers.push(api_schema::Layer::new(api_schema::LayerInput {
+                url: layer_url.as_ref(),
+                descriptor,
+                downloaded_size: downloaded.size,
+                downloaded_digest: downloaded.digest,
+                diff_id: applied.diff_id,
+                uncompressed_size: applied.uncompressed_size,
+            })?);
+        }
+        let filesystem = self.artifacts.finish(workspace).await?;
+        Ok((layers, filesystem))
     }
 }
 
@@ -1027,10 +1043,10 @@ mod image {
 
     #[derive(Debug)]
     pub struct Config {
-        created: Option<String>,
-        author: Option<String>,
-        platform: Platform,
-        config: oci_schema::RuntimeConfig,
+        pub created: Option<String>,
+        pub author: Option<String>,
+        pub platform: Platform,
+        pub runtime: oci_schema::RuntimeConfig,
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,
     }
@@ -1054,7 +1070,7 @@ mod image {
                 created: doc.created,
                 author: doc.author,
                 platform,
-                config: doc.config,
+                runtime: doc.config,
                 rootfs: doc.rootfs,
                 history: doc.history,
             })
@@ -1084,20 +1100,20 @@ mod image {
 
         #[tracing::instrument(skip(self))]
         pub fn response(&self) -> api_schema::Image {
-            let config = &self.config;
+            let runtime = &self.runtime;
             api_schema::Image {
                 created: self.created.clone(),
                 author: self.author.clone(),
-                user: config.user.clone(),
-                exposed_ports: config.exposed_ports.keys().cloned().collect(),
-                env: config.env.clone(),
-                entrypoint: config.entrypoint.clone(),
-                cmd: config.cmd.clone(),
-                volumes: config.volumes.keys().cloned().collect(),
-                working_dir: config.working_dir.clone(),
-                labels: config.labels.clone(),
-                stop_signal: config.stop_signal.clone(),
-                args_escaped: config.args_escaped,
+                user: runtime.user.clone(),
+                exposed_ports: runtime.exposed_ports.keys().cloned().collect(),
+                env: runtime.env.clone(),
+                entrypoint: runtime.entrypoint.clone(),
+                cmd: runtime.cmd.clone(),
+                volumes: runtime.volumes.keys().cloned().collect(),
+                working_dir: runtime.working_dir.clone(),
+                labels: runtime.labels.clone(),
+                stop_signal: runtime.stop_signal.clone(),
+                args_escaped: runtime.args_escaped,
             }
         }
     }
@@ -1671,8 +1687,8 @@ mod tests {
     }
 
     impl ServedDocument {
-        fn from_json(value: Value, media_type: &'static str) -> Self {
-            let body = serde_json::to_vec(&value).expect("fixture JSON should serialize");
+        fn from_json(value: &Value, media_type: &'static str) -> Self {
+            let body = serde_json::to_vec(value).expect("fixture JSON should serialize");
             let digest = digest::Sha256Digest::from(body.as_slice());
             Self {
                 body,
@@ -1721,8 +1737,36 @@ mod tests {
                 first_layer.diff_id.clone()
             };
 
-            let config = ServedDocument::from_json(
-                json!({
+            let config = Self::config_document(platform, &first_diff_id, &second_layer.diff_id);
+            let manifest =
+                Self::manifest_document(&config, &first_layer, &first_digest, &second_layer);
+            let index = Self::index_document(platform, &manifest);
+            let initial = match initial {
+                InitialDocument::Index => index,
+                InitialDocument::Manifest => manifest.clone(),
+            };
+            Self {
+                initial,
+                manifest,
+                config,
+                layers: vec![
+                    (first_digest, first_layer.media_type, first_layer.body),
+                    (
+                        second_layer.digest,
+                        second_layer.media_type,
+                        second_layer.body,
+                    ),
+                ],
+            }
+        }
+
+        fn config_document(
+            platform: &platform::HostPlatform,
+            first_diff_id: &digest::Sha256Digest,
+            second_diff_id: &digest::Sha256Digest,
+        ) -> ServedDocument {
+            ServedDocument::from_json(
+                &json!({
                     "created": "2026-08-02T12:00:00Z",
                     "author": "fixture@example.com",
                     "architecture": platform.architecture,
@@ -1754,7 +1798,7 @@ mod tests {
                         "type": "layers",
                         "diff_ids": [
                             first_diff_id,
-                            second_layer.diff_id
+                            second_diff_id
                         ]
                     },
                     "history": [
@@ -1773,10 +1817,17 @@ mod tests {
                     ]
                 }),
                 "application/vnd.oci.image.config.v1+json",
-            );
+            )
+        }
 
-            let manifest = ServedDocument::from_json(
-                json!({
+        fn manifest_document(
+            config: &ServedDocument,
+            first_layer: &LayerFixture,
+            first_digest: &digest::Sha256Digest,
+            second_layer: &LayerFixture,
+        ) -> ServedDocument {
+            ServedDocument::from_json(
+                &json!({
                     "schemaVersion": 2,
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "config": {
@@ -1801,10 +1852,15 @@ mod tests {
                     }
                 }),
                 "application/vnd.oci.image.manifest.v1+json",
-            );
+            )
+        }
 
-            let index = ServedDocument::from_json(
-                json!({
+        fn index_document(
+            platform: &platform::HostPlatform,
+            manifest: &ServedDocument,
+        ) -> ServedDocument {
+            ServedDocument::from_json(
+                &json!({
                     "schemaVersion": 2,
                     "mediaType": "application/vnd.oci.image.index.v1+json",
                     "manifests": [
@@ -1826,25 +1882,7 @@ mod tests {
                     }
                 }),
                 "application/vnd.oci.image.index.v1+json",
-            );
-
-            let initial = match initial {
-                InitialDocument::Index => index,
-                InitialDocument::Manifest => manifest.clone(),
-            };
-            Self {
-                initial,
-                manifest,
-                config,
-                layers: vec![
-                    (first_digest, first_layer.media_type, first_layer.body),
-                    (
-                        second_layer.digest,
-                        second_layer.media_type,
-                        second_layer.body,
-                    ),
-                ],
-            }
+            )
         }
     }
 
