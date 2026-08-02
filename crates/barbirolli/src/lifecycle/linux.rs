@@ -4,7 +4,7 @@ use std::{
     fmt::Debug,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -19,11 +19,12 @@ use dashmap::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use nonempty_collections::NEVec;
+use tokio::time::{MissedTickBehavior, interval};
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    StorageError, VmId, VmInput, VmSpec, VmStore,
+    DaemonConfig, MemoryMib, ProvisioningConfig, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
 };
@@ -36,12 +37,17 @@ pub enum BarbirolliVm {
     Managed(ManagedVm),
 }
 
+#[derive(Debug, Clone)]
+pub struct Balloon {
+    pub ballon_mem: MemoryMib,
+}
+
 pub struct BarbirolliInner {
     pub(crate) vms: DashMap<VmId, BarbirolliVm>,
+    pub balloon: RwLock<Balloon>,
+    pub provisioning: ProvisioningConfig,
     pub store: VmStore,
-    pub firecracker: PathBuf,
-    pub api_socket_dir: PathBuf,
-    pub api_socket_timeout: Duration,
+    pub firecracker: Firecracker,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
     pub idle_policy: IdlePolicy,
@@ -52,77 +58,30 @@ pub struct BarbirolliInner {
 pub struct Barbirolli(Arc<BarbirolliInner>);
 
 impl Barbirolli {
-    pub async fn new(
-        store: VmStore,
-        firecracker: impl Into<PathBuf>,
-    ) -> Result<Self, LifecycleError> {
-        Self::new_with_idle_policy(store, firecracker, IdlePolicy::default()).await
-    }
-
-    pub async fn new_with_idle_policy(
-        mut store: VmStore,
-        firecracker: impl Into<PathBuf>,
-        idle_policy: IdlePolicy,
-    ) -> Result<Self, LifecycleError> {
-        let firecracker = verify_firecracker(firecracker).await?;
-        tracing::info!(?firecracker, "initializing barbirolli");
-        let specs = store
-            .vm_root
-            .by_ref()
-            .map(|item| item.map(|item| item.persisted_spec.spec))
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        let api_socket_dir = store.vm_root.dir.join(".sockets");
+    #[tracing::instrument]
+    pub async fn new(store: VmStore, config: DaemonConfig) -> Result<Self, LifecycleError> {
+        tracing::info!("initializing barbirolli");
+        let firecracker = Firecracker::new(config.firecracker).await?;
+        let specs = store.all().await?;
         let barbirolli = Self(Arc::new(BarbirolliInner {
-            vms: DashMap::default(),
-            store,
             firecracker,
-            api_socket_dir,
-            api_socket_timeout: Duration::from_secs(10),
+            vms: DashMap::default(),
+            balloon: RwLock::new(Balloon {
+                ballon_mem: config.provisioning.initial_ballon_mem,
+            }),
+            provisioning: config.provisioning,
+            store,
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
-            idle_policy,
+            idle_policy: config.idle_policy.unwrap_or_default(),
         }));
-        let mut errors = vec![];
-        for spec in specs {
-            if spec.deleted {
-                continue;
-            }
-            if let Err(err) = spec.reconcile(&barbirolli).await {
-                errors.push(WarmupFailure::Reconcile(err));
-                continue;
-            }
-            barbirolli
-                .vms
-                .insert(spec.id, BarbirolliVm::Discovered(spec));
-        }
-        match NEVec::try_from_vec(errors) {
-            Some(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
-            None => {
-                tracing::info!(vm_count = barbirolli.vms.len(), "barbirolli ready");
+        match reconcile(&barbirolli, specs).await {
+            Validated::Fail(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
+            Validated::Good(()) => {
+                tracing::info!("barbirolli ready");
                 Ok(barbirolli)
             }
         }
-    }
-
-    pub async fn run_idle_reaper(&self) {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        while self.is_app_alive().is_ok() {
-            interval.tick().await;
-            for mut vm in self.vms.iter_mut() {
-                let vm = vm.value_mut();
-                vm.check_idle(self).await;
-            }
-        }
-    }
-
-    pub(crate) fn api_socket(&self, vm_id: VmId) -> PathBuf {
-        self.api_socket_dir
-            .join(format!("firecracker-{vm_id}.socket"))
-    }
-
-    pub(crate) fn legacy_api_socket(&self) -> PathBuf {
-        self.api_socket_dir.join("firecracker.socket")
     }
 
     pub fn vm(&self, vm_id: VmId) -> Result<Ref<'_, VmId, BarbirolliVm>> {
@@ -135,10 +94,27 @@ impl Barbirolli {
             .ok_or(LifecycleError::NotFound(vm_id))
     }
 
+    /// Prune resources at the host machine by stopping idle vms, and by
+    /// removing idle vms it does free resources to be allocated to used vms
+    pub async fn autoscale(&self) {
+        let mut interval = interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        while self.is_app_alive().is_ok() {
+            interval.tick().await;
+            for mut vm in self.vms.iter_mut() {
+                let vm = vm.value_mut();
+                vm.check_idle(self).await;
+            }
+        }
+    }
+
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
         self.is_app_alive()?;
-        let spec = self.store.create(input).await?;
+        let spec = self
+            .store
+            .create(input, self.provisioning.default_vm_mem)
+            .await?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
         tracing::info!(
@@ -170,8 +146,8 @@ impl Barbirolli {
         tracing::info!(status = "deleting", "VM state transition");
         let () = {
             let vm = vm.get_mut();
-            vm.shutdown(&self).await?;
-            self.store.delete(&vm.spec())?;
+            vm.shutdown(self).await?;
+            self.store.delete(vm.spec())?;
         };
         vm.remove();
         tracing::info!(status = "deleted", "VM state transition");
@@ -183,13 +159,9 @@ impl Barbirolli {
         tracing::info!("draining barbirolli");
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
-        let ids = self.vms.iter().map(|vm| *vm.key()).collect::<Vec<_>>();
-        for id in ids {
-            tracing::info!(?id, "shutting down");
-            let Some(mut vm) = self.vms.get_mut(&id) else {
-                continue;
-            };
-            if let Err(err) = vm.shutdown(self).await {
+        for mut vm in self.vms.iter_mut() {
+            tracing::info!(id = ?vm.key(), "shutting down");
+            if let Err(err) = vm.value_mut().shutdown(self).await {
                 errors.push(Box::new(err))
             }
         }
@@ -211,27 +183,29 @@ impl Barbirolli {
     }
 }
 
-pub async fn verify_firecracker(firecracker: impl Into<PathBuf>) -> Result<PathBuf> {
-    let firecracker = firecracker.into();
-    let output = tokio::process::Command::new(&firecracker)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
-    let version = if output.stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).trim().to_owned()
-    } else {
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    };
-    if output.status.success() && version.starts_with("Firecracker v1.13.") {
-        tracing::debug!(
-            path = %firecracker.display(),
-            %version,
-            "verified Firecracker executable"
-        );
-        Ok(firecracker)
-    } else {
-        Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {
+    let mut errors = vec![];
+    for spec in specs {
+        if spec.deleted {
+            continue;
+        }
+        match spec.reconcile(barbirolli).await {
+            Ok(()) => {
+                barbirolli
+                    .vms
+                    .insert(spec.id, BarbirolliVm::Discovered(spec));
+            }
+            Err(err) => {
+                errors.push(WarmupFailure::Reconcile(err));
+            }
+        }
+    }
+    match NEVec::try_from_vec(errors) {
+        Some(errors) => Validated::Fail(errors),
+        None => {
+            tracing::info!(vm_count = barbirolli.vms.len(), "reconciliation done");
+            Validated::Good(())
+        }
     }
 }
 
@@ -453,5 +427,40 @@ impl BarbirolliVm {
         }
         .instrument(info_span!("shutdown_vm", %vm_id, operation = "shutdown"))
         .boxed()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Firecracker {
+    pub bin: PathBuf,
+    pub api_socket_timeout: Duration,
+}
+
+impl Firecracker {
+    pub async fn new(firecracker: impl Into<PathBuf>) -> Result<Firecracker> {
+        let firecracker = firecracker.into();
+        let output = tokio::process::Command::new(&firecracker)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
+        let version = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        if output.status.success() && version.starts_with("Firecracker v1.13.") {
+            tracing::debug!(
+                path = %firecracker.display(),
+                %version,
+                "verified Firecracker executable"
+            );
+            Ok(Firecracker {
+                bin: firecracker,
+                api_socket_timeout: Duration::from_secs(10),
+            })
+        } else {
+            Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+        }
     }
 }

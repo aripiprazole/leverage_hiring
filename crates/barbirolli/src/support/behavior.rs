@@ -1,6 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, LifecycleError, VmId, VmSpec, VmStore, VmSummary};
+use barbirolli::{
+    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmId, VmSpec, VmStore, VmSummary,
+};
 use derive_more::{Deref, DerefMut};
 use futures::future::try_join_all;
 use tempfile::TempDir;
@@ -47,6 +49,12 @@ pub struct BehaviorVmFixture {
     pub storage: VmStorageFixture,
 }
 
+impl Default for BehaviorFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BehaviorFixture {
     pub fn new() -> Self {
         let temporary = tempfile::tempdir().expect("failed to create temporary storage");
@@ -88,9 +96,16 @@ impl BehaviorFixture {
 
     pub async fn manager(&self) -> BehaviorManagerFixture {
         let store = self.storage.open().store;
-        let manager = Barbirolli::new(store, self.firecracker.clone())
-            .await
-            .expect("failed to create Barbirolli");
+        let manager = Barbirolli::new(
+            store,
+            DaemonConfig {
+                provisioning: ProvisioningConfig::default(),
+                firecracker: self.firecracker.clone(),
+                idle_policy: None,
+            },
+        )
+        .await
+        .expect("failed to create Barbirolli");
         BehaviorManagerFixture { manager }
     }
 }
@@ -108,7 +123,10 @@ impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
         let spec = self
             .store
-            .create(config.into_input())
+            .create(
+                config.into_input(),
+                ProvisioningConfig::default().default_vm_mem,
+            )
             .await
             .expect("failed to create stored VM");
         StoredVmFixture::new(spec)

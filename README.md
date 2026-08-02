@@ -5,7 +5,6 @@
 - Unrestricted firecracker vmm: It's only running trusted binary / root fs, and it's not running in production.
 - Secret Management using Firecracker MDS: not implemented
 - UDP port bindings: not implemented
-- Memory/Resources limiting: not implemented
 
 ## Lima
 
@@ -77,6 +76,8 @@ Then, inside Lima:
 ./x delete 0
 ```
 
+New VMs use the daemon provisioning default of 256 MiB. Memory is not selected per create request.
+
 ## CLI helpers
 
 ```sh
@@ -108,7 +109,7 @@ Run these from the repository root inside the Linux/Lima guest. Keep
 ### SQLite
 
 ```sh
-VM_ID=$(./x create --memory-mib 256 | jq -r .id)
+VM_ID=$(./x create | jq -r .id)
 
 ./x start "$VM_ID"
 
@@ -159,7 +160,7 @@ Press `Ctrl-C` in the HTTP server terminal, then run:
 ### PostgreSQL
 
 ```sh
-VM_ID=$(./x create --memory-mib 512 --publish 5432:5432 | jq -r .id)
+VM_ID=$(./x create --publish 5432:5432 | jq -r .id)
 
 ./x start "$VM_ID"
 

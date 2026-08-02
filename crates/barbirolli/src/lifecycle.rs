@@ -1,7 +1,9 @@
+use std::path::PathBuf;
+
 use serde::Serialize;
 use validated::Validated;
 
-use crate::{NetworkSpec, PortBinding, StorageError, VmId};
+use crate::{MemoryMib, NetworkSpec, PortBinding, StorageError, VmId, idle::IdlePolicy};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -14,6 +16,42 @@ pub use linux::*;
 pub use macos::*;
 
 pub type Result<T, E = LifecycleError> = std::result::Result<T, E>;
+
+/// x = default_vm_mem * count
+/// max_daemon_mem = (x + (x / 100 * extra_percentage))
+#[derive(Debug)]
+pub struct ProvisioningConfig {
+    pub default_vm_mem: MemoryMib,
+    pub max_daemon_mem: MemoryMib,
+    pub initial_ballon_mem: MemoryMib,
+    pub count: u32,
+    pub extra_percentage: u8,
+}
+
+// extra_percentage = 20
+// default_vm_mem = 256
+// x = default_vm_mem * count
+// 2048 = (x + (x / 10 * extra_percentage))
+impl Default for ProvisioningConfig {
+    fn default() -> Self {
+        let ballon_sec = 2048 - (2048 / (1 + (20 / 100)));
+        let total_count = 2048 / ((1 + (20 / 100)) * 256);
+        Self {
+            default_vm_mem: MemoryMib::from(256),
+            max_daemon_mem: MemoryMib::from(2048),
+            initial_ballon_mem: MemoryMib::from(ballon_sec / total_count),
+            extra_percentage: 20,
+            count: 2048 / ((1 + (20 / 100)) * 256),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DaemonConfig {
+    pub provisioning: ProvisioningConfig,
+    pub firecracker: PathBuf,
+    pub idle_policy: Option<IdlePolicy>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,7 +119,7 @@ mod tests {
     async fn per_vm_api_sockets_support_concurrent_vms_and_repeated_lifecycle_calls() {
         let fixture = FirecrackerFixture::new().await;
 
-        let first = fixture.create_vm(TestVmConfig::new(1, 128)).await;
+        let first = fixture.create_vm(TestVmConfig::new(1)).await;
         first
             .lifecycle
             .start_concurrently(|lifecycle| {
@@ -91,11 +129,11 @@ mod tests {
         first
             .api
             .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(1, 128));
+                assert_eq!(config, &MachineConfig::new(1, 256));
             })
             .await;
 
-        let second = fixture.create_vm(TestVmConfig::new(2, 192)).await;
+        let second = fixture.create_vm(TestVmConfig::new(2)).await;
         assert_ne!(first.id, second.id);
         second
             .lifecycle
@@ -107,7 +145,7 @@ mod tests {
         second
             .api
             .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 192));
+                assert_eq!(config, &MachineConfig::new(2, 256));
             })
             .await;
 
@@ -121,7 +159,7 @@ mod tests {
         second
             .api
             .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 192));
+                assert_eq!(config, &MachineConfig::new(2, 256));
             })
             .await;
 
@@ -134,13 +172,13 @@ mod tests {
         first
             .api
             .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(1, 128));
+                assert_eq!(config, &MachineConfig::new(1, 256));
             })
             .await;
         second
             .api
             .machine_config(|config| {
-                assert_eq!(config, &MachineConfig::new(2, 192));
+                assert_eq!(config, &MachineConfig::new(2, 256));
             })
             .await;
 
@@ -151,13 +189,10 @@ mod tests {
     async fn concurrent_vms_keep_private_disks_across_manager_restart_and_delete_together() {
         let mut fixture = FirecrackerFixture::new().await;
         let mut vms = fixture
-            .create_vms_concurrently::<2>(
-                [TestVmConfig::new(1, 128), TestVmConfig::new(1, 128)],
-                |vms| {
-                    assert_eq!(vms.len(), 2);
-                    assert_ne!(vms[0].id, vms[1].id);
-                },
-            )
+            .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |vms| {
+                assert_eq!(vms.len(), 2);
+                assert_ne!(vms[0].id, vms[1].id);
+            })
             .await;
         vms.sort_by_key(|vm| u16::from(vm.id));
         let alice_id = vms[0].id;
@@ -247,7 +282,7 @@ mod tests {
             let fixture = BehaviorFixture::new();
             let manager = fixture.manager().await;
             let vm = manager
-                .try_create_vm(TestVmConfig::new(1, 128))
+                .try_create_vm(TestVmConfig::new(1))
                 .await
                 .expect("failed to create manager VM");
 
@@ -293,7 +328,7 @@ mod tests {
             assert!(fixture.temporary.path().is_dir());
             let manager = fixture.manager().await;
             let vm = manager
-                .try_create_vm(TestVmConfig::new(1, 128))
+                .try_create_vm(TestVmConfig::new(1))
                 .await
                 .expect("failed to create manager VM");
 
@@ -321,10 +356,10 @@ mod tests {
             let mut vms = manager
                 .create_vms_concurrently::<4>(
                     [
-                        TestVmConfig::new(1, 128),
-                        TestVmConfig::new(1, 129),
-                        TestVmConfig::new(1, 130),
-                        TestVmConfig::new(1, 131),
+                        TestVmConfig::new(1),
+                        TestVmConfig::new(1),
+                        TestVmConfig::new(1),
+                        TestVmConfig::new(1),
                     ],
                     |vms| {
                         let ids = vms
@@ -360,11 +395,7 @@ mod tests {
                 .collect::<Vec<_>>();
             active.sort_unstable();
             assert_eq!(active, [1, 3]);
-            let next = fixture
-                .storage
-                .open()
-                .create_vm(TestVmConfig::new(1, 128))
-                .await;
+            let next = fixture.storage.open().create_vm(TestVmConfig::new(1)).await;
             assert_eq!(u16::from(next.spec.id), 4);
         }
 
@@ -375,7 +406,7 @@ mod tests {
 
             manager.finish().await;
             assert!(matches!(
-                manager.try_create_vm(TestVmConfig::new(1, 128)).await,
+                manager.try_create_vm(TestVmConfig::new(1)).await,
                 Err(LifecycleError::Draining)
             ));
         }

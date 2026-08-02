@@ -60,7 +60,7 @@ mod tests {
         let fixture = FirecrackerFixture::new().await;
         let key = SshKeyFixture::generate().await;
         let vm = fixture
-            .create_vm(TestVmConfig::new(1, 128).authorized_key(key.public_key.clone()))
+            .create_vm(TestVmConfig::new(1).authorized_key(key.public_key.clone()))
             .await;
         vm.lifecycle.start(|_| {}).await;
 
@@ -78,7 +78,7 @@ mod tests {
     async fn storage_copies_artifacts_without_a_key_sidecar() {
         let fixture = BehaviorFixture::new();
         let store = fixture.storage.open();
-        let alice = store.create_vm(TestVmConfig::new(1, 128)).await;
+        let alice = store.create_vm(TestVmConfig::new(1)).await;
 
         assert_eq!(u16::from(alice.spec.id), 0);
         assert!(!alice.spec.deleted);
@@ -101,9 +101,9 @@ mod tests {
     async fn storage_soft_deletes_and_allocates_monotonic_ids() {
         let fixture = BehaviorFixture::new();
         let store = fixture.storage.open();
-        let alice = store.create_vm(TestVmConfig::new(1, 128)).await;
+        let alice = store.create_vm(TestVmConfig::new(1)).await;
         let bob = store
-            .create_vm(TestVmConfig::new(2, 192).binding(80, 8080))
+            .create_vm(TestVmConfig::new(2).binding(80, 8080))
             .await;
 
         store.delete_vm(&alice);
@@ -112,7 +112,7 @@ mod tests {
         assert!(alice.storage.rootfs().exists());
         assert_eq!(alice.storage.config()["spec"]["deleted"], true);
 
-        let carol = store.create_vm(TestVmConfig::new(1, 128)).await;
+        let carol = store.create_vm(TestVmConfig::new(1)).await;
         assert_eq!(u16::from(alice.spec.id), 0);
         assert_eq!(u16::from(bob.spec.id), 1);
         assert_eq!(u16::from(carol.spec.id), 2);
@@ -124,9 +124,9 @@ mod tests {
     async fn storage_discovers_persisted_vms_after_reopening() {
         let fixture = BehaviorFixture::new();
         let store = fixture.storage.open();
-        let alice = store.create_vm(TestVmConfig::new(1, 128)).await;
+        let alice = store.create_vm(TestVmConfig::new(1)).await;
         let bob = store
-            .create_vm(TestVmConfig::new(2, 192).binding(80, 8080))
+            .create_vm(TestVmConfig::new(2).binding(80, 8080))
             .await;
 
         let discovered = fixture.storage.open().discover();
@@ -136,11 +136,13 @@ mod tests {
             .find(|vm| vm.spec.id == alice.spec.id)
             .expect("Alice's persisted VM was not discovered");
         assert!(!reopened_alice.spec.deleted);
+        assert_eq!(reopened_alice.spec.api_socket, alice.spec.api_socket);
         let reopened_bob = discovered
             .iter()
             .find(|vm| vm.spec.id == bob.spec.id)
             .expect("Bob's persisted VM was not discovered");
         assert!(!reopened_bob.spec.deleted);
+        assert_eq!(reopened_bob.spec.api_socket, bob.spec.api_socket);
         assert_eq!(
             reopened_bob.spec.port_bindings,
             vec![PortBinding {
@@ -151,10 +153,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_reads_legacy_config_without_deleted() {
+    async fn storage_defaults_missing_deleted_to_false() {
         let fixture = BehaviorFixture::new();
         let store = fixture.storage.open();
-        let alice = store.create_vm(TestVmConfig::new(1, 128)).await;
+        let alice = store.create_vm(TestVmConfig::new(1)).await;
         let mut config = alice.storage.config();
         config["spec"]
             .as_object_mut()
@@ -162,9 +164,9 @@ mod tests {
             .remove("deleted");
         fs::write(
             alice.storage.artifact_dir.join("config.json"),
-            serde_json::to_vec_pretty(&config).expect("failed to encode legacy VM config"),
+            serde_json::to_vec_pretty(&config).expect("failed to encode VM config"),
         )
-        .expect("failed to write legacy VM config");
+        .expect("failed to write VM config");
 
         let discovered = fixture.storage.open().discover();
         assert_eq!(discovered.len(), 1);

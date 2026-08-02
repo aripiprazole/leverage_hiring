@@ -1,24 +1,26 @@
 use super::{Result, StorageError};
 
 use std::{
+    collections::HashMap,
     fs::{
         canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all, rename,
         set_permissions,
     },
+    future::Future,
     io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
-
-use crate::{NetworkSpec, VmId, VmInput, VmSpec};
-
-const CONFIG_VERSION: u16 = 2;
-const SOCKET_DIRECTORY: &str = ".sockets";
-
-#[cfg(target_os = "linux")]
+use nonempty_collections::NEVec;
 use rustix::mount;
+use serde::{Deserialize, Serialize};
+use validated::Validated;
+
+use crate::{ApiSocket, MemoryMib, NetworkSpec, VmId, VmInput, VmSpec};
+
+const CONFIG_VERSION: u16 = 3;
+const SOCKET_DIRECTORY: &str = ".sockets";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshAccessError {
@@ -64,16 +66,6 @@ pub enum RootfsCleanupError {
     },
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct MountedRootfs {
-    loop_device: loopdev::LoopDevice,
-    loop_path: PathBuf,
-    mountpoint: tempfile::TempDir,
-    attached: bool,
-    mounted: bool,
-}
-
 #[derive(Debug)]
 pub struct VmStore {
     pub vm_root: VmRootFolder,
@@ -81,31 +73,11 @@ pub struct VmStore {
     creation_lock: tokio::sync::Mutex<()>,
 }
 
-#[derive(Debug)]
-pub struct VmRootFolder {
-    pub(crate) dir: PathBuf,
-    paths: std::vec::IntoIter<PathDescriptor>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedVmSpec {
     pub version: u16,
     pub spec: VmSpec,
-}
-
-#[derive(Debug)]
-pub struct PathDescriptor {
-    directory: PathBuf,
-    config: PathBuf,
-}
-
-#[derive(Debug)]
-pub struct VmRootFolderItem {
-    pub name: String,
-    pub directory: PathBuf,
-    pub config: PathBuf,
-    pub persisted_spec: PersistedVmSpec,
 }
 
 impl VmStore {
@@ -134,7 +106,11 @@ impl VmStore {
     }
 
     #[tracing::instrument(skip(self, input), err)]
-    pub async fn create(&self, input: VmInput) -> Result<VmSpec, StorageError> {
+    pub async fn create(
+        &self,
+        input: VmInput,
+        memory_mib: MemoryMib,
+    ) -> Result<VmSpec, StorageError> {
         let _creation_guard = self.creation_lock.lock().await;
         let source_kernel = self.image_root.join("vmlinux");
         let source_rootfs = self.image_root.join("alpine.ext4");
@@ -169,7 +145,13 @@ impl VmStore {
             kernel: final_dir.join("vmlinux"),
             rootfs: final_dir.join("rootfs.ext4"),
             vcpu_count: input.vcpu_count,
-            memory_mib: input.memory_mib,
+            api_socket: ApiSocket::from(
+                self.vm_root
+                    .dir
+                    .join(SOCKET_DIRECTORY)
+                    .join(format!("firecracker-{id}.socket")),
+            ),
+            memory_mib,
             port_bindings: input.port_bindings,
             network: NetworkSpec::new(id)
                 .map_err(|error| StorageError::InvalidInput(error.to_string()))?,
@@ -177,6 +159,41 @@ impl VmStore {
         persisted.write_into(tmp.path().join("config.json"))?;
         rename(tmp.path(), &final_dir).map_err(|error| StorageError::io(&final_dir, error))?;
         Ok(persisted.spec)
+    }
+
+    pub async fn all(&self) -> Result<Vec<VmSpec>> {
+        VmRootFolder::new(&self.vm_root.dir)?
+            .map(|item| item.map(|item| item.persisted_spec.spec))
+            .collect::<Result<Vec<_>, StorageError>>()
+    }
+
+    #[tracing::instrument(skip(f))]
+    pub async fn collect<T, E, F, Fut>(&self, mut f: F) -> Result<Validated<HashMap<VmId, T>, E>>
+    where
+        F: FnMut(VmSpec) -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+    {
+        let mut acc = HashMap::new();
+        let mut errors = vec![];
+        for spec in self.all().await? {
+            if spec.deleted {
+                continue;
+            }
+
+            let id = spec.id;
+            match f(spec).await {
+                Ok(val) => {
+                    acc.insert(id, val);
+                }
+                Err(err) => {
+                    errors.push(err);
+                }
+            }
+        }
+        Ok(match NEVec::try_from_vec(errors) {
+            Some(errors) => Validated::Fail(errors),
+            None => Validated::Good(acc),
+        })
     }
 
     #[tracing::instrument(skip(self, spec), fields(vm_id = %spec.id), err)]
@@ -240,28 +257,11 @@ fn install_authorized_keys(rootfs: &Path, authorized_keys: &[u8]) -> Result<(), 
 }
 
 #[tracing::instrument(skip(authorized_keys), err)]
-#[cfg(not(target_os = "linux"))]
 fn install_authorized_keys_into_rootfs(
     rootfs: &Path,
     authorized_keys: &[u8],
 ) -> Result<(), SshAccessError> {
-    return Err(SshAccessError::operation(
-        "mount rootfs",
-        rootfs,
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ext4 rootfs installation requires Linux",
-        ),
-    ));
-}
-
-#[tracing::instrument(skip(authorized_keys), err)]
-#[cfg(target_os = "linux")]
-fn install_authorized_keys_into_rootfs(
-    rootfs: &Path,
-    authorized_keys: &[u8],
-) -> Result<(), SshAccessError> {
-    let mounted = MountedRootfs::open(rootfs)?;
+    let mounted = MountedRootfs::new(rootfs)?;
     let setup = install_authorized_keys(mounted.path(), authorized_keys);
     let cleanup = mounted.finish();
 
@@ -276,10 +276,18 @@ fn install_authorized_keys_into_rootfs(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct MountedRootfs {
+    loop_device: loopdev::LoopDevice,
+    loop_path: PathBuf,
+    mountpoint: tempfile::TempDir,
+    attached: bool,
+    mounted: bool,
+}
+
 impl MountedRootfs {
     #[tracing::instrument(err)]
-    fn open(rootfs: &Path) -> Result<Self, SshAccessError> {
+    fn new(rootfs: &Path) -> Result<Self, SshAccessError> {
         tracing::info!("attaching rootfs loop device");
         let parent = rootfs.parent().unwrap_or_else(|| Path::new("."));
         let mountpoint = tempfile::Builder::new()
@@ -396,13 +404,18 @@ impl MountedRootfs {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for MountedRootfs {
     fn drop(&mut self) {
         if let Err(err) = self.cleanup() {
             tracing::error!(?err, "failed to drop mounted rootfs");
         }
     }
+}
+
+#[derive(Debug)]
+pub struct PathDescriptor {
+    directory: PathBuf,
+    config: PathBuf,
 }
 
 impl PathDescriptor {
@@ -428,14 +441,18 @@ impl PathDescriptor {
     }
 }
 
+#[derive(Debug)]
+pub struct VmRootFolderItem {
+    pub name: String,
+    pub directory: PathBuf,
+    pub config: PathBuf,
+    pub persisted_spec: PersistedVmSpec,
+}
+
 impl VmRootFolderItem {
-    fn new(
-        descriptor: PathDescriptor,
-        name: String,
-        persisted_spec: PersistedVmSpec,
-    ) -> Result<Self> {
-        let directory = &descriptor.directory;
-        let config = &descriptor.config;
+    fn new(desc: PathDescriptor, name: String, persisted_spec: PersistedVmSpec) -> Result<Self> {
+        let directory = &desc.directory;
+        let config = &desc.config;
         let spec = &persisted_spec.spec;
         let expected_name = spec.id.to_string();
         if directory.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
@@ -452,7 +469,7 @@ impl VmRootFolderItem {
         for (actual, expected) in expected {
             if actual != &expected {
                 return Err(StorageError::InvalidConfig {
-                    path: descriptor.config.clone(),
+                    path: desc.config.clone(),
                     message: format!(
                         "configured path {} does not match {}",
                         actual.display(),
@@ -461,23 +478,42 @@ impl VmRootFolderItem {
                 });
             }
         }
+        let expected_api_socket = ApiSocket::from(
+            directory
+                .parent()
+                .expect("a VM artifact directory always has a parent")
+                .join(SOCKET_DIRECTORY)
+                .join(format!("firecracker-{}.socket", spec.id)),
+        );
+        if spec.api_socket != expected_api_socket {
+            return Err(StorageError::InvalidConfig {
+                path: desc.config.clone(),
+                message: "configured API socket does not match VM ID".to_owned(),
+            });
+        }
         let network = NetworkSpec::new(spec.id).map_err(|error| StorageError::InvalidConfig {
             path: config.clone(),
             message: error.to_string(),
         })?;
         if spec.network != network {
             return Err(StorageError::InvalidConfig {
-                path: descriptor.config.clone(),
+                path: desc.config.clone(),
                 message: "configured network does not match VM ID".to_owned(),
             });
         }
         Ok(VmRootFolderItem {
-            directory: descriptor.directory,
-            config: descriptor.config,
+            directory: desc.directory,
+            config: desc.config,
             name,
             persisted_spec,
         })
     }
+}
+
+#[derive(Debug)]
+pub struct VmRootFolder {
+    pub(crate) dir: PathBuf,
+    paths: std::vec::IntoIter<PathDescriptor>,
 }
 
 impl VmRootFolder {
@@ -559,9 +595,8 @@ mod tests {
     use std::{env, fs, os::unix::fs::PermissionsExt};
 
     use super::install_authorized_keys;
-    #[cfg(target_os = "linux")]
+
     use super::{MountedRootfs, VmStore};
-    #[cfg(target_os = "linux")]
     use crate::{AuthorizedKey, MemoryMib, VcpuCount, VmInput};
 
     #[test]
@@ -594,7 +629,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires root, loop devices, and BARBIROLLI_TEST_ROOTFS"]
     async fn vm_store_writes_explicit_authorized_keys_directly_into_rootfs() {
@@ -613,16 +647,18 @@ mod tests {
 
         let store = VmStore::new(vm_root, image_root).expect("failed to create VM store");
         let spec = store
-            .create(VmInput {
-                authorized_keys: vec![
-                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com"
-                        .parse::<AuthorizedKey>()
-                        .expect("valid authorized key"),
-                ],
-                port_bindings: Vec::new(),
-                vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
-                memory_mib: MemoryMib::try_from(128).expect("valid memory"),
-            })
+            .create(
+                VmInput {
+                    authorized_keys: vec![
+                        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com"
+                            .parse::<AuthorizedKey>()
+                            .expect("valid authorized key"),
+                    ],
+                    port_bindings: Vec::new(),
+                    vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
+                },
+                MemoryMib::from(128),
+            )
             .await
             .expect("failed to create VM");
 
@@ -631,7 +667,7 @@ mod tests {
             "authorized keys must not be persisted beside the VM artifacts"
         );
 
-        let mounted = MountedRootfs::open(&spec.rootfs).expect("failed to remount rootfs");
+        let mounted = MountedRootfs::new(&spec.rootfs).expect("failed to remount rootfs");
         assert_eq!(
             fs::read(mounted.path().join("root/.ssh/authorized_keys"))
                 .expect("failed to read authorized keys from rootfs"),

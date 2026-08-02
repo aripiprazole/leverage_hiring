@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-
-use crate::{IdlePolicy, LifecycleError, Result, VmId, VmInput, VmSpec, VmStore, VmSummary};
 use futures::{FutureExt, future::BoxFuture};
+
+use super::{DaemonConfig, LifecycleError, Result, VmSummary};
+use crate::{VmId, VmInput, VmSpec, VmStore};
 
 pub struct BarbirolliVm;
 
@@ -31,22 +31,11 @@ impl BarbirolliVm {
 pub struct Barbirolli;
 
 impl Barbirolli {
-    pub async fn new(
-        _store: VmStore,
-        _firecracker: impl Into<PathBuf>,
-    ) -> Result<Self, LifecycleError> {
+    pub async fn new(_store: VmStore, _config: DaemonConfig) -> Result<Self, LifecycleError> {
         Err(LifecycleError::UnsupportedPlatform)
     }
 
-    pub async fn new_with_idle_policy(
-        store: VmStore,
-        firecracker: impl Into<PathBuf>,
-        _idle_policy: IdlePolicy,
-    ) -> Result<Self, LifecycleError> {
-        Self::new(store, firecracker).await
-    }
-
-    pub async fn run_idle_reaper(&self) {
+    pub async fn autoscale(&self) {
         std::future::pending::<()>().await;
     }
 

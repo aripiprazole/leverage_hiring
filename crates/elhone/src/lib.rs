@@ -44,7 +44,7 @@ pub enum ConfigError {
     NonLoopbackLocal(SocketAddr),
 }
 
-pub fn validate_address(address: SocketAddr) -> Result<SocketAddr, ConfigError> {
+pub fn new_addr(address: SocketAddr) -> Result<SocketAddr, ConfigError> {
     if cfg!(feature = "local") && !address.ip().is_loopback() {
         return Err(ConfigError::NonLoopbackLocal(address));
     }
@@ -53,10 +53,10 @@ pub fn validate_address(address: SocketAddr) -> Result<SocketAddr, ConfigError> 
 
 #[derive(Clone)]
 struct AppState {
-    manager: Arc<Barbirolli>,
+    manager: Barbirolli,
 }
 
-pub fn router(manager: Arc<Barbirolli>, auth: Auth) -> Router {
+pub fn router(manager: Barbirolli, auth: Auth) -> Router {
     let app = Router::new()
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{id}", get(vm).delete(delete_vm))
@@ -306,8 +306,7 @@ mod tests {
     fn vm_input_rejects_artifact_selection() {
         for (field, value) in [("kernel", "vmlinux"), ("rootfs", "alpine.ext4")] {
             let mut input = json!({
-                "vcpu_count": 1,
-                "memory_mib": 128
+                "vcpu_count": 1
             });
             input[field] = value.into();
 
@@ -325,8 +324,7 @@ mod tests {
     fn vm_input_rejects_user() {
         let error = serde_json::from_value::<VmInput>(json!({
             "user": "alice",
-            "vcpu_count": 1,
-            "memory_mib": 128
+            "vcpu_count": 1
         }))
         .expect_err("user must not be accepted");
 
@@ -336,15 +334,13 @@ mod tests {
     #[test]
     fn vm_input_accepts_typed_port_bindings_and_defaults_to_none() {
         let without_bindings = serde_json::from_value::<VmInput>(json!({
-            "vcpu_count": 1,
-            "memory_mib": 128
+            "vcpu_count": 1
         }))
         .expect("port bindings should be optional");
         assert!(without_bindings.port_bindings.is_empty());
 
         let with_bindings = serde_json::from_value::<VmInput>(json!({
             "vcpu_count": 1,
-            "memory_mib": 128,
             "port_bindings": [
                 {
                     "internal": 22,
@@ -373,7 +369,6 @@ mod tests {
 
             let error = serde_json::from_value::<VmInput>(json!({
                 "vcpu_count": 1,
-                "memory_mib": 128,
                 "port_bindings": [binding]
             }))
             .expect_err("port zero must be rejected");

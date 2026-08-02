@@ -451,10 +451,7 @@ mod tests {
     async fn vms_are_isolated_and_can_reach_an_http_server_on_lima() {
         let fixture = FirecrackerFixture::new().await;
         let vms = fixture
-            .create_vms_concurrently::<2>(
-                [TestVmConfig::new(1, 128), TestVmConfig::new(1, 128)],
-                |_| {},
-            )
+            .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |_| {})
             .await;
         let mut running = vms;
         running.sort_by_key(|vm| u16::from(vm.id));
@@ -509,8 +506,8 @@ mod tests {
         let vms = fixture
             .create_vms_concurrently::<2>(
                 [
-                    TestVmConfig::new(1, 128),
-                    TestVmConfig::new(1, 128).binding(allowed_port, external_port),
+                    TestVmConfig::new(1),
+                    TestVmConfig::new(1).binding(allowed_port, external_port),
                 ],
                 |_| {},
             )

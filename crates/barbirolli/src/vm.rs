@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
 };
 
-use derive_more::Display;
+use derive_more::{Display, From, Into};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
@@ -16,7 +16,6 @@ pub(crate) mod managed;
 #[serde(deny_unknown_fields)]
 pub struct VmInput {
     pub vcpu_count: VcpuCount,
-    pub memory_mib: MemoryMib,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
     #[serde(default)]
@@ -33,6 +32,7 @@ pub struct VmSpec {
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
     pub vcpu_count: VcpuCount,
+    pub api_socket: ApiSocket,
     pub memory_mib: MemoryMib,
     #[serde(default)]
     pub port_bindings: Vec<PortBinding>,
@@ -44,6 +44,24 @@ pub struct VmSpec {
 pub struct PortBinding {
     pub internal: Port,
     pub external: Port,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+)]
+#[serde(transparent)]
+pub struct ApiSocket(PathBuf);
+
+impl ApiSocket {
+    fn remove(&self) -> Result<(), std::io::Error> {
+        let api_socket: PathBuf = self.0.clone().into();
+        match std::fs::remove_file(api_socket) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
 }
 
 /// TCP only.
@@ -182,34 +200,19 @@ impl<'de> Deserialize<'de> for VcpuCount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, From, Into, Eq, Hash, PartialOrd, Ord, Display, Serialize,
+)]
 #[serde(transparent)]
 #[display("{_0}")]
 pub struct MemoryMib(u16);
-
-impl TryFrom<u16> for MemoryMib {
-    type Error = ParseValueError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        (1..=2_047)
-            .contains(&value)
-            .then_some(Self(value))
-            .ok_or_else(|| ParseValueError::new("memory MiB", value.to_string()))
-    }
-}
-
-impl From<MemoryMib> for u16 {
-    fn from(value: MemoryMib) -> Self {
-        value.0
-    }
-}
 
 impl<'de> Deserialize<'de> for MemoryMib {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Self::try_from(u16::deserialize(deserializer)?).map_err(de::Error::custom)
+        Ok(Self::from(u16::deserialize(deserializer)?))
     }
 }
 

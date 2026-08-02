@@ -1,7 +1,8 @@
 use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use barbirolli::{Barbirolli, IdlePolicy, VmStore};
+use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, VmStore};
 use serde::Deserialize;
+use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
@@ -55,31 +56,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
-    let store = VmStore::new(config.vm_root, config.image_root)?;
-    let idle_policy = IdlePolicy {
-        initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
-        strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),
-        final_interval: Duration::from_secs(config.idle_final_interval_seconds),
-        cpu_idle_high_percent: config.idle_cpu_high_percent,
-        cpu_active_low_percent: config.idle_cpu_low_percent,
-    };
-    let manager =
-        Arc::new(Barbirolli::new_with_idle_policy(store, config.firecracker, idle_policy).await?);
+    let daemon = Barbirolli::new(
+        VmStore::new(config.vm_root, config.image_root)?,
+        DaemonConfig {
+            firecracker: config.firecracker,
+            provisioning: ProvisioningConfig::default(),
+            idle_policy: Some(IdlePolicy {
+                initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
+                strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),
+                final_interval: Duration::from_secs(config.idle_final_interval_seconds),
+                cpu_idle_high_percent: config.idle_cpu_high_percent,
+                cpu_active_low_percent: config.idle_cpu_low_percent,
+            }),
+        },
+    )
+    .await?;
 
-    let elhone_address = elhone::validate_address(config.elhone_addr)?;
-    let elhone_listener = tokio::net::TcpListener::bind(elhone_address).await?;
+    let addr = elhone::new_addr(config.elhone_addr)?;
+    let listener = TcpListener::bind(addr).await?;
     let elhone = axum::serve(
-        elhone_listener,
-        elhone::router(manager.clone(), elhone::Auth::from_env()?),
+        listener,
+        elhone::router(daemon.clone(), elhone::Auth::from_env()?),
     );
 
-    tracing::info!(%elhone_address, "HTTP service started");
+    tracing::info!(%addr, "HTTP service started");
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
-        () = manager.run_idle_reaper() => Ok(()),
+        () = daemon.autoscale() => Ok(()),
     };
-    let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
+    let shutdown = daemon.shutdown().await.map_err(|error| error.to_string());
 
     match (service, shutdown) {
         (Ok(()), Ok(())) => Ok(()),

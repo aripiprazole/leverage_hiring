@@ -86,16 +86,17 @@ POST /vms
 
 {
   "vcpu_count": 2,
-  "memory_mib": 1024,
   "authorized_keys": ["ssh-ed25519 ..."],
   "port_bindings": [{ "internal": 22, "external": 2222 }]
 }
 ```
 
 Creates a stopped VM and returns `201 Created` with its ID. Kernel and rootfs paths are not part
-of the request; the service copies both artifacts from `IMAGE_ROOT`. Ports are nonzero `u16`
-values. A binding `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest
-port `22`. External-port uniqueness is a provisioning invariant.
+of the request; the service copies both artifacts from `IMAGE_ROOT`. Memory is selected by the
+daemon's provisioning configuration (256 MiB by default) and persisted in `VmSpec`; it is not a
+per-request input. Ports are nonzero `u16` values. A binding
+`{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
+External-port uniqueness is a provisioning invariant.
 
 # Barbirolli: VM and host-resource boundary
 
@@ -115,10 +116,31 @@ conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The_Hall%C3
 struct Barbirolli {
     vms: DashMap<VmId, BarbirolliVm>,
     store: VmStore,
-    firecracker: PathBuf,
-    api_socket: PathBuf,
+    firecracker: Firecracker,
+    balloon: RwLock<Balloon>,
+    provisioning: ProvisioningConfig,
+    shutdown_timeout: Duration,
     draining: AtomicBool,
     idle_policy: IdlePolicy,
+}
+
+struct Firecracker {
+    bin: PathBuf,
+    api_socket_timeout: Duration,
+}
+
+struct DaemonConfig {
+    provisioning: ProvisioningConfig,
+    firecracker: PathBuf,
+    idle_policy: Option<IdlePolicy>,
+}
+
+struct ProvisioningConfig {
+    default_vm_mem: MemoryMib,
+    max_daemon_mem: MemoryMib,
+    initial_ballon_mem: MemoryMib,
+    count: u32,
+    extra_percentage: u8,
 }
 
 enum BarbirolliVm {
@@ -154,12 +176,13 @@ struct VmId(u16);
 
 struct VmSpec {
     id: VmId,
-    /// Defaults to false when absent from an older config.
+    /// Defaults to false when absent from a config.
     deleted: bool,
     artifact_dir: PathBuf,
     kernel: PathBuf,
     rootfs: PathBuf,
     vcpu_count: VcpuCount,
+    api_socket: ApiSocket,
     memory_mib: MemoryMib,
     port_bindings: Vec<PortBinding>,
     network: NetworkSpec,
@@ -171,7 +194,6 @@ type FirecrackerVm = fctools::vm::Vm<...>;
 #[derive(Serialize, Deserialize)]
 struct VmInput {
     vcpu_count: VcpuCount, // 1..=31
-    memory_mib: MemoryMib, // 1..=2047
     authorized_keys: Vec<AuthorizedKey>,
     port_bindings: Vec<PortBinding>,
 }
@@ -180,6 +202,8 @@ struct PortBinding {
     internal: Port,
     external: Port,
 }
+
+struct ApiSocket(PathBuf);
 
 enum LifecycleError {
     InvalidInput,
@@ -202,6 +226,8 @@ Each `$VM_ROOT/<vm_id>` contains:
 - `config.json`: versioned `VmSpec`.
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
+- Every persisted `VmSpec` owns its unique Firecracker API socket path under
+  `$VM_ROOT/.sockets`; runtime cleanup removes the socket file without discarding that path.
 - A VM gets the `VmId` equal to the number of persisted VM directories, starting at `0`. Deleted
   VM directories remain in that count, so IDs increase monotonically and are never reused.
 - A nonempty `authorized_keys` request is written directly to
@@ -322,30 +348,12 @@ Creation provisions a stopped VM.
 
 ```rust
 async fn create(&self, input: VmInput) -> Result<VmId> {
-    self.ensure_not_draining()?;
-
-    // Deleted directories count, so IDs remain monotonic.
-    let id = self.store.next_id()?;
-    let tmp = self.store.temporary_directory()?;
-
-    copy(IMAGE_ROOT.join("vmlinux"), tmp.join("vmlinux"))?;
-    copy(IMAGE_ROOT.join("alpine.ext4"), tmp.join("rootfs.ext4"))?;
-
-    if !input.authorized_keys.is_empty() {
-        install_authorized_keys(tmp.join("rootfs.ext4"), input.authorized_keys)?;
-    }
-
-    let spec = VmSpec {
-        id,
-        artifact_dir: VM_ROOT.join(id.to_string()),
-        kernel: VM_ROOT.join(id.to_string()).join("vmlinux"),
-        rootfs: VM_ROOT.join(id.to_string()).join("rootfs.ext4"),
-        network: NetworkSpec::new(id)?,
-        // vcpu_count, memory_mib, port_bindings
-    };
-
-    write_config(tmp.join("config.json"), &spec)?;
-    rename(tmp, &spec.artifact_dir)?;
+    self.is_app_alive()?;
+    let spec = self
+        .store
+        .create(input, self.provisioning.default_vm_mem)
+        .await?;
+    let id = spec.id;
     self.vms.insert(id, BarbirolliVm::Discovered(spec));
     Ok(id)
 }
@@ -396,13 +404,13 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
     let mut vm = spec.prepare_vm(barbirolli).await
         .map_err(|error| rollback_network(error, &network))?;
 
-    vm.start(barbirolli.api_socket_timeout).await
+    vm.start(barbirolli.firecracker.api_socket_timeout).await
         .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
 
-    let pid = find_firecracker_pid(barbirolli).await
+    let pid = find_firecracker_pid(barbirolli, &spec).await
         .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
 
-    let cgroup = VmCgroup::create(spec.id, pid)
+    let cgroup = VmCgroup::create(spec.id.to_string(), pid)
         .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
 
     let latest_metrics = Arc::new(RwLock::new(None));
@@ -471,7 +479,7 @@ from the in-memory map. The VM directory remains on disk and its ID is never reu
 
 ```rust
 async fn delete(&self, vm_id: VmId) -> Result<()> {
-    self.ensure_not_draining()?;
+    self.is_app_alive()?;
     let mut vm = self.vms.entry(vm_id).occupied_or(NotFound)?;
 
     vm.get_mut().shutdown(self).await?;
@@ -494,7 +502,7 @@ async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<()> {
     Validated::from(self.kill_stale_processes(barbirolli).await)
         .map4(
             Validated::from(self.network.cleanup_stale().await),
-            Validated::from(remove_stale_api_socket()),
+            Validated::from(self.remove_stale_api_socket()),
             Validated::from(self.cleanup_stale_health()),
             |(), (), (), ()| (),
         )

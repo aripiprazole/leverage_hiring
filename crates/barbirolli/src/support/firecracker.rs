@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use barbirolli::{Barbirolli, VmId, VmStore, VmSummary};
+use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, VmId, VmStore, VmSummary};
 use futures::future::try_join_all;
 use serde::Deserialize;
 use tempfile::TempDir;
@@ -75,9 +75,16 @@ impl FirecrackerFixture {
             });
         let store = VmStore::new(vm_root.clone(), image_root.clone())
             .expect("failed to create the VM store");
-        let manager = Barbirolli::new(store, firecracker.clone())
-            .await
-            .expect("failed to create Barbirolli");
+        let manager = Barbirolli::new(
+            store,
+            DaemonConfig {
+                provisioning: ProvisioningConfig::default(),
+                firecracker: firecracker.clone(),
+                idle_policy: None,
+            },
+        )
+        .await
+        .expect("failed to create Barbirolli");
 
         Self {
             manager,
@@ -129,14 +136,11 @@ impl FirecrackerFixture {
             .expect("missing fixture VM")
             .spec()
             .clone();
+        let socket = spec.api_socket.clone().into();
         FirecrackerVmFixture {
             id,
             lifecycle: VmLifecycleFixture::new(self.manager.clone(), id),
-            api: FirecrackerApiFixture {
-                socket: self
-                    .vm_root
-                    .join(format!(".sockets/firecracker-{id}.socket")),
-            },
+            api: FirecrackerApiFixture { socket },
             network: VmNetworkFixture::new(spec.network.clone()),
             ssh: SshFixture::new(spec.network.guest_ip, self.ssh_private_key.clone()),
             storage: VmStorageFixture::new(&spec),
@@ -171,9 +175,16 @@ impl FirecrackerFixture {
             .expect("failed to stop Barbirolli before restart");
         let store = VmStore::new(self.vm_root.clone(), self.image_root.clone())
             .expect("failed to reopen the VM store");
-        self.manager = Barbirolli::new(store, self.firecracker.clone())
-            .await
-            .expect("failed to restart Barbirolli");
+        self.manager = Barbirolli::new(
+            store,
+            DaemonConfig {
+                provisioning: ProvisioningConfig::default(),
+                firecracker: self.firecracker.clone(),
+                idle_policy: None,
+            },
+        )
+        .await
+        .expect("failed to restart Barbirolli");
         inspect(self);
     }
 

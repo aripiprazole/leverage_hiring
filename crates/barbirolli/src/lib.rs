@@ -14,9 +14,12 @@ extern crate self as barbirolli;
 pub mod support;
 
 pub use idle::IdlePolicy;
-pub use lifecycle::{Barbirolli, LifecycleError, VmStatus, VmSummary};
+pub use lifecycle::{
+    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmStatus, VmSummary,
+};
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};
 pub use vm::{
-    AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId, VmInput, VmSpec,
+    ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId,
+    VmInput, VmSpec,
 };
