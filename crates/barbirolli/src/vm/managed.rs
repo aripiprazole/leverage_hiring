@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::ErrorKind,
     net::Ipv4Addr,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -44,6 +45,7 @@ use validated::Validated;
 use crate::{
     Barbirolli, VmSpec,
     idle::{Monitor, Sample},
+    io_error,
     lifecycle::PidError,
     network::{ManagedNetwork, NetworkError},
 };
@@ -65,11 +67,6 @@ pub struct ManagedVm {
     metrics: Arc<RwLock<Option<Metrics>>>,
     #[debug(skip)]
     metrics_task: JoinHandle<()>,
-}
-
-#[derive(Debug)]
-struct VmCgroup {
-    path: PathBuf,
 }
 
 impl VmSpec {
@@ -139,25 +136,19 @@ impl VmSpec {
     fn cleanup_cgroup_and_metrics(&self) -> Result<(), HealthError> {
         tracing::info!("cleaning up cgroup and metrics");
         let metrics = self.metrics_path();
-        if let Err(source) = fs::remove_file(&metrics)
-            && source.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(HealthError::Io {
-                path: metrics,
-                source,
-            });
-        }
+        let metrics_cleanup = match fs::remove_file(&metrics) {
+            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+        io_error!(HealthError, metrics_cleanup, metrics)?;
 
         let cgroup = PathBuf::from(CGROUP_ROOT).join(format!("vm-{}", self.id));
         if cgroup.exists() {
             let kill = cgroup.join("cgroup.kill");
             if kill.exists() {
-                fs::write(&kill, "1").map_err(|source| HealthError::Io { path: kill, source })?;
+                io_error!(HealthError, fs::write(&kill, "1"), kill)?;
             }
-            fs::remove_dir(&cgroup).map_err(|source| HealthError::Io {
-                path: cgroup,
-                source,
-            })?;
+            io_error!(HealthError, fs::remove_dir(&cgroup), cgroup)?;
         }
         Ok(())
     }
@@ -291,7 +282,7 @@ impl ManagedVm {
                 });
             }
         };
-        let cgroup = match VmCgroup::create(spec.id.to_string(), pid) {
+        let cgroup = match VmCgroup::new(spec.id.to_string(), pid) {
             Ok(cgroup) => cgroup,
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
@@ -422,17 +413,9 @@ fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> 
 }
 
 async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(|source| HealthError::Io {
-            path: path.clone(),
-            source,
-        })?;
+    let file = io_error!(HealthError, tokio::fs::File::open(path).await, path.clone())?;
     let mut lines = BufReader::new(file).lines();
-    while let Some(line) = lines.next_line().await.map_err(|source| HealthError::Io {
-        path: path.clone(),
-        source,
-    })? {
+    while let Some(line) = io_error!(HealthError, lines.next_line().await, path.clone())? {
         let metrics = match serde_json::from_str(&line) {
             Ok(metrics) => metrics,
             Err(error) => {
@@ -445,34 +428,34 @@ async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Resul
     Ok(())
 }
 
+#[derive(Debug)]
+struct VmCgroup {
+    path: PathBuf,
+}
+
 impl VmCgroup {
-    fn create(id: String, pid: Pid) -> Result<Self, HealthError> {
+    fn new(id: String, pid: Pid) -> Result<Self, HealthError> {
         let root = PathBuf::from(CGROUP_ROOT);
-        fs::create_dir_all(&root).map_err(|source| HealthError::Io {
-            path: root.clone(),
-            source,
-        })?;
+        io_error!(HealthError, fs::create_dir_all(&root), root.clone())?;
         let controllers = root.join("cgroup.subtree_control");
-        fs::write(&controllers, "+cpu +memory +pids").map_err(|source| HealthError::Io {
-            path: controllers,
-            source,
-        })?;
+        io_error!(
+            HealthError,
+            fs::write(&controllers, "+cpu +memory +pids"),
+            controllers
+        )?;
         let path = root.join(format!("vm-{id}"));
-        fs::create_dir(&path).map_err(|source| HealthError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        io_error!(HealthError, fs::create_dir(&path), path.clone())?;
         let procs = path.join("cgroup.procs");
-        if let Err(source) = fs::write(&procs, pid.as_raw_pid().to_string()) {
-            let setup = HealthError::Io {
-                path: procs,
-                source,
-            };
-            return match fs::remove_dir(&path) {
+        if let Err(setup) = io_error!(
+            HealthError,
+            fs::write(&procs, pid.as_raw_pid().to_string()),
+            procs
+        ) {
+            return match io_error!(HealthError, fs::remove_dir(&path), path) {
                 Ok(()) => Err(setup),
-                Err(source) => Err(HealthError::CgroupSetupRollback {
+                Err(rollback) => Err(HealthError::CgroupSetupRollback {
                     setup: Box::new(setup),
-                    rollback: Box::new(HealthError::Io { path, source }),
+                    rollback: Box::new(rollback),
                 }),
             };
         }
@@ -481,10 +464,7 @@ impl VmCgroup {
 
     fn read_value(&self, name: &str) -> Result<u64, HealthError> {
         let path = self.path.join(name);
-        let value = fs::read_to_string(&path).map_err(|source| HealthError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let value = io_error!(HealthError, fs::read_to_string(&path), path.clone())?;
         value
             .trim()
             .parse()
@@ -493,10 +473,7 @@ impl VmCgroup {
 
     fn read_key(&self, name: &str, key: &str) -> Result<u64, HealthError> {
         let path = self.path.join(name);
-        let value = fs::read_to_string(&path).map_err(|source| HealthError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let value = io_error!(HealthError, fs::read_to_string(&path), path.clone())?;
         value
             .lines()
             .find_map(|line| {
@@ -507,14 +484,11 @@ impl VmCgroup {
     }
 
     fn cleanup(self) -> Result<(), HealthError> {
-        match fs::remove_dir(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(HealthError::Io {
-                path: self.path,
-                source,
-            }),
-        }
+        let cleanup = match fs::remove_dir(&self.path) {
+            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+        io_error!(HealthError, cleanup, self.path)
     }
 }
 
@@ -608,6 +582,12 @@ pub enum HealthError {
         setup: Box<HealthError>,
         rollback: Box<HealthError>,
     },
+}
+
+impl crate::IoError for HealthError {
+    fn from_io_error(path: PathBuf, source: std::io::Error) -> Self {
+        Self::Io { path, source }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

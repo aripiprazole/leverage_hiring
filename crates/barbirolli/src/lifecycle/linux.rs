@@ -30,6 +30,7 @@ use validated::Validated;
 use crate::{
     DaemonConfig, MemoryMib, ProvisioningConfig, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
+    io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
 };
 
@@ -452,6 +453,12 @@ pub enum PidError {
     ProcessNotFound,
 }
 
+impl crate::IoError for PidError {
+    fn from_io_error(path: PathBuf, source: std::io::Error) -> Self {
+        Self::Io { path, source }
+    }
+}
+
 impl Firecracker {
     pub async fn new(firecracker: impl Into<PathBuf>) -> Result<Firecracker> {
         let firecracker = firecracker.into();
@@ -486,16 +493,14 @@ impl Firecracker {
         let expected_socket = api_socket.as_os_str().as_encoded_bytes();
         let expected_firecracker = self.bin.as_os_str().as_encoded_bytes();
         let expected_id = format!("barbirolli-{}", spec.id);
-        let mut proc = tokio::fs::read_dir("/proc")
-            .await
-            .map_err(|source| PidError::Io {
-                path: PathBuf::from("/proc"),
-                source,
-            })?;
-        while let Some(entry) = proc.next_entry().await.map_err(|source| PidError::Io {
-            path: PathBuf::from("/proc"),
-            source,
-        })? {
+        let mut proc = io_error!(
+            PidError,
+            tokio::fs::read_dir("/proc").await,
+            PathBuf::from("/proc")
+        )?;
+        while let Some(entry) =
+            io_error!(PidError, proc.next_entry().await, PathBuf::from("/proc"))?
+        {
             let Some(pid) = entry
                 .file_name()
                 .to_str()

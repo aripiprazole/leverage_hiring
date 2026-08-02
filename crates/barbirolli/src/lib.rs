@@ -13,6 +13,8 @@ extern crate self as barbirolli;
 #[allow(dead_code)]
 pub mod support;
 
+use std::path::PathBuf;
+
 pub use idle::IdlePolicy;
 pub use lifecycle::{
     Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmStatus, VmSummary,
@@ -23,3 +25,17 @@ pub use vm::{
     ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId,
     VmInput, VmSpec,
 };
+
+pub trait IoError {
+    fn from_io_error(path: PathBuf, err: std::io::Error) -> Self;
+}
+
+#[cfg(target_os = "linux")]
+macro_rules! io_error {
+    ($error:ty, $result:expr, $path:expr) => {
+        ($result).map_err(|source| <$error as crate::IoError>::from_io_error($path, source))
+    };
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use io_error;
