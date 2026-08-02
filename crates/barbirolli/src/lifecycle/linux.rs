@@ -59,7 +59,6 @@ pub struct BarbirolliInner {
     pub store: VmStore,
     pub firecracker: Firecracker,
     pub entrypoint: PathBuf,
-    pub provision_rootfs: bool,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
     pub idle_policy: IdlePolicy,
@@ -90,7 +89,6 @@ impl Barbirolli {
             provisioning: config.provisioning,
             store,
             entrypoint: config.entrypoint,
-            provision_rootfs: config.provision_rootfs,
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
             idle_policy: config.idle_policy.unwrap_or_default(),
@@ -166,13 +164,14 @@ impl Barbirolli {
             });
         }
         let authorized_keys = input.authorized_keys.clone();
+        let provision_ssh_keys = input.provision_ssh_keys;
         let creation = self
             .store
             .create(input, self.provisioning.default_vm_mem)
             .await?;
-        if self.provision_rootfs {
-            provision_rootfs(&creation.rootfs, &self.entrypoint, &authorized_keys)?;
-        }
+        creation
+            .rootfs
+            .provision_rootfs(&self.entrypoint, &authorized_keys, provision_ssh_keys)?;
         let spec = creation.finish()?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
@@ -251,23 +250,24 @@ impl Barbirolli {
     }
 }
 
-fn provision_rootfs(
-    rootfs: &Rootfs,
-    entrypoint: &Path,
-    authorized_keys: &[AuthorizedKey],
-) -> Result<(), StorageError> {
-    let entrypoint_contents = read(entrypoint).map_err(|source| StorageError::Io {
-        path: entrypoint.to_owned(),
-        source,
-    })?;
-    rootfs
-        .provision(|builder| {
+impl Rootfs {
+    fn provision_rootfs(
+        &self,
+        entrypoint: &Path,
+        authorized_keys: &[AuthorizedKey],
+        provision_ssh_keys: bool,
+    ) -> Result<(), StorageError> {
+        let entrypoint_contents = read(entrypoint).map_err(|source| StorageError::Io {
+            path: entrypoint.to_owned(),
+            source,
+        })?;
+        self.provision(|builder| {
             builder.write(
                 "barbirolli_entrypoint",
                 entrypoint_contents,
                 Permissions::from_mode(0o755),
             )?;
-            if !authorized_keys.is_empty() {
+            if !authorized_keys.is_empty() && provision_ssh_keys {
                 builder.create_folder("root/.ssh", Permissions::from_mode(0o700))?;
                 builder.write(
                     "root/.ssh/authorized_keys",
@@ -278,6 +278,7 @@ fn provision_rootfs(
             Ok(())
         })
         .map_err(StorageError::from)
+    }
 }
 
 fn authorized_keys_into_bytes(authorized_keys: &[AuthorizedKey]) -> Vec<u8> {

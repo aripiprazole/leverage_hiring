@@ -67,12 +67,12 @@ impl BehaviorFixture {
         fs::create_dir(&image_root).expect("failed to create IMAGE_ROOT");
 
         let source_kernel = temporary.path().join("source-vmlinux");
-        let source_rootfs = temporary.path().join("source-alpine.ext4");
+        let source_rootfs = temporary.path().join("source-ubuntu-24.04.ext4");
         fs::write(&source_kernel, b"kernel").expect("failed to create kernel");
         fs::write(&source_rootfs, b"rootfs").expect("failed to create rootfs");
         std::os::unix::fs::symlink(&source_kernel, image_root.join("vmlinux"))
             .expect("failed to link kernel");
-        std::os::unix::fs::symlink(&source_rootfs, image_root.join("alpine.ext4"))
+        std::os::unix::fs::symlink(&source_rootfs, image_root.join("ubuntu-24.04.ext4"))
             .expect("failed to link rootfs");
 
         let firecracker = temporary.path().join("firecracker");
@@ -116,7 +116,6 @@ impl BehaviorFixture {
             store,
             DaemonConfig {
                 provisioning,
-                provision_rootfs: false,
                 firecracker: self.firecracker.clone(),
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
@@ -126,7 +125,7 @@ impl BehaviorFixture {
         .expect("failed to create Barbirolli");
         BehaviorManagerFixture {
             manager,
-            rootfs: Rootfs::from(self.storage.image_root.join("alpine.ext4")),
+            rootfs: Rootfs::from(self.storage.image_root.join("ubuntu-24.04.ext4")),
         }
     }
 }
@@ -143,7 +142,9 @@ impl StorageEnvironmentFixture {
 
 impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
-        let input = config.into_input(Rootfs::from(self.store.image_root.join("alpine.ext4")));
+        let input = config.into_input(Rootfs::from(
+            self.store.image_root.join("ubuntu-24.04.ext4"),
+        ));
         let creation = self
             .store
             .create(input, ProvisioningConfig::default().default_vm_mem)

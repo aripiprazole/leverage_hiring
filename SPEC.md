@@ -259,7 +259,7 @@ Each `$VM_ROOT/<vm_id>` contains:
 
 - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
 - `rootfs.ext4`: private writable copy of `VmInput.rootfs`; the daemon injects
-  `IMAGE_ROOT/alpine.ext4` for `POST /vms`.
+  `IMAGE_ROOT/ubuntu-24.04.ext4` for `POST /vms`.
 - `config.json`: versioned `VmSpec`.
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
@@ -272,7 +272,8 @@ Each `$VM_ROOT/<vm_id>` contains:
   `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
   file.
 - An empty `authorized_keys` request preserves the default key embedded in the source image.
-- `scripts/setup_daemon` installs that default key while preparing `IMAGE_ROOT/alpine.ext4`.
+- `scripts/setup_daemon` installs that default key while preparing
+  `IMAGE_ROOT/ubuntu-24.04.ext4`.
 
 ## Host and guest networking
 

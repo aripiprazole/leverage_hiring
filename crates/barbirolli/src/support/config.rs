@@ -35,6 +35,7 @@ impl TestVmConfig {
     pub fn into_input(self, rootfs: Rootfs) -> VmInput {
         VmInput {
             rootfs,
+            provision_ssh_keys: true,
             vcpu_count: VcpuCount::try_from(self.vcpu_count).expect("valid vCPU count"),
             authorized_keys: self.authorized_keys,
             bindings: self.bindings,

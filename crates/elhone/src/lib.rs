@@ -63,6 +63,7 @@ impl CreateVmRequest {
     fn into_vm_input(self, rootfs: Rootfs) -> VmInput {
         VmInput {
             rootfs,
+            provision_ssh_keys: true,
             vcpu_count: self.vcpu_count,
             authorized_keys: self.authorized_keys,
             bindings: self.bindings,
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn vm_input_rejects_artifact_selection() {
-        for (field, value) in [("kernel", "vmlinux"), ("rootfs", "alpine.ext4")] {
+        for (field, value) in [("kernel", "vmlinux"), ("rootfs", "ubuntu-24.04.ext4")] {
             let mut input = json!({
                 "vcpu_count": 1
             });
@@ -378,11 +379,13 @@ mod tests {
             "vcpu_count": 1
         }))
         .expect("valid VM input")
-        .into_vm_input(Rootfs::from(PathBuf::from("/var/lib/images/alpine.ext4")));
+        .into_vm_input(Rootfs::from(PathBuf::from(
+            "/var/lib/images/ubuntu-24.04.ext4",
+        )));
 
         assert_eq!(
             input.rootfs,
-            Rootfs::from(PathBuf::from("/var/lib/images/alpine.ext4"))
+            Rootfs::from(PathBuf::from("/var/lib/images/ubuntu-24.04.ext4"))
         );
     }
 

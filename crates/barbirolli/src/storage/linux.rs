@@ -21,57 +21,11 @@ use crate::{ApiSocket, MemoryMib, NetworkSpec, Rootfs, VmId, VmInput, VmSpec};
 const CONFIG_VERSION: u16 = 4;
 const SOCKET_DIRECTORY: &str = ".sockets";
 
-#[derive(Debug, thiserror::Error)]
-pub enum RootfsProvisionError {
-    #[error("rootfs provisioning path must be relative: {path}")]
-    InvalidPath { path: PathBuf },
-    #[error("{operation} failed for {path}: {source}")]
-    Operation {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("rootfs provisioning failed: {setup}; rootfs cleanup also failed: {cleanup}")]
-    SetupCleanup {
-        setup: Box<Self>,
-        cleanup: RootfsCleanupError,
-    },
-    #[error("rootfs cleanup failed: {0}")]
-    Cleanup(#[from] RootfsCleanupError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RootfsCleanupError {
-    #[error("failed to unmount {mountpoint}: {source}")]
-    Unmount {
-        mountpoint: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to detach loop device {loop_device}: {source}")]
-    Detach {
-        loop_device: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error(
-        "failed to unmount {mountpoint}: {unmount}; \
-         failed to detach loop device {loop_device}: {detach}"
-    )]
-    UnmountAndDetach {
-        mountpoint: PathBuf,
-        unmount: io::Error,
-        loop_device: PathBuf,
-        detach: io::Error,
-    },
-}
-
 #[derive(Debug)]
 pub struct VmStore {
     pub vm_root: VmRootFolder,
     pub image_root: PathBuf,
-    creation_lock: tokio::sync::Mutex<()>,
+    _creation_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -117,7 +71,7 @@ impl VmStore {
             vm_root: VmRootFolder::new(vm_root)?,
             image_root: canonicalize(&image_root)
                 .map_err(|error| StorageError::io(&image_root, error))?,
-            creation_lock: tokio::sync::Mutex::new(()),
+            _creation_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -133,7 +87,7 @@ impl VmStore {
         input: VmInput,
         memory_mib: MemoryMib,
     ) -> Result<PartialVm<'_>, StorageError> {
-        let _creation_guard = self.creation_lock.lock().await;
+        let _creation_guard = self._creation_lock.lock().await;
         let source_kernel = self.image_root.join("vmlinux");
         let source_rootfs = input.rootfs;
         let id = self.vm_root.next_id()?;
@@ -707,6 +661,52 @@ impl Iterator for VmRootFolder {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RootfsProvisionError {
+    #[error("rootfs provisioning path must be relative: {path}")]
+    InvalidPath { path: PathBuf },
+    #[error("{operation} failed for {path}: {source}")]
+    Operation {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("rootfs provisioning failed: {setup}; rootfs cleanup also failed: {cleanup}")]
+    SetupCleanup {
+        setup: Box<Self>,
+        cleanup: RootfsCleanupError,
+    },
+    #[error("rootfs cleanup failed: {0}")]
+    Cleanup(#[from] RootfsCleanupError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RootfsCleanupError {
+    #[error("failed to unmount {mountpoint}: {source}")]
+    Unmount {
+        mountpoint: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to detach loop device {loop_device}: {source}")]
+    Detach {
+        loop_device: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "failed to unmount {mountpoint}: {unmount}; \
+         failed to detach loop device {loop_device}: {detach}"
+    )]
+    UnmountAndDetach {
+        mountpoint: PathBuf,
+        unmount: io::Error,
+        loop_device: PathBuf,
+        detach: io::Error,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs, os::unix::fs::PermissionsExt};
@@ -798,12 +798,13 @@ mod tests {
         let image_root = temporary.path().join("images");
         fs::create_dir(&image_root).expect("failed to create image directory");
         fs::write(image_root.join("vmlinux"), b"kernel").expect("failed to create kernel");
-        fs::copy(source_rootfs, image_root.join("alpine.ext4"))
+        fs::copy(source_rootfs, image_root.join("ubuntu-24.04.ext4"))
             .expect("failed to copy source rootfs");
 
         let store = VmStore::new(vm_root, image_root).expect("failed to create VM store");
         let input = VmInput {
-            rootfs: Rootfs::from(store.image_root.join("alpine.ext4")),
+            rootfs: Rootfs::from(store.image_root.join("ubuntu-24.04.ext4")),
+            provision_ssh_keys: true,
             authorized_keys: vec![
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti root@example.com"
                     .parse::<AuthorizedKey>()

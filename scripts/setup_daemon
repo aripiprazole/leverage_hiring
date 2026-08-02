@@ -146,7 +146,7 @@ prepare_rootfs() {
     fi
 
     ROOTFS_WORK="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.rootfs.XXXXXX")"
-    ROOTFS_TEMP="$IMAGE_ROOT/.alpine.ext4.$$"
+    ROOTFS_TEMP="$IMAGE_ROOT/.ubuntu-$ROOTFS_VERSION.ext4.$$"
     trap 'cleanup_rootfs' EXIT
     trap 'cleanup_rootfs; exit 130' INT TERM
 

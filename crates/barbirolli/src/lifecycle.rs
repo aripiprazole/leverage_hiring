@@ -78,7 +78,6 @@ impl Default for ProvisioningConfig {
 #[derive(Debug)]
 pub struct DaemonConfig {
     pub provisioning: ProvisioningConfig,
-    pub provision_rootfs: bool,
     pub firecracker: PathBuf,
     pub entrypoint: PathBuf,
     pub idle_policy: Option<IdlePolicy>,

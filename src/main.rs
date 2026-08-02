@@ -57,14 +57,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
-    let standard_rootfs = Rootfs::from(config.image_root.join("alpine.ext4"));
+    let standard_rootfs = Rootfs::from(config.image_root.join("ubuntu-24.04.ext4"));
     let daemon = Barbirolli::new(
         VmStore::new(config.vm_root, config.image_root)?,
         DaemonConfig {
             firecracker: config.firecracker,
             entrypoint: config.barbirolli_entrypoint,
             provisioning: ProvisioningConfig::default(),
-            provision_rootfs: true,
             idle_policy: Some(IdlePolicy {
                 initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
                 strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),

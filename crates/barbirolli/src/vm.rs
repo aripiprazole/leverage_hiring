@@ -16,11 +16,17 @@ pub(crate) mod managed;
 #[serde(deny_unknown_fields)]
 pub struct VmInput {
     pub rootfs: Rootfs,
+    #[serde(default = "default_provision_ssh_keys")]
+    pub provision_ssh_keys: bool,
     pub vcpu_count: VcpuCount,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
     #[serde(default)]
     pub bindings: Vec<PortBinding>,
+}
+
+fn default_provision_ssh_keys() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

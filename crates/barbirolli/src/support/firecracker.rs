@@ -59,7 +59,6 @@ impl FirecrackerFixture {
             store,
             DaemonConfig {
                 provisioning,
-                provision_rootfs: true,
                 firecracker: firecracker.clone(),
                 entrypoint: entrypoint.clone(),
                 idle_policy: None,
@@ -87,7 +86,7 @@ impl FirecrackerFixture {
 
     #[must_use]
     pub fn source_rootfs(&self) -> Rootfs {
-        Rootfs::from(self.image_root.join("alpine.ext4"))
+        Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"))
     }
 
     pub async fn try_create_vm(
@@ -96,7 +95,7 @@ impl FirecrackerFixture {
     ) -> Result<FirecrackerVmFixture, barbirolli::LifecycleError> {
         let id = self
             .manager
-            .create(config.into_input(Rootfs::from(self.image_root.join("alpine.ext4"))))
+            .create(config.into_input(Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"))))
             .await?;
         Ok(self.vm(id))
     }
@@ -107,7 +106,7 @@ impl FirecrackerFixture {
         inspect: impl FnOnce(&[FirecrackerVmFixture; N]),
     ) -> [FirecrackerVmFixture; N] {
         let barrier = Arc::new(Barrier::new(N.max(1)));
-        let rootfs = Rootfs::from(self.image_root.join("alpine.ext4"));
+        let rootfs = Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"));
         let ids = try_join_all(configs.map(|config| {
             let manager = self.manager.clone();
             let barrier = barrier.clone();
@@ -177,7 +176,6 @@ impl FirecrackerFixture {
             store,
             DaemonConfig {
                 provisioning: ProvisioningConfig::default(),
-                provision_rootfs: true,
                 firecracker: self.firecracker.clone(),
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
