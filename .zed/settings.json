@@ -8,6 +8,8 @@
             "overrideCommand": [
               "cargo",
               "check",
+              "-p",
+              "barbirolli",
               "--target",
               "aarch64-unknown-linux-gnu",
               "--all-targets",
@@ -17,12 +19,7 @@
         },
         "check": {
           "overrideCommand": [
-            "cargo",
-            "check",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-            "--all-targets",
-            "--message-format=json",
+            "rust-analyzer-check",
           ],
         },
       },

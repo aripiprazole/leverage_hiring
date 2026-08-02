@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     fmt::{self, Display},
-    str::FromStr,
     sync::Once,
 };
 
@@ -10,9 +9,9 @@ use futures::TryStreamExt;
 use reqwest::{
     Client, Response, StatusCode, Url,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, WWW_AUTHENTICATE},
-    redirect::{Attempt, Policy},
+    redirect::Policy,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::ApiError;
@@ -66,7 +65,7 @@ impl Display for OutboundUrl<'_> {
 pub struct OciFetcher {
     client: Client,
     transport: TransportPolicy,
-    platform: Option<HostPlatform>,
+    platform: Option<platform::HostPlatform>,
 }
 
 impl Default for OciFetcher {
@@ -78,7 +77,7 @@ impl Default for OciFetcher {
 
 impl OciFetcher {
     #[tracing::instrument]
-    fn new(transport: TransportPolicy, platform: Option<HostPlatform>) -> Self {
+    fn new(transport: TransportPolicy, platform: Option<platform::HostPlatform>) -> Self {
         install_ring_crypto_provider();
         let client = Client::builder()
             .redirect(Policy::custom(move |attempt| {
@@ -100,12 +99,12 @@ impl OciFetcher {
 
     #[cfg(test)]
     #[tracing::instrument]
-    fn for_test(platform: HostPlatform) -> Self {
+    fn for_test(platform: platform::HostPlatform) -> Self {
         Self::new(TransportPolicy::HttpLoopback, Some(platform))
     }
 
     #[tracing::instrument(skip(self), fields(url = %location), err)]
-    async fn fetch(&self, location: RegistryLoc) -> Result<api_schema::Run, OciError> {
+    async fn fetch(&self, location: registry::RegistryLoc) -> Result<api_schema::Run, OciError> {
         let initial_url = self.transport.parse(&location.manifest)?;
         tracing::warn!(
             url = %location.manifest,
@@ -115,7 +114,7 @@ impl OciFetcher {
 
         let host = match self.platform {
             Some(ref platform) => platform.clone(),
-            None => HostPlatform::current()?,
+            None => platform::HostPlatform::current()?,
         };
         let mut session = FetchSession::new(&self.client, self.transport);
         let initial = session.fetch_manifest(initial_url, None).await?;
@@ -124,7 +123,7 @@ impl OciFetcher {
             FetchedManifest::Index {
                 document,
                 digest,
-                media_type,
+                media_kind,
             } => {
                 let selected = host.select_platform(&document.manifests)?;
                 let manifest_url = location.manifest_url(&selected.digest)?;
@@ -158,6 +157,7 @@ impl OciFetcher {
                 &manifest.document.config,
             )
             .await?;
+        let config = image::Config::new(config, &host, &manifest.document.layers)?;
 
         let platform = config.platform(selected_platform);
         let image = config.response();
@@ -243,34 +243,28 @@ impl<'a> FetchSession<'a> {
                 expected.map(|descriptor| descriptor.expectation()),
             )
             .await?;
-        let document =
-            serde_json::from_slice::<ManifestDocument>(&fetched.body).map_err(|source| {
-                OciError::Json {
-                    url: url.to_string(),
-                    source,
-                }
+        let document = serde_json::from_slice::<oci_schema::ManifestDocument>(&fetched.body)
+            .map_err(|source| OciError::Json {
+                url: url.to_string(),
+                source,
             })?;
         match document {
-            ManifestDocument::Index(document) => {
-                let media_type = resolve_media_kind::<media::IndexMedia>(
-                    fetched.content_type.as_deref(),
-                    document.media_type.clone(),
-                )?;
-                Ok(FetchedManifest::Index {
-                    document,
-                    digest: fetched.digest,
-                    media_type,
-                })
-            }
-            ManifestDocument::Manifest(document) => {
-                let kind = resolve_media_kind::<media::ManifestMedia>(
+            oci_schema::ManifestDocument::Index(document) => Ok(FetchedManifest::Index {
+                digest: fetched.digest,
+                media_kind: resolve_media_kind::<media::IndexMedia>(
                     fetched.content_type.as_deref(),
                     document.media_kind.clone(),
-                )?;
+                )?,
+                document,
+            }),
+            oci_schema::ManifestDocument::Manifest(document) => {
                 Ok(FetchedManifest::Manifest(FetchedImageManifest {
-                    document,
                     digest: fetched.digest,
-                    kind,
+                    kind: resolve_media_kind(
+                        fetched.content_type.as_deref(),
+                        document.media_kind.clone(),
+                    )?,
+                    document,
                 }))
             }
         }
@@ -281,7 +275,7 @@ impl<'a> FetchSession<'a> {
         &mut self,
         url: OutboundUrl<'_>,
         desc: &descriptor::Config,
-    ) -> Result<ImageConfig, OciError> {
+    ) -> Result<oci_schema::ImageConfig, OciError> {
         let fetched = self
             .fetch_bytes(url, desc.media_kind.as_ref(), Some(desc.expectation()))
             .await?;
@@ -320,14 +314,13 @@ impl<'a> FetchSession<'a> {
             hasher.update(&chunk);
         }
 
-        let downloaded_digest = digest::format(&hasher.finalize())
-            .parse()
-            .expect("a computed SHA-256 digest should parse");
-        api_schema::Layer::new(LayerResponseInput {
+        api_schema::Layer::new(api_schema::LayerInput {
             url: url.as_ref(),
             descriptor: desc,
             downloaded_size,
-            downloaded_digest,
+            downloaded_digest: digest::format(&hasher.finalize())
+                .parse()
+                .expect("a computed SHA-256 digest should parse"),
         })
     }
 
@@ -365,7 +358,7 @@ impl<'a> FetchSession<'a> {
         let size = u64::try_from(body.len()).map_err(|_| {
             OciError::InvalidDocument("response body length does not fit in u64".to_owned())
         })?;
-        let digest = sha256_digest(&body);
+        let digest = digest::Sha256Digest::from(body.as_slice());
 
         FetchedBytes::new(FetchedBytesInput {
             url: url.as_ref(),
@@ -447,17 +440,17 @@ impl<'a> FetchSession<'a> {
 struct FetchedBytesInput<'a> {
     url: &'a Url,
     body: Vec<u8>,
-    digest: Sha256Digest,
+    digest: digest::Sha256Digest,
     size: u64,
     content_type: Option<String>,
     expected: Option<descriptor::BlobExpectation<'a>>,
-    header_digest: Option<Sha256Digest>,
+    header_digest: Option<digest::Sha256Digest>,
 }
 
 #[derive(Debug)]
 struct FetchedBytes {
     body: Vec<u8>,
-    digest: Sha256Digest,
+    digest: digest::Sha256Digest,
     content_type: Option<String>,
 }
 
@@ -503,19 +496,11 @@ impl FetchedBytes {
 }
 
 #[derive(Debug)]
-struct LayerResponseInput<'a> {
-    url: &'a Url,
-    descriptor: &'a descriptor::Layer,
-    downloaded_size: u64,
-    downloaded_digest: Sha256Digest,
-}
-
-#[derive(Debug)]
 enum FetchedManifest {
     Index {
-        document: ImageIndex,
-        digest: Sha256Digest,
-        media_type: media::IndexMediaKind,
+        document: oci_schema::ImageIndex,
+        digest: digest::Sha256Digest,
+        media_kind: media::IndexMediaKind,
     },
     Manifest(FetchedImageManifest),
 }
@@ -523,7 +508,7 @@ enum FetchedManifest {
 #[derive(Debug)]
 struct FetchedImageManifest {
     document: oci_schema::ImageManifest,
-    digest: Sha256Digest,
+    digest: digest::Sha256Digest,
     kind: media::ManifestMediaKind,
 }
 
@@ -654,7 +639,7 @@ mod media {
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-    use super::{OciError, ParseValueError};
+    use super::ParseValueError;
 
     pub type IndexMediaKind = MediaKind<IndexMedia>;
     pub type ManifestMediaKind = MediaKind<ManifestMedia>;
@@ -775,18 +760,17 @@ mod media {
 mod api_schema {
     use std::collections::BTreeMap;
 
+    use reqwest::Url;
     use serde::{Deserialize, Serialize};
 
-    use super::{
-        Arch, LayerResponseInput, OS, OciError, RegistryLoc, Sha256Digest,
-        descriptor::{History, Rootfs},
-        media::{ConfigMediaKind, IndexMediaKind, ManifestMediaKind},
-    };
+    use crate::oci::descriptor;
+
+    use super::{digest, media, oci_schema, platform, registry};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RunInput {
-        pub url: RegistryLoc,
+        pub url: registry::RegistryLoc,
     }
 
     #[derive(Debug, Serialize)]
@@ -796,15 +780,15 @@ mod api_schema {
         pub index: Option<Document>,
         pub manifest: Manifest,
         pub image: Image,
-        pub rootfs: Rootfs,
-        pub history: Vec<History>,
+        pub rootfs: oci_schema::Rootfs,
+        pub history: Vec<oci_schema::History>,
         pub layers: Vec<Layer>,
     }
 
     #[derive(Debug, Serialize)]
     pub struct Platform {
-        pub os: OS,
-        pub architecture: Arch,
+        pub os: platform::OS,
+        pub architecture: platform::Arch,
         pub variant: Option<String>,
         pub os_version: Option<String>,
         pub os_features: Vec<String>,
@@ -813,24 +797,24 @@ mod api_schema {
     #[derive(Debug, Serialize)]
     pub struct Document {
         pub schema_version: u32,
-        pub media_kind: IndexMediaKind,
-        pub digest: Sha256Digest,
+        pub media_kind: media::IndexMediaKind,
+        pub digest: digest::Sha256Digest,
         pub annotations: BTreeMap<String, String>,
     }
 
     #[derive(Debug, Serialize)]
     pub struct Manifest {
         pub schema_version: u32,
-        pub media_kind: ManifestMediaKind,
-        pub digest: Sha256Digest,
+        pub media_kind: media::ManifestMediaKind,
+        pub digest: digest::Sha256Digest,
         pub annotations: BTreeMap<String, String>,
         pub config: Descriptor,
     }
 
     #[derive(Debug, Serialize)]
     pub struct Descriptor {
-        pub media_kind: ConfigMediaKind,
-        pub digest: Sha256Digest,
+        pub media_kind: media::ConfigMediaKind,
+        pub digest: digest::Sha256Digest,
         pub size: u64,
     }
 
@@ -853,23 +837,31 @@ mod api_schema {
     #[derive(Debug, Serialize)]
     pub struct Layer {
         url: String,
-        media_kind: super::media::LayerMediaKind,
-        digest: Sha256Digest,
+        media_kind: media::LayerMediaKind,
+        digest: digest::Sha256Digest,
         declared_size: u64,
         downloaded_size: u64,
     }
 
+    #[derive(Debug)]
+    pub struct LayerInput<'a> {
+        pub url: &'a Url,
+        pub descriptor: &'a descriptor::Layer,
+        pub downloaded_size: u64,
+        pub downloaded_digest: digest::Sha256Digest,
+    }
+
     impl Layer {
-        pub fn new(input: LayerResponseInput<'_>) -> Result<Self, OciError> {
+        pub fn new(input: LayerInput<'_>) -> Result<Self, super::OciError> {
             if input.descriptor.size != input.downloaded_size {
-                return Err(OciError::SizeMismatch {
+                return Err(super::OciError::SizeMismatch {
                     url: input.url.to_string(),
                     expected: input.descriptor.size,
                     actual: input.downloaded_size,
                 });
             }
             if input.descriptor.digest != input.downloaded_digest {
-                return Err(OciError::DigestMismatch {
+                return Err(super::OciError::DigestMismatch {
                     url: input.url.to_string(),
                     expected: input.descriptor.digest.to_string(),
                     actual: input.downloaded_digest.to_string(),
@@ -890,20 +882,16 @@ mod api_schema {
 mod oci_schema {
     use std::collections::BTreeMap;
 
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
-    use super::{
-        Arch, OS,
-        descriptor::{Config, Layer},
-        media::ManifestMediaKind,
-    };
+    use super::{descriptor, digest, media, platform};
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct PlatformDesc {
         #[serde(rename = "architecture")]
-        pub arch: Arch,
-        pub os: OS,
+        pub arch: platform::Arch,
+        pub os: platform::OS,
         pub variant: Option<String>,
         #[serde(rename = "os.version", default)]
         pub os_version: Option<String>,
@@ -915,11 +903,26 @@ mod oci_schema {
     #[serde(rename_all = "camelCase")]
     pub struct ImageManifest {
         pub schema_version: u32,
-        pub media_kind: Option<ManifestMediaKind>,
-        pub config: Config,
-        pub layers: Vec<Layer>,
+        #[serde(rename = "mediaType")]
+        pub media_kind: Option<media::ManifestMediaKind>,
+        pub config: descriptor::Config,
+        pub layers: Vec<descriptor::Layer>,
         #[serde(default)]
         pub annotations: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ImageConfig {
+        pub created: Option<String>,
+        pub author: Option<String>,
+        #[serde(flatten)]
+        pub platform: PlatformDesc,
+        #[serde(default)]
+        pub config: RuntimeConfig,
+        pub rootfs: Rootfs,
+        #[serde(default)]
+        pub history: Vec<History>,
     }
 
     #[derive(Debug, Default, Deserialize)]
@@ -950,20 +953,7 @@ mod oci_schema {
     #[serde(tag = "type")]
     pub enum Rootfs {
         #[serde(rename = "layers")]
-        Layers { diff_ids: Vec<Sha256Digest> },
-    }
-
-    impl Rootfs {
-        pub fn new(doc: RootfsDoc, layers: &[Layer]) -> Result<Self, ParseImageConfigError> {
-            let RootfsDoc::Layers { diff_ids } = doc;
-            if diff_ids.len() != layers.len() {
-                return Err(ParseImageConfigError::Rootfs {
-                    diff_id_count: diff_ids.len(),
-                    layer_count: layers.len(),
-                });
-            }
-            Ok(Self::Layers { diff_ids })
-        }
+        Layers { diff_ids: Vec<digest::Sha256Digest> },
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -978,44 +968,40 @@ mod oci_schema {
 
     #[derive(Debug, Deserialize)]
     #[serde(untagged)]
-    enum ManifestDocument {
+    pub enum ManifestDocument {
         Index(ImageIndex),
-        Manifest(oci_schema::ImageManifest),
+        Manifest(ImageManifest),
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
-    struct ImageIndex {
-        schema_version: u32,
-        media_type: Option<media::IndexMediaKind>,
-        manifests: Vec<descriptor::Manifest>,
+    pub struct ImageIndex {
+        pub schema_version: u32,
+        #[serde(rename = "mediaType")]
+        pub media_kind: Option<media::IndexMediaKind>,
+        pub manifests: Vec<descriptor::Manifest>,
         #[serde(default)]
-        annotations: BTreeMap<String, String>,
+        pub annotations: BTreeMap<String, String>,
     }
 }
 
 mod descriptor {
-    use std::collections::BTreeMap;
+    use serde::Deserialize;
 
-    use serde::{Deserialize, Serialize};
-
-    use super::{
-        Sha256Digest,
-        media::{ConfigMedia, LayerMedia, ManifestMedia, MediaKind, MediaTypeKind},
-        oci_schema::PlatformDesc,
-    };
+    use super::{digest, media, oci_schema};
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(rename_all = "camelCase", bound(deserialize = ""))]
-    pub struct Descriptor<K: MediaTypeKind> {
-        pub media_kind: MediaKind<K>,
-        pub digest: Sha256Digest,
+    pub struct Descriptor<K: media::MediaTypeKind> {
+        #[serde(rename = "mediaType")]
+        pub media_kind: media::MediaKind<K>,
+        pub digest: digest::Sha256Digest,
         pub size: u64,
         #[serde(default)]
-        pub platform: Option<PlatformDesc>,
+        pub platform: Option<oci_schema::PlatformDesc>,
     }
 
-    impl<K: MediaTypeKind> Descriptor<K> {
+    impl<K: media::MediaTypeKind> Descriptor<K> {
         pub fn expectation(&self) -> BlobExpectation<'_> {
             BlobExpectation {
                 digest: &self.digest,
@@ -1024,50 +1010,59 @@ mod descriptor {
         }
     }
 
-    pub type Manifest = Descriptor<ManifestMedia>;
-    pub type Config = Descriptor<ConfigMedia>;
-    pub type Layer = Descriptor<LayerMedia>;
+    pub type Manifest = Descriptor<media::ManifestMedia>;
+    pub type Config = Descriptor<media::ConfigMedia>;
+    pub type Layer = Descriptor<media::LayerMedia>;
 
     #[derive(Debug, Clone, Copy)]
     pub struct BlobExpectation<'a> {
-        pub digest: &'a Sha256Digest,
+        pub digest: &'a digest::Sha256Digest,
         pub size: u64,
     }
 }
 
 mod image {
-    use super::*;
+    use super::{api_schema, descriptor, oci_schema, platform};
 
     type Result<T, E = ParseImageConfigError> = std::result::Result<T, E>;
 
     #[derive(Debug)]
-    struct Config {
+    pub struct Config {
         created: Option<String>,
         author: Option<String>,
         platform: Platform,
         config: oci_schema::RuntimeConfig,
-        rootfs: oci_schema::Rootfs,
-        history: Vec<oci_schema::History>,
+        pub rootfs: oci_schema::Rootfs,
+        pub history: Vec<oci_schema::History>,
     }
 
-    impl ImageConfig {
-        fn new(
-            doc: ImageConfigDoc,
-            host: &HostPlatform,
+    impl Config {
+        pub fn new(
+            doc: oci_schema::ImageConfig,
+            host: &platform::HostPlatform,
             layers: &[descriptor::Layer],
         ) -> Result<Self> {
+            let platform = Platform::new(doc.platform, host)?;
+            let oci_schema::Rootfs::Layers { diff_ids } = &doc.rootfs;
+            if diff_ids.len() != layers.len() {
+                return Err(ParseImageConfigError::Rootfs {
+                    diff_id_count: diff_ids.len(),
+                    layer_count: layers.len(),
+                });
+            }
+
             Ok(Self {
                 created: doc.created,
                 author: doc.author,
-                platform: ImagePlatform::new(doc.platform, host)?,
+                platform,
                 config: doc.config,
-                rootfs: descriptor::Rootfs::new(doc.rootfs, layers)?,
+                rootfs: doc.rootfs,
                 history: doc.history,
             })
         }
 
         #[tracing::instrument(skip(self, selected))]
-        fn platform(&self, selected: Option<oci_schema::PlatformDesc>) -> api_schema::Platform {
+        pub fn platform(&self, selected: Option<oci_schema::PlatformDesc>) -> api_schema::Platform {
             api_schema::Platform {
                 os: self.platform.os.clone(),
                 architecture: self.platform.architecture.clone(),
@@ -1089,7 +1084,7 @@ mod image {
         }
 
         #[tracing::instrument(skip(self))]
-        fn response(&self) -> api_schema::Image {
+        pub fn response(&self) -> api_schema::Image {
             let config = &self.config;
             api_schema::Image {
                 created: self.created.clone(),
@@ -1109,18 +1104,18 @@ mod image {
     }
 
     #[derive(Debug)]
-    struct ImagePlatform {
-        architecture: Arch,
-        os: OS,
+    struct Platform {
+        architecture: platform::Arch,
+        os: platform::OS,
         variant: Option<String>,
         os_version: Option<String>,
         os_features: Vec<String>,
     }
 
-    impl ImagePlatform {
-        fn new(platform: oci_schema::PlatformDesc, host: &HostPlatform) -> Result<Self> {
+    impl Platform {
+        fn new(platform: oci_schema::PlatformDesc, host: &platform::HostPlatform) -> Result<Self> {
             if platform.os != host.os || platform.arch != host.architecture {
-                return Err(oci_schema::ParseImageConfigError::Platform {
+                return Err(ParseImageConfigError::Platform {
                     image_os: platform.os,
                     image_architecture: platform.arch,
                     host_os: host.os.clone(),
@@ -1144,10 +1139,10 @@ mod image {
             "image platform {image_os}/{image_architecture} does not match host {host_os}/{host_architecture}"
         )]
         Platform {
-            image_os: OS,
-            image_architecture: Arch,
-            host_os: OS,
-            host_architecture: Arch,
+            image_os: platform::OS,
+            image_architecture: platform::Arch,
+            host_os: platform::OS,
+            host_architecture: platform::Arch,
         },
         #[error("rootfs has {diff_id_count} diff IDs but manifest has {layer_count} layers")]
         Rootfs {
@@ -1158,11 +1153,19 @@ mod image {
 }
 
 mod registry {
-    use super::*;
+    use std::{
+        fmt::{self, Display},
+        str::FromStr,
+    };
+
+    use reqwest::Url;
+    use serde::{Deserialize, Deserializer, de};
+
+    use super::{OciError, digest};
 
     #[derive(Debug)]
     pub struct RegistryLoc {
-        manifest: Url,
+        pub manifest: Url,
     }
 
     impl FromStr for RegistryLoc {
@@ -1219,17 +1222,21 @@ mod registry {
 
     impl RegistryLoc {
         #[tracing::instrument(err)]
-        fn manifest_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
+        pub fn manifest_url(&self, digest: &digest::Sha256Digest) -> Result<Url, OciError> {
             self.descriptor_url("manifests", digest)
         }
 
         #[tracing::instrument(err)]
-        fn blob_url(&self, digest: &Sha256Digest) -> Result<Url, OciError> {
+        pub fn blob_url(&self, digest: &digest::Sha256Digest) -> Result<Url, OciError> {
             self.descriptor_url("blobs", digest)
         }
 
         #[tracing::instrument(err)]
-        fn descriptor_url(&self, kind: &str, digest: &Sha256Digest) -> Result<Url, OciError> {
+        fn descriptor_url(
+            &self,
+            kind: &str,
+            digest: &digest::Sha256Digest,
+        ) -> Result<Url, OciError> {
             let mut url = self.manifest.clone();
             {
                 let mut segments = url.path_segments_mut().map_err(|()| {
@@ -1248,7 +1255,15 @@ mod registry {
 }
 
 mod digest {
-    use super::*;
+    use std::{
+        fmt::{self, Display},
+        str::FromStr,
+    };
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+    use sha2::{Digest as _, Sha256};
+
+    use super::ParseValueError;
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     pub struct Sha256Digest(String);
@@ -1261,7 +1276,7 @@ mod digest {
     }
 
     #[tracing::instrument(skip(bytes))]
-    fn format(bytes: &[u8]) -> String {
+    pub fn format(bytes: &[u8]) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
         let mut digest = String::with_capacity("sha256:".len() + bytes.len() * 2);
@@ -1321,17 +1336,24 @@ mod digest {
 }
 
 mod platform {
-    use super::*;
+    use std::{
+        fmt::{self, Display},
+        str::FromStr,
+    };
+
+    use serde::{Deserialize, Deserializer, Serialize, de};
+
+    use super::{OciError, ParseValueError, descriptor};
 
     #[derive(Debug, Clone)]
-    struct HostPlatform {
-        os: OS,
-        architecture: Arch,
+    pub struct HostPlatform {
+        pub os: OS,
+        pub architecture: Arch,
     }
 
     impl HostPlatform {
         #[tracing::instrument(err)]
-        fn current() -> Result<Self, OciError> {
+        pub fn current() -> Result<Self, OciError> {
             let os = match std::env::consts::OS {
                 "macos" => "darwin",
                 os => os,
@@ -1356,7 +1378,7 @@ mod platform {
         }
 
         #[tracing::instrument(skip(manifests), fields(os = %self.os, architecture = %self.architecture), err)]
-        fn select_platform(
+        pub fn select_platform(
             &self,
             manifests: &[descriptor::Manifest],
         ) -> Result<descriptor::Manifest, OciError> {
@@ -1506,12 +1528,12 @@ impl From<ParseValueError> for OciError {
     }
 }
 
-impl From<oci_schema::ParseImageConfigError> for OciError {
-    fn from(error: oci_schema::ParseImageConfigError) -> Self {
+impl From<image::ParseImageConfigError> for OciError {
+    fn from(error: image::ParseImageConfigError) -> Self {
         let message = error.to_string();
         match error {
-            oci_schema::ParseImageConfigError::Platform { .. } => Self::InvalidInput(message),
-            oci_schema::ParseImageConfigError::Rootfs { .. } => Self::InvalidDocument(message),
+            image::ParseImageConfigError::Platform { .. } => Self::InvalidInput(message),
+            image::ParseImageConfigError::Rootfs { .. } => Self::InvalidDocument(message),
         }
     }
 }
@@ -1537,12 +1559,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::{
-        Router,
+        Extension, Json, Router,
         body::Body,
         extract::State,
         http::{
-            Request, Uri,
-            header::{AUTHORIZATION, CONTENT_TYPE},
+            HeaderMap, Request, StatusCode, Uri,
+            header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
         },
         response::{IntoResponse, Response},
         routing::{get, post},
@@ -1552,11 +1574,7 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
     use tower::ServiceExt;
 
-    use super::*;
-    use super::{
-        descriptor::{Descriptor, Layer as LayerDesc, ParseImageConfigError},
-        oci_schema::ImageConfigDoc,
-    };
+    use super::{OciFetcher, descriptor, digest, image, oci_schema, platform, run};
 
     const TOKEN: &str = "fixture-token";
 
@@ -1570,13 +1588,13 @@ mod tests {
     struct ServedDocument {
         body: Vec<u8>,
         media_type: &'static str,
-        digest: Sha256Digest,
+        digest: digest::Sha256Digest,
     }
 
     impl ServedDocument {
         fn from_json(value: Value, media_type: &'static str) -> Self {
             let body = serde_json::to_vec(&value).expect("fixture JSON should serialize");
-            let digest = sha256_digest(&body);
+            let digest = digest::Sha256Digest::from(body.as_slice());
             Self {
                 body,
                 media_type,
@@ -1590,12 +1608,12 @@ mod tests {
         initial: ServedDocument,
         manifest: ServedDocument,
         config: ServedDocument,
-        layers: Vec<(Sha256Digest, &'static str, Vec<u8>)>,
+        layers: Vec<(digest::Sha256Digest, &'static str, Vec<u8>)>,
     }
 
     impl RegistryDocuments {
         fn new(
-            platform: &HostPlatform,
+            platform: &platform::HostPlatform,
             initial: InitialDocument,
             corrupt_layer_digest: bool,
         ) -> Self {
@@ -1606,9 +1624,9 @@ mod tests {
                     .parse()
                     .expect("fixture digest should be valid")
             } else {
-                sha256_digest(&first_layer)
+                digest::Sha256Digest::from(first_layer.as_slice())
             };
-            let second_digest = sha256_digest(&second_layer);
+            let second_digest = digest::Sha256Digest::from(second_layer.as_slice());
 
             let config = ServedDocument::from_json(
                 json!({
@@ -1642,8 +1660,8 @@ mod tests {
                     "rootfs": {
                         "type": "layers",
                         "diff_ids": [
-                            sha256_digest(b"first uncompressed layer"),
-                            sha256_digest(b"second uncompressed layer")
+                            digest::Sha256Digest::from(b"first uncompressed layer".as_slice()),
+                            digest::Sha256Digest::from(b"second uncompressed layer".as_slice())
                         ]
                     },
                     "history": [
@@ -1862,7 +1880,7 @@ mod tests {
         bytes_response(&document.body, document.media_type, &document.digest)
     }
 
-    fn bytes_response(body: &[u8], media_type: &str, digest: &Sha256Digest) -> Response {
+    fn bytes_response(body: &[u8], media_type: &str, digest: &digest::Sha256Digest) -> Response {
         Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, media_type)
@@ -1900,22 +1918,25 @@ mod tests {
         (status, body)
     }
 
-    fn layer_descriptors(count: usize) -> Vec<LayerDesc> {
+    fn layer_descriptors(count: usize) -> Vec<descriptor::Layer> {
         (0..count)
-            .map(|index| Descriptor {
+            .map(|index| descriptor::Descriptor {
                 media_kind: "application/vnd.oci.image.layer.v1.tar"
                     .parse()
                     .expect("fixture media type should parse"),
-                digest: sha256_digest(index.to_string().as_bytes()),
+                digest: digest::Sha256Digest::from(index.to_string().as_bytes()),
                 size: 0,
                 platform: None,
             })
             .collect()
     }
 
-    fn configuration_document(platform: &HostPlatform, diff_id_count: usize) -> ImageConfigDoc {
+    fn configuration_document(
+        platform: &platform::HostPlatform,
+        diff_id_count: usize,
+    ) -> oci_schema::ImageConfig {
         let diff_ids = (0..diff_id_count)
-            .map(|index| sha256_digest(index.to_string().as_bytes()))
+            .map(|index| digest::Sha256Digest::from(index.to_string().as_bytes()))
             .collect::<Vec<_>>();
         serde_json::from_value(json!({
             "architecture": platform.architecture,
@@ -1930,8 +1951,8 @@ mod tests {
 
     #[test]
     fn platform_fields_parse_during_deserialization() {
-        let platform = HostPlatform::current().expect("test host should be supported");
-        let error = serde_json::from_value::<ImageConfigDoc>(json!({
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let error = serde_json::from_value::<oci_schema::ImageConfig>(json!({
             "architecture": "AMD64",
             "os": platform.os,
             "rootfs": {
@@ -1946,7 +1967,7 @@ mod tests {
 
     #[test]
     fn image_configuration_parser_rejects_a_different_platform() {
-        let platform = HostPlatform::current().expect("test host should be supported");
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
         let mut document = configuration_document(&platform, 1);
         document.platform.arch = if platform.architecture.as_ref() == "amd64" {
             "arm64".parse().expect("fixture architecture should parse")
@@ -1954,23 +1975,26 @@ mod tests {
             "amd64".parse().expect("fixture architecture should parse")
         };
 
-        let error = ImageConfig::new(document, &platform, &layer_descriptors(1))
+        let error = image::Config::new(document, &platform, &layer_descriptors(1))
             .expect_err("a different platform must not produce an image configuration");
 
-        assert!(matches!(error, ParseImageConfigError::Platform { .. }));
+        assert!(matches!(
+            error,
+            image::ParseImageConfigError::Platform { .. }
+        ));
     }
 
     #[test]
     fn image_configuration_parser_rejects_a_rootfs_for_different_layers() {
-        let platform = HostPlatform::current().expect("test host should be supported");
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
         let document = configuration_document(&platform, 1);
 
-        let error = ImageConfig::new(document, &platform, &layer_descriptors(2))
+        let error = image::Config::new(document, &platform, &layer_descriptors(2))
             .expect_err("a mismatched rootfs must not produce an image configuration");
 
         assert!(matches!(
             error,
-            ParseImageConfigError::Rootfs {
+            image::ParseImageConfigError::Rootfs {
                 diff_id_count: 1,
                 layer_count: 2,
             }
@@ -1979,7 +2003,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_fetches_anonymous_host_image_and_verifies_every_layer() {
-        let platform = HostPlatform::current().expect("test host should be supported");
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Index,
@@ -2004,15 +2028,15 @@ mod tests {
         assert_eq!(body["platform"]["os_version"], "index-os-version");
         assert_eq!(body["platform"]["os_features"], json!(["index-feature"]));
         assert_eq!(
-            body["index"]["media_type"],
+            body["index"]["media_kind"],
             "application/vnd.oci.image.index.v1+json"
         );
         assert_eq!(
-            body["manifest"]["media_type"],
+            body["manifest"]["media_kind"],
             "application/vnd.oci.image.manifest.v1+json"
         );
         assert_eq!(
-            body["manifest"]["config"]["media_type"],
+            body["manifest"]["config"]["media_kind"],
             "application/vnd.oci.image.config.v1+json"
         );
         assert_eq!(body["image"]["user"], "1000:1000");
@@ -2028,7 +2052,6 @@ mod tests {
             .as_array()
             .expect("layers should be an array")
         {
-            assert_eq!(layer["verified"], true);
             assert_eq!(layer["downloaded_size"], layer["declared_size"]);
             assert!(
                 layer["url"]
@@ -2059,7 +2082,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_accepts_a_direct_platform_manifest() {
-        let platform = HostPlatform::current().expect("test host should be supported");
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Manifest,
@@ -2073,7 +2096,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["index"].is_null());
         assert_eq!(
-            body["manifest"]["media_type"],
+            body["manifest"]["media_kind"],
             "application/vnd.oci.image.manifest.v1+json"
         );
         assert_eq!(body["layers"].as_array().map(Vec::len), Some(2));
@@ -2097,8 +2120,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_rejects_an_index_without_the_host_platform() {
-        let platform = HostPlatform::current().expect("test host should be supported");
-        let advertised = HostPlatform {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let advertised = platform::HostPlatform {
             os: platform.os.clone(),
             architecture: if platform.architecture.as_ref() == "amd64" {
                 "arm64".parse().expect("fixture architecture should parse")
@@ -2126,7 +2149,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_returns_bad_gateway_when_a_layer_digest_does_not_match() {
-        let platform = HostPlatform::current().expect("test host should be supported");
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Index,
