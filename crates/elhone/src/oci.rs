@@ -1,5 +1,8 @@
+mod rootfs;
+
 use std::{
     fmt::{self, Display},
+    path::Path,
     sync::Once,
 };
 
@@ -11,6 +14,7 @@ use reqwest::{
     redirect::Policy,
 };
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use super::ApiError;
 
@@ -64,18 +68,27 @@ pub struct OciFetcher {
     client: Client,
     transport: TransportPolicy,
     platform: Option<platform::HostPlatform>,
+    artifacts: rootfs::ArtifactStore,
 }
 
 impl Default for OciFetcher {
     #[tracing::instrument]
     fn default() -> Self {
-        Self::new(TransportPolicy::HttpsOnly, None)
+        Self::new(
+            TransportPolicy::HttpsOnly,
+            None,
+            rootfs::ArtifactStore::default(),
+        )
     }
 }
 
 impl OciFetcher {
-    #[tracing::instrument]
-    fn new(transport: TransportPolicy, platform: Option<platform::HostPlatform>) -> Self {
+    #[tracing::instrument(skip(artifacts))]
+    fn new(
+        transport: TransportPolicy,
+        platform: Option<platform::HostPlatform>,
+        artifacts: rootfs::ArtifactStore,
+    ) -> Self {
         install_ring_crypto_provider();
         let client = Client::builder()
             .redirect(Policy::custom(move |attempt| {
@@ -92,13 +105,27 @@ impl OciFetcher {
             client,
             transport,
             platform,
+            artifacts,
         }
     }
 
     #[cfg(test)]
     #[tracing::instrument]
     fn for_test(platform: platform::HostPlatform) -> Self {
-        Self::new(TransportPolicy::HttpLoopback, Some(platform))
+        Self::new(
+            TransportPolicy::HttpLoopback,
+            Some(platform),
+            rootfs::ArtifactStore::for_test(false),
+        )
+    }
+
+    #[cfg(test)]
+    fn for_test_builder_failure(platform: platform::HostPlatform) -> Self {
+        Self::new(
+            TransportPolicy::HttpLoopback,
+            Some(platform),
+            rootfs::ArtifactStore::for_test(true),
+        )
     }
 
     #[tracing::instrument(skip(self, token), fields(url = %loc), err)]
@@ -161,12 +188,31 @@ impl OciFetcher {
 
         let platform = config.platform(selected_platform);
         let image = config.response();
+        let workspace = self.artifacts.workspace()?;
+        let oci_schema::Rootfs::Layers { diff_ids } = &config.rootfs;
         let mut layers = Vec::with_capacity(manifest.document.layers.len());
-        for descriptor in &manifest.document.layers {
+        for (index, (descriptor, diff_id)) in
+            manifest.document.layers.iter().zip(diff_ids).enumerate()
+        {
             let layer_url = loc.blob_url(&descriptor.digest)?;
             let layer_url = self.transport.parse(&layer_url)?;
-            layers.push(session.fetch_layer(layer_url, descriptor).await?);
+            let downloaded = session
+                .fetch_layer(layer_url, descriptor, &workspace.layer_blob(index))
+                .await?;
+            let applied = self
+                .artifacts
+                .apply_layer(&workspace, index, &descriptor.media_kind, diff_id.clone())
+                .await?;
+            layers.push(api_schema::Layer::new(api_schema::LayerInput {
+                url: layer_url.as_ref(),
+                descriptor,
+                downloaded_size: downloaded.size,
+                downloaded_digest: downloaded.digest,
+                diff_id: applied.diff_id,
+                uncompressed_size: applied.uncompressed_size,
+            })?);
         }
+        let filesystem = self.artifacts.finish(workspace).await?;
 
         Ok(api_schema::Run {
             url: loc.manifest.to_string(),
@@ -187,6 +233,7 @@ impl OciFetcher {
             rootfs: config.rootfs,
             history: config.history,
             layers,
+            filesystem: filesystem.into(),
         })
     }
 }
@@ -288,9 +335,19 @@ impl<'a> FetchSession<'a> {
         &mut self,
         url: OutboundUrl<'_>,
         desc: &descriptor::Layer,
-    ) -> Result<api_schema::Layer, OciError> {
+        destination: &Path,
+    ) -> Result<DownloadedLayer, OciError> {
         let response = self.get(url, desc.media_kind.as_ref()).await?;
         let mut stream = response.bytes_stream();
+        let destination_path = destination.to_path_buf();
+        let mut destination = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination_path)
+            .await
+            .map_err(|source| {
+                rootfs::Error::io("create downloaded OCI layer", &destination_path, source)
+            })?;
         let mut hasher = Sha256::new();
         let mut downloaded_size = 0_u64;
 
@@ -310,16 +367,22 @@ impl<'a> FetchSession<'a> {
                     OciError::InvalidDocument("downloaded layer size overflowed u64".to_owned())
                 })?;
             hasher.update(&chunk);
+            destination.write_all(&chunk).await.map_err(|source| {
+                rootfs::Error::io("write downloaded OCI layer", &destination_path, source)
+            })?;
         }
+        destination.flush().await.map_err(|source| {
+            rootfs::Error::io("flush downloaded OCI layer", &destination_path, source)
+        })?;
 
-        api_schema::Layer::new(api_schema::LayerInput {
-            url: url.as_ref(),
-            descriptor: desc,
-            downloaded_size,
-            downloaded_digest: digest::format(&hasher.finalize())
+        let downloaded = DownloadedLayer {
+            size: downloaded_size,
+            digest: digest::format(&hasher.finalize())
                 .parse()
                 .expect("a computed SHA-256 digest should parse"),
-        })
+        };
+        downloaded.verify(url.as_ref(), desc)?;
+        Ok(downloaded)
     }
 
     #[tracing::instrument(skip(self, expected), fields(url = %url), err)]
@@ -386,6 +449,32 @@ impl<'a> FetchSession<'a> {
                 url: url.to_string(),
                 source,
             })
+    }
+}
+
+#[derive(Debug)]
+struct DownloadedLayer {
+    size: u64,
+    digest: digest::Sha256Digest,
+}
+
+impl DownloadedLayer {
+    fn verify(&self, url: &Url, descriptor: &descriptor::Layer) -> Result<(), OciError> {
+        if descriptor.size != self.size {
+            return Err(OciError::SizeMismatch {
+                url: url.to_string(),
+                expected: descriptor.size,
+                actual: self.size,
+            });
+        }
+        if descriptor.digest != self.digest {
+            return Err(OciError::DigestMismatch {
+                url: url.to_string(),
+                expected: descriptor.digest.to_string(),
+                actual: self.digest.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -667,6 +756,7 @@ mod api_schema {
         pub rootfs: oci_schema::Rootfs,
         pub history: Vec<oci_schema::History>,
         pub layers: Vec<Layer>,
+        pub filesystem: Filesystem,
     }
 
     #[derive(Debug, Serialize)]
@@ -725,6 +815,8 @@ mod api_schema {
         digest: digest::Sha256Digest,
         declared_size: u64,
         downloaded_size: u64,
+        diff_id: digest::Sha256Digest,
+        uncompressed_size: u64,
     }
 
     #[derive(Debug)]
@@ -733,6 +825,8 @@ mod api_schema {
         pub descriptor: &'a descriptor::Layer,
         pub downloaded_size: u64,
         pub downloaded_digest: digest::Sha256Digest,
+        pub diff_id: digest::Sha256Digest,
+        pub uncompressed_size: u64,
     }
 
     impl Layer {
@@ -758,7 +852,28 @@ mod api_schema {
                 digest: input.descriptor.digest.clone(),
                 declared_size: input.descriptor.size,
                 downloaded_size: input.downloaded_size,
+                diff_id: input.diff_id,
+                uncompressed_size: input.uncompressed_size,
             })
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct Filesystem {
+        format: &'static str,
+        path: std::path::PathBuf,
+        size: u64,
+        digest: digest::Sha256Digest,
+    }
+
+    impl From<super::rootfs::Filesystem> for Filesystem {
+        fn from(filesystem: super::rootfs::Filesystem) -> Self {
+            Self {
+                format: "ext4",
+                path: filesystem.path,
+                size: filesystem.size,
+                digest: filesystem.digest,
+            }
         }
     }
 }
@@ -1402,6 +1517,14 @@ pub enum OciError {
         expected: u64,
         actual: u64,
     },
+    #[error(transparent)]
+    Rootfs(#[from] rootfs::Error),
+}
+
+impl OciError {
+    pub fn is_local_failure(&self) -> bool {
+        matches!(self, Self::Rootfs(error) if error.is_local())
+    }
 }
 
 impl From<ParseValueError> for OciError {
@@ -1438,7 +1561,11 @@ impl ParseValueError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        io::Write,
+        path::Path,
+        sync::{Arc, Mutex},
+    };
 
     use axum::{
         Extension, Router,
@@ -1451,6 +1578,7 @@ mod tests {
         response::{IntoResponse, Response},
         routing::{get, post},
     };
+    use flate2::{Compression as GzipCompression, write::GzEncoder};
     use http_body_util::BodyExt;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle};
@@ -1464,6 +1592,75 @@ mod tests {
     enum InitialDocument {
         Index,
         Manifest,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Corruption {
+        None,
+        CompressedDigest,
+        DiffId,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum LayerEncoding {
+        Gzip,
+        Zstd,
+    }
+
+    #[derive(Debug)]
+    struct LayerFixture {
+        body: Vec<u8>,
+        digest: digest::Sha256Digest,
+        diff_id: digest::Sha256Digest,
+        media_type: &'static str,
+    }
+
+    impl LayerFixture {
+        fn new(path: &str, body: &[u8], encoding: LayerEncoding) -> Self {
+            let mut archive = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut archive);
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).expect("fixture path should be valid");
+                header.set_size(u64::try_from(body.len()).expect("fixture body should fit in u64"));
+                header.set_mode(0o644);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(1);
+                header.set_cksum();
+                builder
+                    .append(&header, body)
+                    .expect("fixture tar entry should append");
+                builder.finish().expect("fixture tar should finish");
+            }
+            let diff_id = digest::Sha256Digest::from(archive.as_slice());
+            let (body, media_type) = match encoding {
+                LayerEncoding::Gzip => {
+                    let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
+                    encoder
+                        .write_all(&archive)
+                        .expect("fixture gzip encoder should write");
+                    (
+                        encoder
+                            .finish()
+                            .expect("fixture gzip encoder should finish"),
+                        "application/vnd.oci.image.layer.v1.tar+gzip",
+                    )
+                }
+                LayerEncoding::Zstd => (
+                    zstd::stream::encode_all(archive.as_slice(), 0)
+                        .expect("fixture zstd encoder should finish"),
+                    "application/vnd.oci.image.layer.v1.tar+zstd",
+                ),
+            };
+            let digest = digest::Sha256Digest::from(body.as_slice());
+            Self {
+                body,
+                digest,
+                diff_id,
+                media_type,
+            }
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1497,18 +1694,32 @@ mod tests {
         fn new(
             platform: &platform::HostPlatform,
             initial: InitialDocument,
-            corrupt_layer_digest: bool,
+            corruption: Corruption,
         ) -> Self {
-            let first_layer = b"first compressed filesystem layer".to_vec();
-            let second_layer = b"second compressed filesystem layer".to_vec();
-            let first_digest = if corrupt_layer_digest {
+            let first_layer = LayerFixture::new(
+                "etc/first-layer",
+                b"first filesystem layer",
+                LayerEncoding::Gzip,
+            );
+            let second_layer = LayerFixture::new(
+                "etc/second-layer",
+                b"second filesystem layer",
+                LayerEncoding::Zstd,
+            );
+            let first_digest = if matches!(corruption, Corruption::CompressedDigest) {
                 format!("sha256:{}", "0".repeat(64))
                     .parse()
                     .expect("fixture digest should be valid")
             } else {
-                digest::Sha256Digest::from(first_layer.as_slice())
+                first_layer.digest.clone()
             };
-            let second_digest = digest::Sha256Digest::from(second_layer.as_slice());
+            let first_diff_id = if matches!(corruption, Corruption::DiffId) {
+                format!("sha256:{}", "0".repeat(64))
+                    .parse()
+                    .expect("fixture diff ID should be valid")
+            } else {
+                first_layer.diff_id.clone()
+            };
 
             let config = ServedDocument::from_json(
                 json!({
@@ -1542,8 +1753,8 @@ mod tests {
                     "rootfs": {
                         "type": "layers",
                         "diff_ids": [
-                            digest::Sha256Digest::from(b"first uncompressed layer".as_slice()),
-                            digest::Sha256Digest::from(b"second uncompressed layer".as_slice())
+                            first_diff_id,
+                            second_layer.diff_id
                         ]
                     },
                     "history": [
@@ -1575,14 +1786,14 @@ mod tests {
                     },
                     "layers": [
                         {
-                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "mediaType": first_layer.media_type,
                             "digest": first_digest,
-                            "size": first_layer.len()
+                            "size": first_layer.body.len()
                         },
                         {
-                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                            "digest": second_digest,
-                            "size": second_layer.len()
+                            "mediaType": second_layer.media_type,
+                            "digest": second_layer.digest,
+                            "size": second_layer.body.len()
                         }
                     ],
                     "annotations": {
@@ -1626,15 +1837,11 @@ mod tests {
                 manifest,
                 config,
                 layers: vec![
+                    (first_digest, first_layer.media_type, first_layer.body),
                     (
-                        first_digest,
-                        "application/vnd.oci.image.layer.v1.tar+gzip",
-                        first_layer,
-                    ),
-                    (
-                        second_digest,
-                        "application/vnd.oci.image.layer.v1.tar+gzip",
-                        second_layer,
+                        second_layer.digest,
+                        second_layer.media_type,
+                        second_layer.body,
                     ),
                 ],
             }
@@ -1751,10 +1958,10 @@ mod tests {
             .expect("fixture document response should build")
     }
 
-    async fn request_run(fetcher: OciFetcher, url: &str, token: &str) -> (StatusCode, Value) {
+    async fn request_run(fetcher: &OciFetcher, url: &str, token: &str) -> (StatusCode, Value) {
         let app = Router::new()
             .route("/run", post(run))
-            .layer(Extension(fetcher));
+            .layer(Extension(fetcher.clone()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1869,16 +2076,12 @@ mod tests {
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Index,
-            false,
+            Corruption::None,
         ))
         .await;
 
-        let (status, body) = request_run(
-            OciFetcher::for_test(platform.clone()),
-            &registry.manifest_url,
-            TOKEN,
-        )
-        .await;
+        let fetcher = OciFetcher::for_test(platform.clone());
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["url"], registry.manifest_url);
@@ -1917,11 +2120,37 @@ mod tests {
         {
             assert_eq!(layer["downloaded_size"], layer["declared_size"]);
             assert!(
+                layer["diff_id"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("sha256:"))
+            );
+            assert!(
+                layer["uncompressed_size"]
+                    .as_u64()
+                    .is_some_and(|size| size > 0)
+            );
+            assert!(
                 layer["url"]
                     .as_str()
                     .is_some_and(|url| url.contains("/blobs/"))
             );
         }
+        assert_eq!(body["filesystem"]["format"], "ext4");
+        let filesystem = body["filesystem"]["path"]
+            .as_str()
+            .expect("filesystem path should be a string");
+        assert!(Path::new(filesystem).is_file());
+        assert!(
+            body["filesystem"]["size"]
+                .as_u64()
+                .is_some_and(|size| size > 0)
+        );
+        assert!(
+            body["filesystem"]["digest"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+        assert_eq!(fetcher.artifacts.retained_count(), 1);
 
         let requests = registry.requests();
         assert_eq!(
@@ -1948,16 +2177,12 @@ mod tests {
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Manifest,
-            false,
+            Corruption::None,
         ))
         .await;
 
-        let (status, body) = request_run(
-            OciFetcher::for_test(platform),
-            &registry.manifest_url,
-            TOKEN,
-        )
-        .await;
+        let fetcher = OciFetcher::for_test(platform);
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(body["index"].is_null());
@@ -1970,8 +2195,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_rejects_non_https_registry_urls() {
+        let fetcher = OciFetcher::default();
         let (status, body) = request_run(
-            OciFetcher::default(),
+            &fetcher,
             "http://registry.example/v2/library/alpine/manifests/latest",
             TOKEN,
         )
@@ -1999,16 +2225,12 @@ mod tests {
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &advertised,
             InitialDocument::Index,
-            false,
+            Corruption::None,
         ))
         .await;
 
-        let (status, body) = request_run(
-            OciFetcher::for_test(platform),
-            &registry.manifest_url,
-            TOKEN,
-        )
-        .await;
+        let fetcher = OciFetcher::for_test(platform);
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
@@ -2024,16 +2246,12 @@ mod tests {
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
             InitialDocument::Index,
-            true,
+            Corruption::CompressedDigest,
         ))
         .await;
 
-        let (status, body) = request_run(
-            OciFetcher::for_test(platform),
-            &registry.manifest_url,
-            TOKEN,
-        )
-        .await;
+        let fetcher = OciFetcher::for_test(platform);
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
@@ -2041,5 +2259,89 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("digest mismatch"))
         );
+        assert_eq!(fetcher.artifacts.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_returns_bad_gateway_when_a_layer_diff_id_does_not_match() {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let registry = RegistryFixture::start(RegistryDocuments::new(
+            &platform,
+            InitialDocument::Index,
+            Corruption::DiffId,
+        ))
+        .await;
+        let fetcher = OciFetcher::for_test(platform);
+
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("diff ID mismatch"))
+        );
+        assert_eq!(fetcher.artifacts.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_returns_internal_server_error_when_ext4_building_fails() {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let registry = RegistryFixture::start(RegistryDocuments::new(
+            &platform,
+            InitialDocument::Index,
+            Corruption::None,
+        ))
+        .await;
+        let fetcher = OciFetcher::for_test_builder_failure(platform);
+
+        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("filesystem builder failed"))
+        );
+        assert_eq!(fetcher.artifacts.retained_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_retains_distinct_artifacts_until_the_fetcher_is_dropped() {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let registry = RegistryFixture::start(RegistryDocuments::new(
+            &platform,
+            InitialDocument::Index,
+            Corruption::None,
+        ))
+        .await;
+        let first_path;
+        let second_path;
+        {
+            let fetcher = OciFetcher::for_test(platform);
+            let (first_status, first) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+            let (second_status, second) =
+                request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+            assert_eq!(first_status, StatusCode::OK);
+            assert_eq!(second_status, StatusCode::OK);
+            first_path = Path::new(
+                first["filesystem"]["path"]
+                    .as_str()
+                    .expect("first filesystem path should be a string"),
+            )
+            .to_path_buf();
+            second_path = Path::new(
+                second["filesystem"]["path"]
+                    .as_str()
+                    .expect("second filesystem path should be a string"),
+            )
+            .to_path_buf();
+            assert_ne!(first_path, second_path);
+            assert!(first_path.is_file());
+            assert!(second_path.is_file());
+            assert_eq!(fetcher.artifacts.retained_count(), 2);
+        }
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
     }
 }

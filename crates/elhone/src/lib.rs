@@ -175,6 +175,10 @@ impl ApiError {
 
 impl From<oci::OciError> for ApiError {
     fn from(error: oci::OciError) -> Self {
+        if error.is_local_failure() {
+            tracing::error!(%error, "OCI artifact build failed");
+            return Self::InternalServerError(error.to_string());
+        }
         match error {
             oci::OciError::InvalidInput(message) => Self::UnprocessableEntity(message),
             error => {

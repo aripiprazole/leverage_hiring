@@ -106,7 +106,7 @@
             pkgs.cargo-mutants
             rust-analyzer-check
             x-cli
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.e2fsprogs ];
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu =
             "-I${aarch64-linux-headers}/include";
           RUST_BACKTRACE = "1";

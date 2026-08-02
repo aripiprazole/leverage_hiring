@@ -7,13 +7,35 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x run <oci_manifest_url>
+Usage: x run <docker_image>
 
-Fetch a public Docker Hub image for the host platform and verify all filesystem layers.
+Fetch a public Docker Hub image for the host platform and build an ext4 root filesystem.
 
-Example:
+Examples:
+  x run ubuntu:latest
   x run https://registry-1.docker.io/v2/library/alpine/manifests/latest
 EOF
+}
+
+docker_manifest_url() {
+    local image="$1"
+
+    if [[ "$image" =~ ^https://registry-1\.docker\.io/v2/([^?#]+)/manifests/[^/?#]+$ ]]; then
+        printf '%s\n' "$image"
+        return
+    fi
+
+    if [[ "$image" =~ ^([a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*):([A-Za-z0-9_][A-Za-z0-9_.-]*)$ ]]; then
+        local repository="${BASH_REMATCH[1]}"
+        local tag="${BASH_REMATCH[5]}"
+        if [[ "$repository" != */* ]]; then
+            repository="library/$repository"
+        fi
+        printf 'https://registry-1.docker.io/v2/%s/manifests/%s\n' "$repository" "$tag"
+        return
+    fi
+
+    usage_error "expected a Docker Hub image like ubuntu:latest or a manifest URL, got: $image"
 }
 
 docker_repository() {
@@ -49,7 +71,7 @@ docker_public_token() {
 }
 
 if (($# == 0)); then
-    usage_error "missing OCI manifest URL"
+    usage_error "missing Docker image"
 fi
 
 case "$1" in
@@ -62,7 +84,7 @@ case "$1" in
             usage_error "unexpected extra argument: $2"
         fi
         require_commands curl jq
-        manifest_url="$1"
+        manifest_url="$(docker_manifest_url "$1")"
         repository="$(docker_repository "$manifest_url")"
         token="$(docker_public_token "$repository")"
         payload="$(jq -nc --arg url "$manifest_url" --arg token "$token" '{url: $url, token: $token}')"

@@ -11,7 +11,7 @@ Usage: x <command> [args]
 Commands:
   setup_daemon     Download and prepare daemon/runtime artifacts.
   run_daemon       Build and run the HTTP daemon with required privileges.
-  run              Fetch and inspect an OCI image through Elhone.
+  run              Fetch an OCI image and build an ext4 root filesystem.
   create           Create a new VM.
   ps               List VMs.
   show             Show details for a VM.
