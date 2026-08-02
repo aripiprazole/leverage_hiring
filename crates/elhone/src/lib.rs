@@ -7,17 +7,21 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use barbirolli::{Barbirolli, LifecycleError, StorageError, VmId, VmInput, VmStatus};
-use serde::Serialize;
+use barbirolli::{
+    AuthorizedKey, Barbirolli, LifecycleError, PortBinding, Rootfs, StorageError, VcpuCount, VmId,
+    VmInput, VmStatus,
+};
+use serde::{Deserialize, Serialize};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 #[derive(Clone)]
 struct AppState {
     manager: Barbirolli,
+    standard_rootfs: Rootfs,
 }
 
-pub fn router(manager: Barbirolli) -> Router {
+pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
     Router::new()
         .route("/vms", get(list_vms).post(create_vm))
         .route("/vms/{id}", get(vm).delete(delete_vm))
@@ -27,7 +31,10 @@ pub fn router(manager: Barbirolli) -> Router {
         .route("/run", post(oci::run))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .with_state(AppState { manager })
+        .with_state(AppState {
+            manager,
+            standard_rootfs,
+        })
         .layer(Extension(oci::OciFetcher::default()))
         .layer(
             TraceLayer::new_for_http()
@@ -40,6 +47,27 @@ pub fn router(manager: Barbirolli) -> Router {
 struct StatusResponse {
     id: VmId,
     status: VmStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateVmRequest {
+    vcpu_count: VcpuCount,
+    #[serde(default)]
+    authorized_keys: Vec<AuthorizedKey>,
+    #[serde(default)]
+    bindings: Vec<PortBinding>,
+}
+
+impl CreateVmRequest {
+    fn into_vm_input(self, rootfs: Rootfs) -> VmInput {
+        VmInput {
+            rootfs,
+            vcpu_count: self.vcpu_count,
+            authorized_keys: self.authorized_keys,
+            bindings: self.bindings,
+        }
+    }
 }
 
 #[tracing::instrument(skip(state))]
@@ -63,10 +91,11 @@ async fn vm(
 #[tracing::instrument(skip(state))]
 async fn create_vm(
     State(state): State<AppState>,
-    input: Result<Json<VmInput>, JsonRejection>,
+    input: Result<Json<CreateVmRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
     tracing::info!("create vm");
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
+    let input = input.into_vm_input(state.standard_rootfs);
     let id = state.manager.create(input).await.map_err(ApiError::from)?;
     Ok((
         StatusCode::CREATED,
@@ -251,8 +280,12 @@ fn parse_vm_id(value: &str) -> Result<VmId, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use barbirolli::{NetworkSpec, Port, PortBinding, VmId, VmInput, VmStatus, VmSummary};
+    use std::path::PathBuf;
+
+    use barbirolli::{NetworkSpec, Port, PortBinding, Rootfs, VmId, VmStatus, VmSummary};
     use serde_json::json;
+
+    use super::CreateVmRequest;
 
     #[test]
     fn vm_input_rejects_artifact_selection() {
@@ -262,7 +295,7 @@ mod tests {
             });
             input[field] = value.into();
 
-            let error = serde_json::from_value::<VmInput>(input)
+            let error = serde_json::from_value::<CreateVmRequest>(input)
                 .expect_err("artifact selection must not be accepted");
             assert!(
                 error
@@ -274,7 +307,7 @@ mod tests {
 
     #[test]
     fn vm_input_rejects_user() {
-        let error = serde_json::from_value::<VmInput>(json!({
+        let error = serde_json::from_value::<CreateVmRequest>(json!({
             "user": "alice",
             "vcpu_count": 1
         }))
@@ -285,13 +318,13 @@ mod tests {
 
     #[test]
     fn vm_input_accepts_typed_bindings_and_defaults_to_none() {
-        let without_bindings = serde_json::from_value::<VmInput>(json!({
+        let without_bindings = serde_json::from_value::<CreateVmRequest>(json!({
             "vcpu_count": 1
         }))
         .expect("bindings should be optional");
         assert!(without_bindings.bindings.is_empty());
 
-        let with_bindings = serde_json::from_value::<VmInput>(json!({
+        let with_bindings = serde_json::from_value::<CreateVmRequest>(json!({
             "vcpu_count": 1,
             "bindings": [
                 {
@@ -319,7 +352,7 @@ mod tests {
             });
             binding[field] = 0.into();
 
-            let error = serde_json::from_value::<VmInput>(json!({
+            let error = serde_json::from_value::<CreateVmRequest>(json!({
                 "vcpu_count": 1,
                 "bindings": [binding]
             }))
@@ -330,13 +363,27 @@ mod tests {
 
     #[test]
     fn vm_input_rejects_port_bindings() {
-        let error = serde_json::from_value::<VmInput>(json!({
+        let error = serde_json::from_value::<CreateVmRequest>(json!({
             "vcpu_count": 1,
             "port_bindings": []
         }))
         .expect_err("port_bindings must not be accepted");
 
         assert!(error.to_string().contains("unknown field `port_bindings`"));
+    }
+
+    #[test]
+    fn vm_input_receives_the_daemon_standard_rootfs() {
+        let input = serde_json::from_value::<CreateVmRequest>(json!({
+            "vcpu_count": 1
+        }))
+        .expect("valid VM input")
+        .into_vm_input(Rootfs::from(PathBuf::from("/var/lib/images/alpine.ext4")));
+
+        assert_eq!(
+            input.rootfs,
+            Rootfs::from(PathBuf::from("/var/lib/images/alpine.ext4"))
+        );
     }
 
     #[test]

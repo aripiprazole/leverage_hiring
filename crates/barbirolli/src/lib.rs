@@ -28,8 +28,8 @@ pub use lifecycle::{
 pub use network::{InterfaceName, NetworkSpec};
 pub use storage::{StorageError, VmStore};
 pub use vm::{
-    ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, VcpuCount, VmId,
-    VmInput, VmSpec,
+    ApiSocket, AuthorizedKey, MemoryMib, ParseValueError, Port, PortBinding, Rootfs, VcpuCount,
+    VmId, VmInput, VmSpec,
 };
 
 pub trait IoError {

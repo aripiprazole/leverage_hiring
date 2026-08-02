@@ -166,7 +166,7 @@ fn vm_config(
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
     let rootfs = resources.create_resource(
-        &spec.rootfs,
+        spec.rootfs.as_ref(),
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
     let metrics = resources.create_resource(

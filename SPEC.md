@@ -209,7 +209,7 @@ struct VmSpec {
     deleted: bool,
     artifact_dir: PathBuf,
     kernel: PathBuf,
-    rootfs: PathBuf,
+    rootfs: Rootfs,
     vcpu_count: VcpuCount,
     api_socket: ApiSocket,
     memory_mib: MemoryMib,
@@ -222,10 +222,15 @@ type FirecrackerVm = fctools::vm::Vm<...>;
 
 #[derive(Serialize, Deserialize)]
 struct VmInput {
+    /// Injected by the daemon and not accepted by the HTTP API.
+    rootfs: Rootfs,
     vcpu_count: VcpuCount, // 1..=31
     authorized_keys: Vec<AuthorizedKey>,
     bindings: Vec<PortBinding>,
 }
+
+/// A private ext4 filesystem that can be mounted to plant authorized keys.
+struct Rootfs(PathBuf);
 
 struct PortBinding {
     internal: Port,
@@ -253,7 +258,8 @@ enum LifecycleError {
 Each `$VM_ROOT/<vm_id>` contains:
 
 - `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
-- `rootfs.ext4`: private writable copy of `IMAGE_ROOT/alpine.ext4`.
+- `rootfs.ext4`: private writable copy of `VmInput.rootfs`; the daemon injects
+  `IMAGE_ROOT/alpine.ext4` for `POST /vms`.
 - `config.json`: versioned `VmSpec`.
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.

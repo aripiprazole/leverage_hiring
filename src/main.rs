@@ -1,6 +1,6 @@
 use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 
-use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, VmStore};
+use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, Rootfs, VmStore};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -56,6 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
+    let standard_rootfs = Rootfs::from(config.image_root.join("alpine.ext4"));
     let daemon = Barbirolli::new(
         VmStore::new(config.vm_root, config.image_root)?,
         DaemonConfig {
@@ -73,7 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     let listener = TcpListener::bind(config.elhone_addr).await?;
-    let elhone = axum::serve(listener, elhone::router(daemon.clone()));
+    let elhone = axum::serve(listener, elhone::router(daemon.clone(), standard_rootfs));
 
     tracing::info!(addr = %config.elhone_addr, "HTTP service started");
     let service = tokio::select! {

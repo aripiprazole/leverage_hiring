@@ -30,7 +30,7 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    DaemonConfig, MemoryMib, ProvisioningConfig, VmId, VmInput, VmSpec, VmStore,
+    DaemonConfig, MemoryMib, ProvisioningConfig, StorageError, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
     io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
@@ -119,7 +119,9 @@ impl Barbirolli {
 
     /// Prune resources at the host machine by stopping idle vms, and by
     /// removing idle vms it does free resources to be allocated to used vms
+    #[tracing::instrument]
     pub async fn autoscale(&self) {
+        tracing::info!("autoscale");
         let mut interval = interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         while self.is_app_alive().is_ok() {
@@ -138,7 +140,7 @@ impl Barbirolli {
     /// Returns an error if the manager is draining, capacity is exhausted, or
     /// the VM artifacts cannot be created.
     #[tracing::instrument(skip(self, input), err)]
-    pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
+    pub async fn create(&self, input: VmInput) -> Result<VmId> {
         self.is_app_alive()?;
         let running_vms = self
             .vms
@@ -156,10 +158,16 @@ impl Barbirolli {
                 max_running_vms: self.provisioning.count,
             });
         }
-        let spec = self
+        let authorized_keys = input.authorized_keys.clone();
+        let creation = self
             .store
             .create(input, self.provisioning.default_vm_mem)
             .await?;
+        creation
+            .rootfs
+            .plant_authorized_keys(&authorized_keys)
+            .map_err(StorageError::from)?;
+        let spec = creation.finish()?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
         tracing::info!(

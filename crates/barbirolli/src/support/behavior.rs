@@ -1,7 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
 use barbirolli::{
-    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmId, VmSpec, VmStore, VmSummary,
+    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, Rootfs, VmId, VmSpec, VmStore,
+    VmSummary,
 };
 use derive_more::{Deref, DerefMut};
 use futures::future::try_join_all;
@@ -41,6 +42,7 @@ pub struct BehaviorManagerFixture {
     #[deref]
     #[deref_mut]
     manager: Barbirolli,
+    rootfs: Rootfs,
 }
 
 pub struct BehaviorVmFixture {
@@ -115,7 +117,10 @@ impl BehaviorFixture {
         )
         .await
         .expect("failed to create Barbirolli");
-        BehaviorManagerFixture { manager }
+        BehaviorManagerFixture {
+            manager,
+            rootfs: Rootfs::from(self.storage.image_root.join("alpine.ext4")),
+        }
     }
 }
 
@@ -131,14 +136,18 @@ impl StorageEnvironmentFixture {
 
 impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
-        let spec = self
+        let input = config.into_input(Rootfs::from(self.store.image_root.join("alpine.ext4")));
+        let authorized_keys = input.authorized_keys.clone();
+        let creation = self
             .store
-            .create(
-                config.into_input(),
-                ProvisioningConfig::default().default_vm_mem,
-            )
+            .create(input, ProvisioningConfig::default().default_vm_mem)
             .await
             .expect("failed to create stored VM");
+        creation
+            .rootfs
+            .plant_authorized_keys(&authorized_keys)
+            .expect("failed to plant authorized keys");
+        let spec = creation.finish().expect("failed to persist stored VM");
         StoredVmFixture::new(spec)
     }
 
@@ -176,7 +185,10 @@ impl BehaviorManagerFixture {
         &self,
         config: TestVmConfig,
     ) -> Result<BehaviorVmFixture, LifecycleError> {
-        let id = self.manager.create(config.into_input()).await?;
+        let id = self
+            .manager
+            .create(config.into_input(self.rootfs.clone()))
+            .await?;
         self.try_vm(id)
     }
 
@@ -189,9 +201,10 @@ impl BehaviorManagerFixture {
         let ids = try_join_all(configs.map(|config| {
             let manager = self.manager.clone();
             let barrier = barrier.clone();
+            let rootfs = self.rootfs.clone();
             async move {
                 barrier.wait().await;
-                manager.create(config.into_input()).await
+                manager.create(config.into_input(rootfs)).await
             }
         }))
         .await

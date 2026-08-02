@@ -1,6 +1,6 @@
 use std::{
     fmt::{self, Display},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -15,6 +15,7 @@ pub(crate) mod managed;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmInput {
+    pub rootfs: Rootfs,
     pub vcpu_count: VcpuCount,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
@@ -30,7 +31,7 @@ pub struct VmSpec {
     pub deleted: bool,
     pub artifact_dir: PathBuf,
     pub kernel: PathBuf,
-    pub rootfs: PathBuf,
+    pub rootfs: Rootfs,
     pub vcpu_count: VcpuCount,
     pub api_socket: ApiSocket,
     pub memory_mib: MemoryMib,
@@ -51,6 +52,18 @@ pub struct PortBinding {
 )]
 #[serde(transparent)]
 pub struct ApiSocket(PathBuf);
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+)]
+#[serde(transparent)]
+pub struct Rootfs(PathBuf);
+
+impl AsRef<Path> for Rootfs {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
 
 impl ApiSocket {
     #[cfg(target_os = "linux")]

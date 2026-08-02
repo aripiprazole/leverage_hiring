@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, VmId, VmStore, VmSummary};
+use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, Rootfs, VmId, VmStore, VmSummary};
 use futures::future::try_join_all;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -82,7 +82,10 @@ impl FirecrackerFixture {
         &self,
         config: TestVmConfig,
     ) -> Result<FirecrackerVmFixture, barbirolli::LifecycleError> {
-        let id = self.manager.create(config.into_input()).await?;
+        let id = self
+            .manager
+            .create(config.into_input(Rootfs::from(self.image_root.join("alpine.ext4"))))
+            .await?;
         Ok(self.vm(id))
     }
 
@@ -92,12 +95,14 @@ impl FirecrackerFixture {
         inspect: impl FnOnce(&[FirecrackerVmFixture; N]),
     ) -> [FirecrackerVmFixture; N] {
         let barrier = Arc::new(Barrier::new(N.max(1)));
+        let rootfs = Rootfs::from(self.image_root.join("alpine.ext4"));
         let ids = try_join_all(configs.map(|config| {
             let manager = self.manager.clone();
             let barrier = barrier.clone();
+            let rootfs = rootfs.clone();
             async move {
                 barrier.wait().await;
-                manager.create(config.into_input()).await
+                manager.create(config.into_input(rootfs)).await
             }
         }))
         .await

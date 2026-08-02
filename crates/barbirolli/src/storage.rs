@@ -50,7 +50,7 @@ mod tests {
     use std::fs;
 
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
-    use barbirolli::{Port, PortBinding};
+    use barbirolli::{Port, PortBinding, Rootfs};
     use barbirolli_derive::firecracker_test;
     use serde_json::json;
 
@@ -97,6 +97,28 @@ mod tests {
         assert!(
             !alice.storage.authorized_keys().exists(),
             "authorized keys must not be copied beside VM artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_copies_the_rootfs_from_vm_input() {
+        let fixture = BehaviorFixture::new();
+        let selected_rootfs = fixture.temporary.path().join("selected-rootfs.ext4");
+        fs::write(&selected_rootfs, b"selected rootfs").expect("failed to create selected rootfs");
+        let store = fixture.storage.open();
+
+        let creation = store
+            .create(
+                TestVmConfig::new(1).into_input(Rootfs::from(selected_rootfs)),
+                ProvisioningConfig::default().default_vm_mem,
+            )
+            .await
+            .expect("failed to create stored VM");
+        let spec = creation.finish().expect("failed to persist stored VM");
+
+        assert_eq!(
+            fs::read(spec.rootfs.as_ref()).expect("failed to read copied rootfs"),
+            b"selected rootfs"
         );
     }
 
