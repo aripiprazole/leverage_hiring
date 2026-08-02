@@ -146,6 +146,26 @@ impl Barbirolli {
     /// the VM artifacts cannot be created.
     #[tracing::instrument(skip(self, input), err)]
     pub async fn create(&self, input: VmInput) -> Result<VmId> {
+        self.create_with_rootfs_provisioning(input, Rootfs::provision_rootfs)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_for_behavior_test(&self, input: VmInput) -> Result<VmId> {
+        self.create_with_rootfs_provisioning(input, |_, _, _, _| Ok(()))
+            .await
+    }
+
+    async fn create_with_rootfs_provisioning(
+        &self,
+        input: VmInput,
+        provision_rootfs: impl FnOnce(
+            &Rootfs,
+            &Path,
+            &[AuthorizedKey],
+            bool,
+        ) -> Result<(), StorageError>,
+    ) -> Result<VmId> {
         self.is_app_alive()?;
         let running_vms = self
             .vms
@@ -169,9 +189,12 @@ impl Barbirolli {
             .store
             .create(input, self.provisioning.default_vm_mem)
             .await?;
-        creation
-            .rootfs
-            .provision_rootfs(&self.entrypoint, &authorized_keys, provision_ssh_keys)?;
+        provision_rootfs(
+            &creation.rootfs,
+            &self.entrypoint,
+            &authorized_keys,
+            provision_ssh_keys,
+        )?;
         let spec = creation.finish()?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));

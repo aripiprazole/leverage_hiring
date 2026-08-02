@@ -1,22 +1,30 @@
 mod rootfs;
 
 use std::{
+    collections::HashMap,
     fmt::{self, Display},
     path::Path,
-    sync::Once,
+    str::FromStr,
+    sync::{Arc, Once},
 };
 
-use axum::{Extension, Json, extract::rejection::JsonRejection};
-use futures::TryStreamExt;
+use axum::{
+    Json,
+    extract::{State, rejection::JsonRejection},
+    http::StatusCode as HttpStatusCode,
+};
+use barbirolli::{Barbirolli, LifecycleError, Rootfs, VcpuCount, VmId, VmInput, VmStatus};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture};
 use reqwest::{
     Client, Response, StatusCode, Url,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap},
     redirect::Policy,
 };
+use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 
-use super::ApiError;
+use super::{ApiError, AppState};
 
 #[derive(Debug, Clone, Copy)]
 enum TransportPolicy {
@@ -60,6 +68,403 @@ impl AsRef<Url> for OutboundUrl<'_> {
 impl Display for OutboundUrl<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageReference {
+    name: ImageName,
+    tag: ImageTag,
+}
+
+impl ImageReference {
+    fn docker_hub_location(&self) -> Result<registry::Loc, OciError> {
+        registry::Loc::docker_hub(&self.name, &self.tag)
+    }
+}
+
+impl Display for ImageReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.name, self.tag)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageName(String);
+
+impl FromStr for ImageName {
+    type Err = OciError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let valid_component = |component: &str| {
+            !component.is_empty()
+                && component.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                })
+                && component
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && component
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        };
+        if value.is_empty() || !value.split('/').all(valid_component) {
+            return Err(OciError::InvalidInput(format!(
+                "invalid OCI image name {value:?}"
+            )));
+        }
+        Ok(Self(if value.contains('/') {
+            value.to_owned()
+        } else {
+            format!("library/{value}")
+        }))
+    }
+}
+
+impl Display for ImageName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageTag(String);
+
+impl FromStr for ImageTag {
+    type Err = OciError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let valid = !value.is_empty()
+            && value.len() <= 128
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte));
+        valid
+            .then(|| Self(value.to_owned()))
+            .ok_or_else(|| OciError::InvalidInput(format!("invalid OCI image tag {value:?}")))
+    }
+}
+
+impl Display for ImageTag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageTag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullInput {
+    name: ImageName,
+    tag: ImageTag,
+    token: String,
+}
+
+impl PullInput {
+    fn reference(&self) -> ImageReference {
+        ImageReference {
+            name: self.name.clone(),
+            tag: self.tag.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceInput {
+    name: ImageName,
+    tag: ImageTag,
+}
+
+impl ReferenceInput {
+    fn reference(&self) -> ImageReference {
+        ImageReference {
+            name: self.name.clone(),
+            tag: self.tag.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OciStatus {
+    Pulled,
+    Running,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LifecycleResponse {
+    name: String,
+    tag: String,
+    status: OciStatus,
+    vm_id: Option<VmId>,
+    manifest_digest: String,
+    filesystem: api_schema::FileSystem,
+}
+
+struct FetchedImage {
+    details: api_schema::Pull,
+    filesystem: rootfs::FileSystem,
+}
+
+struct OciEntry {
+    image: FetchedImage,
+    vm_id: Option<VmId>,
+}
+
+impl OciEntry {
+    fn response(&self, reference: &ImageReference) -> LifecycleResponse {
+        LifecycleResponse {
+            name: reference.name.to_string(),
+            tag: reference.tag.to_string(),
+            status: if self.vm_id.is_some() {
+                OciStatus::Running
+            } else {
+                OciStatus::Pulled
+            },
+            vm_id: self.vm_id,
+            manifest_digest: self.image.details.manifest.digest.to_string(),
+            filesystem: (&self.image.filesystem).into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OciStore {
+    fetcher: OciFetcher,
+    entries: Arc<Mutex<HashMap<ImageReference, OciEntry>>>,
+}
+
+impl Default for OciStore {
+    fn default() -> Self {
+        Self {
+            fetcher: OciFetcher::default(),
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl OciStore {
+    #[cfg(test)]
+    fn for_test(fetcher: OciFetcher) -> Self {
+        Self {
+            fetcher,
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn ensure_pulled(
+        &self,
+        entries: &mut HashMap<ImageReference, OciEntry>,
+        reference: &ImageReference,
+        token: String,
+    ) -> Result<(), OciStoreError> {
+        if entries.contains_key(reference) {
+            return Ok(());
+        }
+        let image = self
+            .fetcher
+            .fetch(reference.docker_hub_location()?, token)
+            .await?;
+        entries.insert(reference.clone(), OciEntry { image, vm_id: None });
+        Ok(())
+    }
+
+    async fn pull(&self, input: PullInput) -> Result<LifecycleResponse, OciStoreError> {
+        let reference = input.reference();
+        let mut entries = self.entries.lock().await;
+        self.ensure_pulled(&mut entries, &reference, input.token)
+            .await?;
+        Ok(entries
+            .get(&reference)
+            .expect("ensured OCI entry must exist")
+            .response(&reference))
+    }
+
+    async fn run<M: OciVmManager>(
+        &self,
+        manager: &M,
+        input: PullInput,
+    ) -> Result<LifecycleResponse, OciStoreError> {
+        let reference = input.reference();
+        let mut entries = self.entries.lock().await;
+        self.ensure_pulled(&mut entries, &reference, input.token)
+            .await?;
+        let entry = entries
+            .get_mut(&reference)
+            .expect("ensured OCI entry must exist");
+
+        if let Some(vm_id) = entry.vm_id {
+            match manager.start_oci_vm(vm_id).await {
+                Ok(()) => return Ok(entry.response(&reference)),
+                Err(LifecycleError::NotFound(_)) => entry.vm_id = None,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let vm_id = manager
+            .create_oci_vm(Rootfs::from(entry.image.filesystem.path.clone()))
+            .await?;
+        entry.vm_id = Some(vm_id);
+        if let Err(start) = manager.start_oci_vm(vm_id).await {
+            match manager.delete_oci_vm(vm_id).await {
+                Ok(()) => {
+                    entry.vm_id = None;
+                    return Err(start.into());
+                }
+                Err(cleanup) => {
+                    return Err(OciStoreError::StartCleanup {
+                        reference,
+                        start: Box::new(start),
+                        cleanup: Box::new(cleanup),
+                    });
+                }
+            }
+        }
+        Ok(entry.response(&reference))
+    }
+
+    async fn stop<M: OciVmManager>(
+        &self,
+        manager: &M,
+        input: ReferenceInput,
+    ) -> Result<LifecycleResponse, OciStoreError> {
+        let reference = input.reference();
+        let mut entries = self.entries.lock().await;
+        let entry = entries
+            .get_mut(&reference)
+            .ok_or_else(|| OciStoreError::NotFound(reference.clone()))?;
+        if let Some(vm_id) = entry.vm_id {
+            match manager.delete_oci_vm(vm_id).await {
+                Ok(()) | Err(LifecycleError::NotFound(_)) => entry.vm_id = None,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(entry.response(&reference))
+    }
+
+    async fn remove<M: OciVmManager>(
+        &self,
+        manager: &M,
+        input: ReferenceInput,
+    ) -> Result<(), OciStoreError> {
+        let reference = input.reference();
+        let mut entries = self.entries.lock().await;
+        let entry = entries
+            .get_mut(&reference)
+            .ok_or_else(|| OciStoreError::NotFound(reference.clone()))?;
+        if let Some(vm_id) = entry.vm_id {
+            match manager.oci_vm_status(vm_id) {
+                Ok(VmStatus::Discovered) => {
+                    manager.delete_oci_vm(vm_id).await?;
+                    entry.vm_id = None;
+                }
+                Err(LifecycleError::NotFound(_)) => entry.vm_id = None,
+                Ok(_) => return Err(OciStoreError::Running(reference)),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        entries.remove(&reference);
+        Ok(())
+    }
+}
+
+trait OciVmManager: Sync {
+    fn create_oci_vm(&self, rootfs: Rootfs) -> BoxFuture<'_, Result<VmId, LifecycleError>>;
+    fn start_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>>;
+    fn delete_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>>;
+    fn oci_vm_status(&self, vm_id: VmId) -> Result<VmStatus, LifecycleError>;
+}
+
+impl OciVmManager for Barbirolli {
+    fn create_oci_vm(&self, rootfs: Rootfs) -> BoxFuture<'_, Result<VmId, LifecycleError>> {
+        async move {
+            self.create(VmInput {
+                rootfs,
+                provision_ssh_keys: false,
+                vcpu_count: VcpuCount::try_from(1).expect("one vCPU is always valid"),
+                authorized_keys: Vec::new(),
+                bindings: Vec::new(),
+            })
+            .await
+        }
+        .boxed()
+    }
+
+    fn start_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>> {
+        async move {
+            let mut vm = self.vm_mut(vm_id)?;
+            vm.start(self).await
+        }
+        .boxed()
+    }
+
+    fn delete_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>> {
+        async move { self.delete(vm_id).await }.boxed()
+    }
+
+    fn oci_vm_status(&self, vm_id: VmId) -> Result<VmStatus, LifecycleError> {
+        Ok(self.vm(vm_id)?.summary().status)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OciStoreError {
+    #[error(transparent)]
+    Fetch(#[from] OciError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
+    #[error("OCI image {0} is not pulled")]
+    NotFound(ImageReference),
+    #[error("OCI image {0} must be stopped before removal")]
+    Running(ImageReference),
+    #[error("failed to start OCI image {reference}: {start}; cleanup also failed: {cleanup}")]
+    StartCleanup {
+        reference: ImageReference,
+        start: Box<LifecycleError>,
+        cleanup: Box<LifecycleError>,
+    },
+}
+
+impl From<OciStoreError> for ApiError {
+    fn from(error: OciStoreError) -> Self {
+        match error {
+            OciStoreError::Fetch(error) => Self::from(error),
+            OciStoreError::Lifecycle(error) => Self::from(error),
+            OciStoreError::NotFound(_) => Self::NotFound(error.to_string()),
+            OciStoreError::Running(_) => Self::Conflict(error.to_string()),
+            OciStoreError::StartCleanup { .. } => {
+                tracing::error!(%error, "OCI VM startup rollback failed");
+                Self::InternalServerError(error.to_string())
+            }
+        }
     }
 }
 
@@ -129,7 +534,7 @@ impl OciFetcher {
     }
 
     #[tracing::instrument(skip(self, token), fields(url = %loc), err)]
-    async fn fetch(&self, loc: registry::Loc, token: String) -> Result<api_schema::Run, OciError> {
+    async fn fetch(&self, loc: registry::Loc, token: String) -> Result<FetchedImage, OciError> {
         if token.trim().is_empty() {
             return Err(OciError::InvalidInput(
                 "OCI bearer token must not be empty".to_owned(),
@@ -139,7 +544,7 @@ impl OciFetcher {
         tracing::warn!(
             url = %loc.manifest,
             host = loc.manifest.host_str().unwrap_or_default(),
-            "fetching OCI data from a caller-supplied registry URL"
+            "fetching OCI data"
         );
 
         let host = match self.platform {
@@ -188,36 +593,48 @@ impl OciFetcher {
 
         let platform = config.platform(selected_platform);
         let image = config.response();
+        let process_spec = serde_json::to_vec(&config.process()?).map_err(|source| {
+            OciError::InvalidDocument(format!("failed to encode OCI process spec: {source}"))
+        })?;
         let oci_schema::Rootfs::Layers { diff_ids } = &config.rootfs;
         let (layers, filesystem) = self
-            .fetch_layers(&mut session, &loc, &manifest.document.layers, diff_ids)
+            .fetch_layers(
+                &mut session,
+                &loc,
+                &manifest.document.layers,
+                diff_ids,
+                process_spec,
+            )
             .await?;
 
-        Ok(api_schema::Run {
-            url: loc.manifest.to_string(),
-            platform,
-            index,
-            manifest: api_schema::Manifest {
-                schema_version: manifest.document.schema_version,
-                media_kind: manifest.kind,
-                digest: manifest.digest,
-                annotations: manifest.document.annotations,
-                config: api_schema::Descriptor {
-                    media_kind: manifest.document.config.media_kind,
-                    digest: manifest.document.config.digest,
-                    size: manifest.document.config.size,
+        Ok(FetchedImage {
+            details: api_schema::Pull {
+                url: loc.manifest.to_string(),
+                platform,
+                index,
+                manifest: api_schema::Manifest {
+                    schema_version: manifest.document.schema_version,
+                    media_kind: manifest.kind,
+                    digest: manifest.digest,
+                    annotations: manifest.document.annotations,
+                    config: api_schema::Descriptor {
+                        media_kind: manifest.document.config.media_kind,
+                        digest: manifest.document.config.digest,
+                        size: manifest.document.config.size,
+                    },
                 },
+                image,
+                rootfs: config.rootfs,
+                history: config.history,
+                layers,
+                filesystem: (&filesystem).into(),
             },
-            image,
-            rootfs: config.rootfs,
-            history: config.history,
-            layers,
-            filesystem: filesystem.into(),
+            filesystem,
         })
     }
 
     #[tracing::instrument(
-        skip(self, session, loc, descriptors, diff_ids),
+        skip(self, session, loc, descriptors, diff_ids, process_spec),
         fields(layer_count = descriptors.len()),
         err
     )]
@@ -227,6 +644,7 @@ impl OciFetcher {
         loc: &registry::Loc,
         descriptors: &[descriptor::Layer],
         diff_ids: &[digest::Sha256Digest],
+        process_spec: Vec<u8>,
     ) -> Result<(Vec<api_schema::Layer>, rootfs::FileSystem), OciError> {
         let workspace = rootfs::Workspace::new()?;
         let mut layers = Vec::with_capacity(descriptors.len());
@@ -249,7 +667,7 @@ impl OciFetcher {
                 uncompressed_size: applied.uncompressed_size,
             })?);
         }
-        let filesystem = self.artifacts.finish(workspace).await?;
+        let filesystem = self.artifacts.finish(workspace, process_spec).await?;
         Ok((layers, filesystem))
     }
 }
@@ -264,17 +682,60 @@ fn install_ring_crypto_provider() {
     });
 }
 
-#[tracing::instrument(skip(fetcher, input), err)]
-pub async fn run(
-    Extension(fetcher): Extension<OciFetcher>,
-    input: Result<Json<api_schema::RunInput>, JsonRejection>,
-) -> Result<Json<api_schema::Run>, ApiError> {
+#[tracing::instrument(skip(state, input), err)]
+pub async fn pull(
+    State(state): State<AppState>,
+    input: Result<Json<PullInput>, JsonRejection>,
+) -> Result<Json<LifecycleResponse>, ApiError> {
     let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
-    fetcher
-        .fetch(input.url, input.token)
+    state
+        .oci_store
+        .pull(input)
         .await
         .map(Json)
         .map_err(ApiError::from)
+}
+
+#[tracing::instrument(skip(state, input), err)]
+pub async fn run(
+    State(state): State<AppState>,
+    input: Result<Json<PullInput>, JsonRejection>,
+) -> Result<Json<LifecycleResponse>, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
+    state
+        .oci_store
+        .run(&state.manager, input)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+#[tracing::instrument(skip(state, input), err)]
+pub async fn stop(
+    State(state): State<AppState>,
+    input: Result<Json<ReferenceInput>, JsonRejection>,
+) -> Result<Json<LifecycleResponse>, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
+    state
+        .oci_store
+        .stop(&state.manager, input)
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
+}
+
+#[tracing::instrument(skip(state, input), err)]
+pub async fn remove(
+    State(state): State<AppState>,
+    input: Result<Json<ReferenceInput>, JsonRejection>,
+) -> Result<HttpStatusCode, ApiError> {
+    let Json(input) = input.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
+    state
+        .oci_store
+        .remove(&state.manager, input)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(HttpStatusCode::NO_CONTENT)
 }
 
 struct FetchSession<'a> {
@@ -749,21 +1210,14 @@ mod api_schema {
     use std::collections::BTreeMap;
 
     use reqwest::Url;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
 
     use crate::oci::descriptor;
 
-    use super::{digest, media, oci_schema, platform, registry};
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunInput {
-        pub url: registry::Loc,
-        pub token: String,
-    }
+    use super::{digest, media, oci_schema, platform};
 
     #[derive(Debug, Serialize)]
-    pub struct Run {
+    pub struct Pull {
         pub url: String,
         pub platform: Platform,
         pub index: Option<Document>,
@@ -882,13 +1336,13 @@ mod api_schema {
         digest: digest::Sha256Digest,
     }
 
-    impl From<super::rootfs::FileSystem> for FileSystem {
-        fn from(filesystem: super::rootfs::FileSystem) -> Self {
+    impl From<&super::rootfs::FileSystem> for FileSystem {
+        fn from(filesystem: &super::rootfs::FileSystem) -> Self {
             Self {
                 format: "ext4",
-                path: filesystem.path,
+                path: filesystem.path.clone(),
                 size: filesystem.size,
-                digest: filesystem.digest,
+                digest: filesystem.digest.clone(),
             }
         }
     }
@@ -1037,6 +1491,9 @@ mod descriptor {
 }
 
 mod image {
+    use oci_spec::runtime::Process;
+    use serde_json::json;
+
     use super::{api_schema, descriptor, oci_schema, platform};
 
     type Result<T, E = ParseImageConfigError> = std::result::Result<T, E>;
@@ -1116,6 +1573,72 @@ mod image {
                 args_escaped: runtime.args_escaped,
             }
         }
+
+        pub fn process(&self) -> Result<Process> {
+            let mut args = self.runtime.entrypoint.clone();
+            args.extend(self.runtime.cmd.clone());
+            if args.is_empty() || args.first().is_some_and(String::is_empty) {
+                return Err(ParseImageConfigError::Runtime(
+                    "image has no executable entrypoint or command".to_owned(),
+                ));
+            }
+            for entry in &self.runtime.env {
+                let Some((name, _)) = entry.split_once('=') else {
+                    return Err(ParseImageConfigError::Runtime(format!(
+                        "image environment entry {entry:?} must use NAME=VALUE"
+                    )));
+                };
+                if name.is_empty() || name.as_bytes().contains(&0) {
+                    return Err(ParseImageConfigError::Runtime(format!(
+                        "image environment entry {entry:?} has an invalid name"
+                    )));
+                }
+            }
+            let (uid, gid) = numeric_user(self.runtime.user.as_deref())?;
+            let cwd = self
+                .runtime
+                .working_dir
+                .as_deref()
+                .filter(|cwd| !cwd.is_empty())
+                .unwrap_or("/");
+            if !cwd.starts_with('/') {
+                return Err(ParseImageConfigError::Runtime(format!(
+                    "image working directory {cwd:?} must be absolute"
+                )));
+            }
+            serde_json::from_value(json!({
+                "terminal": false,
+                "user": {
+                    "uid": uid,
+                    "gid": gid
+                },
+                "args": args,
+                "env": self.runtime.env,
+                "cwd": cwd,
+                "noNewPrivileges": false
+            }))
+            .map_err(|error| {
+                ParseImageConfigError::Runtime(format!(
+                    "failed to build OCI process configuration: {error}"
+                ))
+            })
+        }
+    }
+
+    fn numeric_user(value: Option<&str>) -> Result<(u32, u32)> {
+        let value = value.unwrap_or_default().trim();
+        if value.is_empty() {
+            return Ok((0, 0));
+        }
+        let (uid, gid) = value.split_once(':').map_or((value, value), |parts| parts);
+        let parse = |part: &str, kind: &str| {
+            part.parse::<u32>().map_err(|_| {
+                ParseImageConfigError::Runtime(format!(
+                    "image user {value:?} has a non-numeric {kind}"
+                ))
+            })
+        };
+        Ok((parse(uid, "UID")?, parse(gid, "GID")?))
     }
 
     #[derive(Debug)]
@@ -1164,6 +1687,8 @@ mod image {
             diff_id_count: usize,
             layer_count: usize,
         },
+        #[error("unsupported OCI runtime configuration: {0}")]
+        Runtime(String),
     }
 }
 
@@ -1176,11 +1701,17 @@ mod registry {
     use reqwest::Url;
     use serde::{Deserialize, Deserializer, de};
 
-    use super::{OciError, digest};
+    use super::{ImageName, ImageTag, OciError, digest};
 
     #[derive(Debug)]
     pub struct Loc {
         pub manifest: Url,
+    }
+
+    impl Loc {
+        pub fn docker_hub(name: &ImageName, tag: &ImageTag) -> Result<Self, OciError> {
+            format!("https://registry-1.docker.io/v2/{name}/manifests/{tag}").parse()
+        }
     }
 
     impl FromStr for Loc {
@@ -1553,7 +2084,8 @@ impl From<image::ParseImageConfigError> for OciError {
     fn from(error: image::ParseImageConfigError) -> Self {
         let message = error.to_string();
         match error {
-            image::ParseImageConfigError::Platform { .. } => Self::InvalidInput(message),
+            image::ParseImageConfigError::Platform { .. }
+            | image::ParseImageConfigError::Runtime(_) => Self::InvalidInput(message),
             image::ParseImageConfigError::Rootfs { .. } => Self::InvalidDocument(message),
         }
     }
@@ -1578,29 +2110,37 @@ impl ParseValueError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         io::Write,
         path::Path,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU16, Ordering},
+        },
     };
 
     use axum::{
-        Extension, Router,
+        Router,
         body::Body,
         extract::State,
         http::{
-            HeaderMap, Request, StatusCode, Uri,
+            HeaderMap, StatusCode, Uri,
             header::{AUTHORIZATION, CONTENT_TYPE},
         },
         response::{IntoResponse, Response},
-        routing::{get, post},
+        routing::get,
     };
+    use barbirolli::{LifecycleError, Rootfs, VmId, VmStatus};
     use flate2::{Compression as GzipCompression, write::GzEncoder};
-    use http_body_util::BodyExt;
+    use futures::{FutureExt, future::BoxFuture};
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle};
-    use tower::ServiceExt;
 
-    use super::{OciFetcher, descriptor, digest, image, oci_schema, platform, run};
+    use super::{
+        ApiError, FetchedImage, ImageName, ImageReference, ImageTag, OciEntry, OciFetcher,
+        OciStatus, OciStore, OciStoreError, OciVmManager, PullInput, ReferenceInput, descriptor,
+        digest, image, oci_schema, platform,
+    };
 
     const TOKEN: &str = "fixture-token";
 
@@ -1621,6 +2161,68 @@ mod tests {
     enum LayerEncoding {
         Gzip,
         Zstd,
+    }
+
+    #[derive(Default)]
+    struct FakeManager {
+        next_id: AtomicU16,
+        states: Mutex<HashMap<VmId, VmStatus>>,
+        rootfs: Mutex<Vec<Rootfs>>,
+    }
+
+    impl OciVmManager for FakeManager {
+        fn create_oci_vm(&self, rootfs: Rootfs) -> BoxFuture<'_, Result<VmId, LifecycleError>> {
+            async move {
+                let id = VmId::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
+                    .expect("fixture VM ID should be valid");
+                self.states
+                    .lock()
+                    .expect("fixture states should not be poisoned")
+                    .insert(id, VmStatus::Discovered);
+                self.rootfs
+                    .lock()
+                    .expect("fixture rootfs list should not be poisoned")
+                    .push(rootfs);
+                Ok(id)
+            }
+            .boxed()
+        }
+
+        fn start_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>> {
+            async move {
+                let mut states = self
+                    .states
+                    .lock()
+                    .expect("fixture states should not be poisoned");
+                let status = states
+                    .get_mut(&vm_id)
+                    .ok_or(LifecycleError::NotFound(vm_id))?;
+                *status = VmStatus::Running;
+                Ok(())
+            }
+            .boxed()
+        }
+
+        fn delete_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>> {
+            async move {
+                self.states
+                    .lock()
+                    .expect("fixture states should not be poisoned")
+                    .remove(&vm_id)
+                    .map(|_| ())
+                    .ok_or(LifecycleError::NotFound(vm_id))
+            }
+            .boxed()
+        }
+
+        fn oci_vm_status(&self, vm_id: VmId) -> Result<VmStatus, LifecycleError> {
+            self.states
+                .lock()
+                .expect("fixture states should not be poisoned")
+                .get(&vm_id)
+                .copied()
+                .ok_or(LifecycleError::NotFound(vm_id))
+        }
     }
 
     #[derive(Debug)]
@@ -1996,33 +2598,23 @@ mod tests {
             .expect("fixture document response should build")
     }
 
-    async fn request_run(fetcher: &OciFetcher, url: &str, token: &str) -> (StatusCode, Value) {
-        let app = Router::new()
-            .route("/run", post(run))
-            .layer(Extension(fetcher.clone()));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/run")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({ "url": url, "token": token }))
-                            .expect("request JSON should serialize"),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("run router should respond");
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("response body should collect")
-            .to_bytes();
-        let body = serde_json::from_slice(&body).expect("response should contain JSON");
-        (status, body)
+    async fn request_pull(
+        fetcher: &OciFetcher,
+        url: &str,
+        token: &str,
+    ) -> (StatusCode, Value, Option<FetchedImage>) {
+        let location = url.parse().expect("fixture registry location should parse");
+        match fetcher.fetch(location, token.to_owned()).await {
+            Ok(image) => {
+                let body =
+                    serde_json::to_value(&image.details).expect("pull response should serialize");
+                (StatusCode::OK, body, Some(image))
+            }
+            Err(error) => {
+                let error = ApiError::from(error);
+                (error.status(), json!({ "error": error.to_string() }), None)
+            }
+        }
     }
 
     fn layer_descriptors(count: usize) -> Vec<descriptor::Layer> {
@@ -2056,6 +2648,30 @@ mod tests {
         .expect("fixture configuration should parse")
     }
 
+    fn fixture_reference() -> ImageReference {
+        ImageReference {
+            name: "fixture".parse::<ImageName>().expect("valid image name"),
+            tag: "latest".parse::<ImageTag>().expect("valid image tag"),
+        }
+    }
+
+    fn pull_input() -> PullInput {
+        let reference = fixture_reference();
+        PullInput {
+            name: reference.name,
+            tag: reference.tag,
+            token: TOKEN.to_owned(),
+        }
+    }
+
+    fn reference_input() -> ReferenceInput {
+        let reference = fixture_reference();
+        ReferenceInput {
+            name: reference.name,
+            tag: reference.tag,
+        }
+    }
+
     #[test]
     fn platform_fields_parse_during_deserialization() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
@@ -2070,6 +2686,26 @@ mod tests {
         .expect_err("an invalid architecture must not produce a document");
 
         assert!(error.to_string().contains("invalid architecture"));
+    }
+
+    #[test]
+    fn image_reference_is_indexed_by_normalized_name_and_tag() {
+        let latest = serde_json::from_value::<ReferenceInput>(json!({
+            "name": "alpine",
+            "tag": "latest"
+        }))
+        .expect("valid image reference should parse")
+        .reference();
+        let versioned = serde_json::from_value::<ReferenceInput>(json!({
+            "name": "alpine",
+            "tag": "3.22"
+        }))
+        .expect("valid image reference should parse")
+        .reference();
+
+        assert_eq!(latest.name.to_string(), "library/alpine");
+        assert_eq!(latest.tag.to_string(), "latest");
+        assert_ne!(latest, versioned);
     }
 
     #[test]
@@ -2108,8 +2744,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn image_runtime_configuration_becomes_the_guest_process() {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let mut document = configuration_document(&platform, 1);
+        document.config.user = Some("1000:1001".to_owned());
+        document.config.entrypoint = vec!["/bin/fixture".to_owned()];
+        document.config.cmd = vec!["serve".to_owned()];
+        document.config.env = vec!["MESSAGE=hello".to_owned()];
+        document.config.working_dir = Some("/srv".to_owned());
+        let config = image::Config::new(&platform, &layer_descriptors(1), document)
+            .expect("image configuration should parse");
+
+        let process = config.process().expect("guest process should build");
+
+        assert_eq!(
+            process.args().as_deref(),
+            Some(["/bin/fixture".to_owned(), "serve".to_owned()].as_slice())
+        );
+        assert_eq!(
+            process.env().as_deref(),
+            Some(["MESSAGE=hello".to_owned()].as_slice())
+        );
+        assert_eq!(process.cwd(), Path::new("/srv"));
+        assert_eq!(process.user().uid(), 1000);
+        assert_eq!(process.user().gid(), 1001);
+        assert_eq!(process.no_new_privileges(), Some(false));
+    }
+
     #[tokio::test]
-    async fn run_forwards_token_and_verifies_every_layer() {
+    async fn pull_forwards_token_and_verifies_every_layer() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2119,7 +2783,8 @@ mod tests {
         .await;
 
         let fetcher = OciFetcher::for_test(platform.clone());
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
+        let image = image.expect("successful pull should retain its artifact");
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["url"], registry.manifest_url);
@@ -2188,7 +2853,12 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("sha256:"))
         );
-        assert_eq!(fetcher.artifacts.retained_count(), 1);
+        assert_eq!(
+            image.filesystem.artifact_dir(),
+            Path::new(filesystem)
+                .parent()
+                .expect("filesystem should have a parent")
+        );
 
         let requests = registry.requests();
         assert_eq!(
@@ -2210,7 +2880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_accepts_a_direct_platform_manifest() {
+    async fn pull_accepts_a_direct_platform_manifest() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2220,7 +2890,7 @@ mod tests {
         .await;
 
         let fetcher = OciFetcher::for_test(platform);
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, _image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::OK);
         assert!(body["index"].is_null());
@@ -2232,9 +2902,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_rejects_non_https_registry_urls() {
+    async fn pull_rejects_non_https_registry_urls() {
         let fetcher = OciFetcher::default();
-        let (status, body) = request_run(
+        let (status, body, _image) = request_pull(
             &fetcher,
             "http://registry.example/v2/library/alpine/manifests/latest",
             TOKEN,
@@ -2250,7 +2920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_rejects_an_index_without_the_host_platform() {
+    async fn pull_rejects_an_index_without_the_host_platform() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let advertised = platform::HostPlatform {
             os: platform.os.clone(),
@@ -2268,7 +2938,7 @@ mod tests {
         .await;
 
         let fetcher = OciFetcher::for_test(platform);
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, _image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
@@ -2279,7 +2949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_bad_gateway_when_a_layer_digest_does_not_match() {
+    async fn pull_returns_bad_gateway_when_a_layer_digest_does_not_match() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2289,7 +2959,7 @@ mod tests {
         .await;
 
         let fetcher = OciFetcher::for_test(platform);
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
@@ -2297,11 +2967,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("digest mismatch"))
         );
-        assert_eq!(fetcher.artifacts.retained_count(), 0);
+        assert!(image.is_none());
     }
 
     #[tokio::test]
-    async fn run_returns_bad_gateway_when_a_layer_diff_id_does_not_match() {
+    async fn pull_returns_bad_gateway_when_a_layer_diff_id_does_not_match() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2311,7 +2981,7 @@ mod tests {
         .await;
         let fetcher = OciFetcher::for_test(platform);
 
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
@@ -2319,11 +2989,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("diff ID mismatch"))
         );
-        assert_eq!(fetcher.artifacts.retained_count(), 0);
+        assert!(image.is_none());
     }
 
     #[tokio::test]
-    async fn run_returns_internal_server_error_when_ext4_building_fails() {
+    async fn pull_returns_internal_server_error_when_ext4_building_fails() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2333,7 +3003,7 @@ mod tests {
         .await;
         let fetcher = OciFetcher::for_test_builder_failure(platform);
 
-        let (status, body) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (status, body, image) = request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(
@@ -2341,11 +3011,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("filesystem builder failed"))
         );
-        assert_eq!(fetcher.artifacts.retained_count(), 0);
+        assert!(image.is_none());
     }
 
     #[tokio::test]
-    async fn run_retains_distinct_artifacts_until_the_fetcher_is_dropped() {
+    async fn store_runs_stops_and_removes_one_vm_per_name_and_tag() {
         let platform = platform::HostPlatform::current().expect("test host should be supported");
         let registry = RegistryFixture::start(RegistryDocuments::new(
             &platform,
@@ -2353,32 +3023,103 @@ mod tests {
             Corruption::None,
         ))
         .await;
-        let first_path;
-        let second_path;
-        {
-            let fetcher = OciFetcher::for_test(platform);
-            let (first_status, first) = request_run(&fetcher, &registry.manifest_url, TOKEN).await;
-            let (second_status, second) =
-                request_run(&fetcher, &registry.manifest_url, TOKEN).await;
-            assert_eq!(first_status, StatusCode::OK);
-            assert_eq!(second_status, StatusCode::OK);
-            first_path = Path::new(
-                first["filesystem"]["path"]
-                    .as_str()
-                    .expect("first filesystem path should be a string"),
+        let store = OciStore::for_test(OciFetcher::for_test(platform));
+        let image = store
+            .fetcher
+            .fetch(
+                registry
+                    .manifest_url
+                    .parse()
+                    .expect("fixture registry location should parse"),
+                TOKEN.to_owned(),
             )
-            .to_path_buf();
-            second_path = Path::new(
-                second["filesystem"]["path"]
-                    .as_str()
-                    .expect("second filesystem path should be a string"),
-            )
-            .to_path_buf();
-            assert_ne!(first_path, second_path);
-            assert!(first_path.is_file());
-            assert!(second_path.is_file());
-            assert_eq!(fetcher.artifacts.retained_count(), 2);
-        }
+            .await
+            .expect("fixture image should pull");
+        let filesystem = image.filesystem.path.clone();
+        store
+            .entries
+            .lock()
+            .await
+            .insert(fixture_reference(), OciEntry { image, vm_id: None });
+        let manager = FakeManager::default();
+
+        let running = store
+            .run(&manager, pull_input())
+            .await
+            .expect("pulled image should run");
+        let repeated = store
+            .run(&manager, pull_input())
+            .await
+            .expect("running image should be idempotent");
+        assert_eq!(running.status, OciStatus::Running);
+        assert_eq!(repeated.vm_id, running.vm_id);
+        assert_eq!(
+            manager
+                .rootfs
+                .lock()
+                .expect("fixture rootfs list should not be poisoned")
+                .len(),
+            1
+        );
+
+        let error = store
+            .remove(&manager, reference_input())
+            .await
+            .expect_err("running image must not be removable");
+        assert!(matches!(error, OciStoreError::Running(_)));
+        assert!(filesystem.exists());
+
+        let stopped = store
+            .stop(&manager, reference_input())
+            .await
+            .expect("running image should stop");
+        assert_eq!(stopped.status, OciStatus::Pulled);
+        assert!(stopped.vm_id.is_none());
+        assert!(filesystem.exists());
+
+        store
+            .remove(&manager, reference_input())
+            .await
+            .expect("stopped image should be removable");
+        assert!(store.entries.lock().await.is_empty());
+        assert!(!filesystem.exists());
+    }
+
+    #[tokio::test]
+    async fn pulled_artifacts_live_until_their_owning_images_are_dropped() {
+        let platform = platform::HostPlatform::current().expect("test host should be supported");
+        let registry = RegistryFixture::start(RegistryDocuments::new(
+            &platform,
+            InitialDocument::Index,
+            Corruption::None,
+        ))
+        .await;
+        let fetcher = OciFetcher::for_test(platform);
+        let (first_status, first, first_image) =
+            request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
+        let (second_status, second, second_image) =
+            request_pull(&fetcher, &registry.manifest_url, TOKEN).await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        let first_path = Path::new(
+            first["filesystem"]["path"]
+                .as_str()
+                .expect("first filesystem path should be a string"),
+        )
+        .to_path_buf();
+        let second_path = Path::new(
+            second["filesystem"]["path"]
+                .as_str()
+                .expect("second filesystem path should be a string"),
+        )
+        .to_path_buf();
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+        drop(first_image);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second_image);
         assert!(!first_path.exists());
         assert!(!second_path.exists());
     }

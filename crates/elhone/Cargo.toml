@@ -9,6 +9,7 @@ axum.workspace = true
 barbirolli.workspace = true
 flate2.workspace = true
 futures.workspace = true
+oci-spec.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls-no-provider", "stream"] }
 rustls.workspace = true
 serde.workspace = true

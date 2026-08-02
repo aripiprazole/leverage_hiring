@@ -564,6 +564,7 @@ dependencies = [
  "flate2",
  "futures",
  "http-body-util",
+ "oci-spec",
  "reqwest",
  "rustls",
  "serde",

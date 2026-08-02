@@ -1,7 +1,7 @@
 mod oci;
 
 use axum::{
-    Extension, Json, Router,
+    Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -19,6 +19,7 @@ use tracing::Level;
 struct AppState {
     manager: Barbirolli,
     standard_rootfs: Rootfs,
+    oci_store: oci::OciStore,
 }
 
 pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
@@ -28,14 +29,17 @@ pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
         .route("/vms/{id}/status", get(vm_status))
         .route("/vms/{id}/start", post(start_vm))
         .route("/vms/{id}/shutdown", post(shutdown_vm))
-        .route("/run", post(oci::run))
+        .route("/oci/pull", post(oci::pull))
+        .route("/oci/run", post(oci::run))
+        .route("/oci/stop", post(oci::stop))
+        .route("/oci/rm", post(oci::remove))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .with_state(AppState {
             manager,
             standard_rootfs,
+            oci_store: oci::OciStore::default(),
         })
-        .layer(Extension(oci::OciFetcher::default()))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))

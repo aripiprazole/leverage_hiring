@@ -89,6 +89,21 @@ nix develop --command x help
 Run these from the repository root inside the Linux/Lima guest. Keep
 `./x run_daemon` running in another Linux/Lima terminal.
 
+### OCI image lifecycle
+
+The OCI store is keyed by image name and tag. This pulls Alpine, starts its single VM, stops the
+VM while retaining the pulled image, then removes the stopped lifecycle and its artifacts:
+
+```sh
+./x oci:pull alpine:latest
+./x oci:run alpine:latest
+./x oci:stop alpine:latest
+./x oci:rm alpine:latest
+```
+
+`oci:run` can be used directly when the image is absent; it pulls the image automatically.
+`oci:rm` rejects the request until the VM has been stopped.
+
 ### SQLite
 
 ```sh

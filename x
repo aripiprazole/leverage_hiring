@@ -11,7 +11,10 @@ Usage: x <command> [args]
 Commands:
   setup_daemon     Download and prepare daemon/runtime artifacts.
   run_daemon       Build and run the HTTP daemon with required privileges.
-  run              Fetch an OCI image and build an ext4 root filesystem.
+  oci:pull         Pull and retain an OCI image.
+  oci:run          Run one VM for an OCI image.
+  oci:stop         Stop an OCI image's VM.
+  oci:rm           Remove a stopped OCI image and its artifacts.
   create           Create a new VM.
   ps               List VMs.
   show             Show details for a VM.
@@ -41,7 +44,10 @@ is_supported_command() {
 commands=(
     setup_daemon
     run_daemon
-    run
+    oci:pull
+    oci:run
+    oci:stop
+    oci:rm
     create
     ps
     show

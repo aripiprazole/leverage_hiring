@@ -190,7 +190,7 @@ impl BehaviorManagerFixture {
     ) -> Result<BehaviorVmFixture, LifecycleError> {
         let id = self
             .manager
-            .create(config.into_input(self.rootfs.clone()))
+            .create_for_behavior_test(config.into_input(self.rootfs.clone()))
             .await?;
         self.try_vm(id)
     }
@@ -207,7 +207,9 @@ impl BehaviorManagerFixture {
             let rootfs = self.rootfs.clone();
             async move {
                 barrier.wait().await;
-                manager.create(config.into_input(rootfs)).await
+                manager
+                    .create_for_behavior_test(config.into_input(rootfs))
+                    .await
             }
         }))
         .await

@@ -16,6 +16,35 @@ early-twentieth-century New York.
   invalid input returns `422`, and internal lifecycle failures return `500`.
 - Mutating operations on the same VM are serialized.
 
+## OCI image lifecycle
+
+Elhone owns the OCI image index in its application state:
+
+```rust
+struct AppState {
+    manager: Barbirolli,
+    standard_rootfs: Rootfs,
+    oci_store: OciStore,
+}
+```
+
+`OciStore` contains one lifecycle for each composite `(name, tag)` key. An entry contains the
+pulled rootfs artifact and, while that image is running, the ID of its single Barbirolli VM.
+Elhone owns the mapping from an OCI image reference to its artifact and VM lifecycle; Barbirolli
+continues to own VM state and runtime resources.
+
+The colon is part of each OCI command name; these names are CLI namespacing, not authorization
+scopes or Cargo features:
+
+- `x oci:pull alpine:latest` ensures the image is pulled and stored.
+- `x oci:run alpine:latest` automatically pulls an absent entry, then creates and starts its VM.
+- `x oci:stop alpine:latest` stops the associated VM while retaining the pulled artifact.
+- `x oci:rm alpine:latest` rejects a running entry; once stopped, it removes the entry and its
+  artifacts.
+
+Each `name:tag` therefore follows `absent → pulled → running → pulled → absent`.
+HTTP routes and JSON wire shapes for these operations are not specified here.
+
 ## DELETE `/vms/:id`
 
 ```http

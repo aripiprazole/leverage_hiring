@@ -5,11 +5,11 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
+        fs::{MetadataExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use flate2::read::MultiGzDecoder;
@@ -30,7 +30,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct ArtifactStore {
-    retained: Arc<Mutex<Vec<TempDir>>>,
     builder: FilesystemBuilder,
     preserve_ownerships: bool,
 }
@@ -75,13 +74,14 @@ impl ArtifactStore {
     }
 
     #[tracing::instrument(skip(self), err)]
-    pub async fn finish(&self, workspace: Workspace) -> Result<FileSystem> {
+    pub async fn finish(&self, workspace: Workspace, process_spec: Vec<u8>) -> Result<FileSystem> {
         let root = workspace.root.clone();
         let path = workspace.filesystem();
         let builder = self.builder;
         let result_path = path.clone();
 
         let built = spawn_blocking(move || {
+            install_process_spec(&root, &process_spec)?;
             let built = builder.build(&root, &path)?;
             fs::remove_dir_all(&root)
                 .map_err(|source| Error::io("remove merged rootfs", &root, source))?;
@@ -93,12 +93,8 @@ impl ArtifactStore {
             source,
         })??;
 
-        self.retained
-            .lock()
-            .map_err(|_| Error::RetentionLock)?
-            .push(workspace.temp);
-
         Ok(FileSystem {
+            _artifact: Arc::new(workspace.temp),
             path: result_path,
             size: built.size,
             digest: built.digest,
@@ -106,17 +102,8 @@ impl ArtifactStore {
     }
 
     #[cfg(test)]
-    pub fn retained_count(&self) -> usize {
-        self.retained
-            .lock()
-            .expect("test artifact retention lock should not be poisoned")
-            .len()
-    }
-
-    #[cfg(test)]
     pub fn for_test(fail: bool) -> Self {
         Self {
-            retained: Arc::new(Mutex::new(Vec::new())),
             builder: if fail {
                 FilesystemBuilder::TestFailure
             } else {
@@ -184,11 +171,30 @@ pub struct AppliedLayer {
     pub uncompressed_size: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileSystem {
+    _artifact: Arc<TempDir>,
     pub path: PathBuf,
     pub size: u64,
     pub digest: digest::Sha256Digest,
+}
+
+impl FileSystem {
+    #[cfg(test)]
+    pub fn artifact_dir(&self) -> &Path {
+        self._artifact.path()
+    }
+}
+
+fn install_process_spec(root: &Path, process_spec: &[u8]) -> Result<()> {
+    let directory = root.join("etc/barbirolli");
+    fs::create_dir_all(&directory)
+        .map_err(|source| Error::io("create OCI process directory", &directory, source))?;
+    let path = directory.join("process.json");
+    fs::write(&path, process_spec)
+        .map_err(|source| Error::io("write OCI process spec", &path, source))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+        .map_err(|source| Error::io("set OCI process spec permissions", &path, source))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -839,8 +845,6 @@ pub enum Error {
         #[source]
         source: tokio::task::JoinError,
     },
-    #[error("OCI artifact retention lock was poisoned")]
-    RetentionLock,
     #[cfg(test)]
     #[error("test filesystem builder failed")]
     TestBuilder,
@@ -870,7 +874,6 @@ impl Error {
 impl Default for ArtifactStore {
     fn default() -> Self {
         Self {
-            retained: Arc::new(Mutex::new(Vec::new())),
             builder: FilesystemBuilder::Ext4,
             preserve_ownerships: true,
         }
@@ -904,7 +907,7 @@ mod tests {
     use flate2::{Compression as GzipCompression, write::GzEncoder};
     use tar::{Builder, EntryType, Header};
 
-    use super::{Archive, ArtifactStore, FilesystemLayout, MIB, Workspace};
+    use super::{Archive, ArtifactStore, FilesystemLayout, MIB, Workspace, install_process_spec};
     use crate::oci::{digest, media, rootfs::Error};
 
     #[derive(Debug, Clone, Copy)]
@@ -912,6 +915,28 @@ mod tests {
         Tar,
         Gzip,
         Zstd,
+    }
+
+    #[test]
+    fn process_spec_is_installed_with_read_only_permissions() {
+        let root = tempfile::tempdir().expect("temporary root should be created");
+        let contents = br#"{"args":["/bin/sh"]}"#;
+
+        install_process_spec(root.path(), contents).expect("process spec should be installed");
+
+        let path = root.path().join("etc/barbirolli/process.json");
+        assert_eq!(
+            fs::read(&path).expect("process spec should be readable"),
+            contents
+        );
+        assert_eq!(
+            fs::metadata(path)
+                .expect("process spec metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
     }
 
     struct TestLayer {
