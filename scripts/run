@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x run <oci_manifest_url>
+
+Fetch the host-platform OCI image metadata and verify all filesystem layers.
+
+Example:
+  x run https://registry-1.docker.io/v2/library/alpine/manifests/latest
+EOF
+}
+
+if (($# == 0)); then
+    usage_error "missing OCI manifest URL"
+fi
+
+case "$1" in
+    help | --help | -h)
+        usage
+        exit 0
+        ;;
+    *)
+        if (($# != 1)); then
+            usage_error "unexpected extra argument: $2"
+        fi
+        payload="$(jq -nc --arg url "$1" '{url: $url}')"
+        api_request POST "/run" "$payload"
+        ;;
+esac

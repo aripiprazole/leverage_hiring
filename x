@@ -11,6 +11,7 @@ Usage: x <command> [args]
 Commands:
   setup_daemon     Download and prepare daemon/runtime artifacts.
   run_daemon       Build and run the HTTP daemon with required privileges.
+  run              Fetch and inspect an OCI image through Elhone.
   create           Create a new VM.
   ps               List VMs.
   show             Show details for a VM.
@@ -40,6 +41,7 @@ is_supported_command() {
 commands=(
     setup_daemon
     run_daemon
+    run
     create
     ps
     show
