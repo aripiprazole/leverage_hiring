@@ -27,7 +27,7 @@ if (($# > 0)); then
 fi
 
 require_linux
-require_commands cargo cmp grep mkfs.ext4 sudo
+require_commands cargo cmp grep mkfs.ext4 sha256sum sudo
 require_runtime_artifacts
 [[ -e /dev/kvm ]] || die "/dev/kvm is unavailable inside this Lima guest"
 

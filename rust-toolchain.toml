@@ -1,5 +1,10 @@
 [toolchain]
 channel = "stable"
 components = ["clippy", "rustfmt", "rust-src", "rust-analyzer"]
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 profile = "default"

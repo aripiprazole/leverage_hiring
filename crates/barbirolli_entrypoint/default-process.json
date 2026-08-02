@@ -1,0 +1,17 @@
+{
+  "terminal": false,
+  "user": {
+    "uid": 0,
+    "gid": 0
+  },
+  "args": [
+    "/bin/sh",
+    "-c",
+    "mkdir -p /run/sshd && chmod 0755 /run/sshd && exec /usr/sbin/sshd -D -e"
+  ],
+  "env": [
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "cwd": "/",
+  "noNewPrivileges": false
+}
