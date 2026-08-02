@@ -125,6 +125,10 @@ mod tests {
             fs::read(alice.storage.rootfs()).expect("failed to read copied rootfs"),
             b"rootfs"
         );
+        assert_eq!(
+            fs::read(alice.storage.serial_log()).expect("failed to read serial log"),
+            b""
+        );
         assert!(
             !alice.storage.authorized_keys().exists(),
             "authorized keys must not be copied beside VM artifacts"

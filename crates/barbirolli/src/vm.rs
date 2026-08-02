@@ -46,6 +46,13 @@ pub struct VmSpec {
     pub network: NetworkSpec,
 }
 
+impl VmSpec {
+    #[must_use]
+    pub fn serial_log(&self) -> PathBuf {
+        self.artifact_dir.join("serial.log")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortBinding {

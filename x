@@ -23,6 +23,7 @@ Commands:
   shutdown         Shutdown a VM.
   delete           Delete a VM.
   ssh              SSH into a running VM.
+  vm:logs          Pull or attach to a VM's serial log.
   help             Show command usage.
 
 Run:
@@ -56,6 +57,7 @@ commands=(
     shutdown
     delete
     ssh
+    vm:logs
 )
 
 if (($# == 0)); then

@@ -11,7 +11,7 @@ early-twentieth-century New York.
 
 - Built with `axum` around an `Arc<Barbirolli>`.
 - Binds to `ELHONE_ADDR`, defaulting to `127.0.0.1:3000`.
-- JSON responses, including `{"error": "..."}` for errors.
+- JSON responses, including `{"error": "..."}` for errors, except for the raw VM log stream.
 - Unknown VMs return `404`, invalid state transitions and exhausted VM capacity return `409`,
   invalid input returns `422`, and internal lifecycle failures return `500`.
 - Mutating operations on the same VM are serialized.
@@ -96,6 +96,18 @@ GET /vms/:id
 ```
 
 Returns the state, port bindings, and allocated network of one registered VM.
+
+## GET `/vms/:id/logs`
+
+```http
+GET /vms/:id/logs?follow=false
+```
+
+Returns the VM's append-only serial stdout as `application/octet-stream`. With the default
+`follow=false`, the response ends at the file length observed when the request starts. With
+`follow=true`, it first returns all retained output and then waits for new bytes until the client
+disconnects or the daemon stops. Following continues while the VM is stopped and across later
+starts. Every client owns an independent file offset.
 
 ## GET `/vms/:id/status`
 
@@ -290,6 +302,8 @@ Each `$VM_ROOT/<vm_id>` contains:
 - `rootfs.ext4`: private writable copy of `VmInput.rootfs`; the daemon injects
   `IMAGE_ROOT/ubuntu-24.04.ext4` for `POST /vms`.
 - `config.json`: versioned `VmSpec`.
+- `serial.log`: append-only Firecracker stdout retained across every start of the VM; it is never
+  truncated or rotated.
 
 - `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
 - Every persisted `VmSpec` owns its unique Firecracker API socket path under
@@ -473,9 +487,10 @@ The start sequence is:
 1. Prepares the TAP, routes, addresses, forwarding, and nftables table.
 2. Builds the Firecracker resources and configuration.
 3. Firecracker starts and opens its API socket.
-4. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
-5. The metrics reader starts.
-6. `ManagedVm` takes ownership of the live resources.
+4. Takes the Firecracker pipes, appends stdout to `serial.log`, drains stderr, and retains stdin.
+5. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
+6. The metrics reader starts.
+7. `ManagedVm` takes ownership of the live resources.
 
 ```rust
 async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
@@ -484,6 +499,9 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
         .map_err(|error| rollback_network(error, &network))?;
 
     vm.start(barbirolli.firecracker.api_socket_timeout).await
+        .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
+
+    let serial_console = SerialConsole::new(&mut vm, spec.id, spec.serial_log()).await
         .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
 
     let pid = find_firecracker_pid(barbirolli, &spec).await
@@ -504,6 +522,7 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
         cgroup: Some(cgroup),
         metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
         metrics,
+        serial_console,
     })
 }
 ```
@@ -545,10 +564,10 @@ async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 }
 ```
 
-`ManagedVm::shutdown` sends Ctrl-Alt-Del on x86_64 or writes `reboot\n` to the serial console on
-aarch64. On timeout it falls back to pause-and-kill, then kill. Cleanup separately stops the
-metrics reader and removes the Firecracker resources, network, and cgroup. Cleanup attempts every
-resource and aggregates errors.
+`ManagedVm::shutdown` sends Ctrl-Alt-Del on x86_64 or writes `reboot\n` through the retained serial
+stdin on aarch64. On timeout it falls back to pause-and-kill, then kill. Cleanup flushes the serial
+stdout writer, stops the metrics reader, and removes the Firecracker resources, network, and
+cgroup. Cleanup attempts every resource and aggregates errors.
 
 ### Deletion
 

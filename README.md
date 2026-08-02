@@ -63,6 +63,7 @@ Then, inside Lima:
 ./x start 0 # Start a VM
 ./x shutdown 0 # Stop a VM
 ./x status 0 # Check status
+./x vm:logs 0 # Print retained serial output and follow new output
 ./x delete 0 # Delete a VM
 ```
 
@@ -74,9 +75,15 @@ New VMs use the daemon provisioning default of 256 MiB. Memory is not selected p
 ./x ps
 ./x show 0 # Inspect the current state
 ./x ssh 0 # Open SSH using the VM's default key
+./x vm:logs 0 --pull # Print the current retained serial output and exit
+./x vm:logs 0 --attach # Explicit form of the default follow mode
 ./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use a custom key if you passed --authorized-key-file on create
 ./x help create # Help for a specific command
 ```
+
+Each VM's raw Firecracker stdout is retained in `$VM_ROOT/<id>/serial.log`. The file is append-only
+across starts and is never truncated or rotated. The same bytes are available from
+`GET /vms/{id}/logs?follow=false`; use `follow=true` to keep waiting for appended output.
 
 If you use the provided Nix shell, `x` is also available in `PATH`:
 

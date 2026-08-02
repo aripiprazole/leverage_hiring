@@ -3,8 +3,8 @@ use super::{Result, StorageError};
 use std::{
     collections::HashMap,
     fs::{
-        Permissions, canonicalize, copy, create_dir, create_dir_all, read_dir, remove_dir_all,
-        rename, set_permissions,
+        File, Permissions, canonicalize, copy, create_dir, create_dir_all, read_dir,
+        remove_dir_all, rename, set_permissions,
     },
     future::Future,
     io,
@@ -100,9 +100,11 @@ impl VmStore {
 
         let kernel = tmp.path().join("vmlinux");
         let rootfs = tmp.path().join("rootfs.ext4");
+        let serial_log = tmp.path().join("serial.log");
 
         copy(&source_kernel, &kernel).map_err(|error| StorageError::io(&kernel, error))?;
         copy(&source_rootfs, &rootfs).map_err(|error| StorageError::io(&rootfs, error))?;
+        File::create(&serial_log).map_err(|error| StorageError::io(&serial_log, error))?;
 
         Ok(PartialVm {
             persisted: PersistedVmSpec::new(VmSpec {
