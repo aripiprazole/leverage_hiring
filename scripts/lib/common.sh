@@ -28,7 +28,8 @@ ROOTFS_IMAGE="$IMAGE_ROOT/alpine.ext4"
 ROOTFS_SQUASHFS="$DOWNLOAD_DIR/ubuntu-$ROOTFS_VERSION.squashfs"
 ROOTFS_KEY_MARKER="$ROOTFS_IMAGE.authorized_key"
 ROOTFS_RESOLVER_MARKER="$ROOTFS_IMAGE.resolver"
-ROOTFS_ENTRYPOINT_MARKER="$ROOTFS_IMAGE.barbirolli_entrypoint.sha256"
+ROOTFS_LAYOUT_MARKER="$ROOTFS_IMAGE.layout"
+ROOTFS_LAYOUT_VERSION="daemon-entrypoint-v1"
 DEFAULT_PROCESS_SPEC="$REPO_ROOT/crates/barbirolli_entrypoint/default-process.json"
 ROOTFS_PROCESS_SPEC_MARKER="$ROOTFS_IMAGE.process.json"
 
@@ -38,6 +39,7 @@ export VM_ROOT
 export IMAGE_ROOT
 export DEFAULT_AUTHORIZED_KEYS
 export FIRECRACKER
+export BARBIROLLI_ENTRYPOINT
 export ELHONE_URL
 export ELHONE_ADDR
 export RUST_LOG
@@ -106,16 +108,9 @@ rootfs_resolver_matches() {
         grep -qx 'nameserver 1.1.1.1' "$ROOTFS_RESOLVER_MARKER"
 }
 
-entrypoint_checksum() {
-    local checksum ignored
-    read -r checksum ignored < <(sha256sum "$BARBIROLLI_ENTRYPOINT")
-    printf '%s\n' "$checksum"
-}
-
-rootfs_entrypoint_matches() {
-    [[ -x "$BARBIROLLI_ENTRYPOINT" ]] &&
-        [[ -s "$ROOTFS_ENTRYPOINT_MARKER" ]] &&
-        [[ "$(entrypoint_checksum)" == "$(<"$ROOTFS_ENTRYPOINT_MARKER")" ]]
+rootfs_layout_matches() {
+    [[ -s "$ROOTFS_LAYOUT_MARKER" ]] &&
+        grep -qx "$ROOTFS_LAYOUT_VERSION" "$ROOTFS_LAYOUT_MARKER"
 }
 
 rootfs_process_spec_matches() {
@@ -127,11 +122,12 @@ runtime_is_prepared() {
     firecracker_is_compatible &&
         [[ -s "$KERNEL_IMAGE" ]] &&
         [[ -s "$ROOTFS_IMAGE" ]] &&
+        [[ -x "$BARBIROLLI_ENTRYPOINT" ]] &&
         [[ -s "$SSH_PRIVATE_KEY" ]] &&
         [[ -s "$DEFAULT_AUTHORIZED_KEYS" ]] &&
         rootfs_key_matches &&
         rootfs_resolver_matches &&
-        rootfs_entrypoint_matches &&
+        rootfs_layout_matches &&
         rootfs_process_spec_matches
 }
 

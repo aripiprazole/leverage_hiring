@@ -133,7 +133,7 @@ prepare_rootfs() {
     if [[ -s "$ROOTFS_IMAGE" ]] &&
         rootfs_key_matches &&
         rootfs_resolver_matches &&
-        rootfs_entrypoint_matches &&
+        rootfs_layout_matches &&
         rootfs_process_spec_matches; then
         info "guest rootfs is already prepared"
         return
@@ -155,9 +155,6 @@ prepare_rootfs() {
     sudo install -D -m 0600 \
         "$DEFAULT_AUTHORIZED_KEYS" \
         "$ROOTFS_WORK/rootfs/root/.ssh/authorized_keys"
-    sudo install -D -m 0755 \
-        "$BARBIROLLI_ENTRYPOINT" \
-        "$ROOTFS_WORK/rootfs/barbirolli_entrypoint"
     sudo install -D -m 0644 \
         "$DEFAULT_PROCESS_SPEC" \
         "$ROOTFS_WORK/rootfs/etc/barbirolli/process.json"
@@ -172,7 +169,7 @@ prepare_rootfs() {
     ROOTFS_TEMP=""
     install -m 0644 "$DEFAULT_AUTHORIZED_KEYS" "$ROOTFS_KEY_MARKER"
     printf 'nameserver 1.1.1.1\n' >"$ROOTFS_RESOLVER_MARKER"
-    entrypoint_checksum >"$ROOTFS_ENTRYPOINT_MARKER"
+    printf '%s\n' "$ROOTFS_LAYOUT_VERSION" >"$ROOTFS_LAYOUT_MARKER"
     install -m 0644 "$DEFAULT_PROCESS_SPEC" "$ROOTFS_PROCESS_SPEC_MARKER"
 
     sudo rm -rf -- "$ROOTFS_WORK"

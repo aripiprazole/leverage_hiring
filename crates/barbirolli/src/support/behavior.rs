@@ -17,6 +17,7 @@ pub struct BehaviorFixture {
     pub storage: StorageEnvironmentFixture,
     pub temporary: TempDir,
     firecracker: PathBuf,
+    entrypoint: PathBuf,
 }
 
 #[derive(Clone)]
@@ -87,12 +88,16 @@ impl BehaviorFixture {
         fs::set_permissions(&firecracker, permissions)
             .expect("failed to make fake Firecracker executable");
 
+        let entrypoint = temporary.path().join("barbirolli_entrypoint");
+        fs::write(&entrypoint, b"entrypoint").expect("failed to create fake guest entrypoint");
+
         Self {
             storage: StorageEnvironmentFixture {
                 vm_root,
                 image_root,
             },
             firecracker,
+            entrypoint,
             temporary,
         }
     }
@@ -107,11 +112,12 @@ impl BehaviorFixture {
         provisioning: ProvisioningConfig,
     ) -> BehaviorManagerFixture {
         let store = self.storage.open().store;
-        let manager = Barbirolli::new(
+        let manager = Barbirolli::new_without_rootfs_provisioning(
             store,
             DaemonConfig {
                 provisioning,
                 firecracker: self.firecracker.clone(),
+                entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },
         )

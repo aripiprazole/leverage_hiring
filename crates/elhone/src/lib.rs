@@ -241,7 +241,7 @@ impl From<LifecycleError> for ApiError {
                 Self::InternalServerError(message)
             }
             #[cfg(target_os = "linux")]
-            LifecycleError::Storage(StorageError::SshAccess(_)) => {
+            LifecycleError::Storage(StorageError::RootfsProvision(_)) => {
                 tracing::error!(%error, "Elhone request failed");
                 Self::InternalServerError(message)
             }

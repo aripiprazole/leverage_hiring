@@ -10,6 +10,7 @@ struct Config {
     vm_root: PathBuf,
     image_root: PathBuf,
     firecracker: PathBuf,
+    barbirolli_entrypoint: PathBuf,
     #[serde(default = "default_elhone_address")]
     elhone_addr: SocketAddr,
     #[serde(default = "default_idle_initial_interval")]
@@ -61,6 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         VmStore::new(config.vm_root, config.image_root)?,
         DaemonConfig {
             firecracker: config.firecracker,
+            entrypoint: config.barbirolli_entrypoint,
             provisioning: ProvisioningConfig::default(),
             idle_policy: Some(IdlePolicy {
                 initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
@@ -108,6 +110,10 @@ mod tests {
                 "FIRECRACKER".to_owned(),
                 "/usr/local/bin/firecracker".to_owned(),
             ),
+            (
+                "BARBIROLLI_ENTRYPOINT".to_owned(),
+                "/usr/local/bin/barbirolli_entrypoint".to_owned(),
+            ),
             ("ELHONE_ADDR".to_owned(), "127.0.0.1:4000".to_owned()),
         ])
         .expect("configuration should deserialize");
@@ -117,6 +123,10 @@ mod tests {
         assert_eq!(
             config.firecracker,
             PathBuf::from("/usr/local/bin/firecracker")
+        );
+        assert_eq!(
+            config.barbirolli_entrypoint,
+            PathBuf::from("/usr/local/bin/barbirolli_entrypoint")
         );
         assert_eq!(
             config.elhone_addr,

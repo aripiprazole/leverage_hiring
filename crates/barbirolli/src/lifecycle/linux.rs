@@ -55,6 +55,8 @@ pub struct BarbirolliInner {
     pub provisioning: ProvisioningConfig,
     pub store: VmStore,
     pub firecracker: Firecracker,
+    pub entrypoint: PathBuf,
+    pub provision_rootfs: bool,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
     pub idle_policy: IdlePolicy,
@@ -84,6 +86,8 @@ impl Barbirolli {
             },
             provisioning: config.provisioning,
             store,
+            entrypoint: config.entrypoint,
+            provision_rootfs: config.provision_rootfs,
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
             idle_policy: config.idle_policy.unwrap_or_default(),
@@ -163,10 +167,12 @@ impl Barbirolli {
             .store
             .create(input, self.provisioning.default_vm_mem)
             .await?;
-        creation
-            .rootfs
-            .plant_authorized_keys(&authorized_keys)
-            .map_err(StorageError::from)?;
+        if self.provision_rootfs {
+            creation
+                .rootfs
+                .provision(&self.entrypoint, &authorized_keys)
+                .map_err(StorageError::from)?;
+        }
         let spec = creation.finish()?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));

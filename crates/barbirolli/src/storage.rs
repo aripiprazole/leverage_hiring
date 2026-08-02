@@ -32,7 +32,7 @@ pub enum StorageError {
     InvalidConfig { path: PathBuf, message: String },
     #[cfg(target_os = "linux")]
     #[error(transparent)]
-    SshAccess(#[from] SshAccessError),
+    RootfsProvision(#[from] RootfsProvisionError),
 }
 
 #[cfg(target_os = "linux")]
@@ -59,19 +59,41 @@ mod tests {
     use crate::ProvisioningConfig;
 
     #[firecracker_test]
-    async fn authorized_key_allows_an_ssh_connection_to_the_vm() {
+    async fn daemon_installs_the_entrypoint_and_authorized_key_before_boot() {
         let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        assert_eq!(
+            fixture
+                .source_rootfs()
+                .read_entrypoint()
+                .expect("failed to inspect source rootfs"),
+            None,
+            "the input rootfs must not already contain the daemon-owned entrypoint"
+        );
         let key = SshKeyFixture::generate().await;
         let vm = fixture
             .create_vm(TestVmConfig::new(1).authorized_key(key.public_key.clone()))
             .await;
+        assert_eq!(
+            Rootfs::from(vm.storage.rootfs())
+                .read_entrypoint()
+                .expect("failed to inspect private rootfs"),
+            Some(fs::read(&fixture.entrypoint).expect("failed to read daemon entrypoint")),
+            "Barbirolli must install the entrypoint into the copied input rootfs"
+        );
         vm.lifecycle.start(|_| {}).await;
 
         vm.ssh
             .with_private_key(key.private_key.clone())
-            .command("printf barbirolli-ssh", |output| {
-                assert_eq!(output.stdout, "barbirolli-ssh");
-            })
+            .command(
+                "printf 'barbirolli-ssh\\n'; readlink /proc/1/exe; \
+                 set -- $(cat /proc/1/task/1/children); readlink /proc/$1/exe",
+                |output| {
+                    assert_eq!(
+                        output.stdout,
+                        "barbirolli-ssh\n/barbirolli_entrypoint\n/usr/sbin/sshd\n"
+                    );
+                },
+            )
             .await;
 
         fixture.finish().await;

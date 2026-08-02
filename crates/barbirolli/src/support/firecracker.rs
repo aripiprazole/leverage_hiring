@@ -11,12 +11,13 @@ use super::{
 };
 
 pub struct FirecrackerFixture {
-    manager: Barbirolli,
-    temporary: TempDir,
-    vm_root: PathBuf,
-    image_root: PathBuf,
-    firecracker: PathBuf,
-    ssh_private_key: PathBuf,
+    pub manager: Barbirolli,
+    pub temp: TempDir,
+    pub vm_root: PathBuf,
+    pub image_root: PathBuf,
+    pub firecracker: PathBuf,
+    pub entrypoint: PathBuf,
+    pub ssh_private_key: PathBuf,
 }
 
 #[derive(Clone)]
@@ -31,15 +32,18 @@ pub struct FirecrackerVmFixture {
 
 impl FirecrackerFixture {
     pub async fn new(provisioning: ProvisioningConfig) -> Self {
-        let temporary = tempfile::Builder::new()
+        let temp = tempfile::Builder::new()
             .prefix("barbirolli-firecracker-")
             .tempdir_in("/var/tmp")
             .expect("failed to create temporary storage");
-        let vm_root = temporary.path().join("vms");
+        let vm_root = temp.path().join("vms");
         let image_root =
             PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
         let firecracker =
             PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
+        let entrypoint = PathBuf::from(
+            std::env::var_os("BARBIROLLI_ENTRYPOINT").expect("BARBIROLLI_ENTRYPOINT is required"),
+        );
         let ssh_private_key = std::env::var_os("SSH_PRIVATE_KEY").map_or_else(
             || {
                 image_root
@@ -56,6 +60,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning,
                 firecracker: firecracker.clone(),
+                entrypoint: entrypoint.clone(),
                 idle_policy: None,
             },
         )
@@ -64,10 +69,11 @@ impl FirecrackerFixture {
 
         Self {
             manager,
-            temporary,
+            temp,
             vm_root,
             image_root,
             firecracker,
+            entrypoint,
             ssh_private_key,
         }
     }
@@ -76,6 +82,11 @@ impl FirecrackerFixture {
         self.try_create_vm(config)
             .await
             .expect("failed to create fixture VM")
+    }
+
+    #[must_use]
+    pub fn source_rootfs(&self) -> Rootfs {
+        Rootfs::from(self.image_root.join("alpine.ext4"))
     }
 
     pub async fn try_create_vm(
@@ -166,6 +177,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning: ProvisioningConfig::default(),
                 firecracker: self.firecracker.clone(),
+                entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },
         )

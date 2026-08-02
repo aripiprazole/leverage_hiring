@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
     process::ExitStatus,
 };
 
-use oci_spec::runtime::Process;
+use oci_spec::runtime::{PosixRlimitType, Process};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -14,15 +15,194 @@ mod linux;
 mod unsupported;
 
 #[cfg(target_os = "linux")]
-pub use linux::{
-    OciChild, mount_userspace_filesystems, power_off, spawn_oci_process, sync_filesystems,
-};
+pub use linux::{OciChild, mount_userspace_filesystems, power_off, sync_filesystems};
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::{
-    OciChild, mount_userspace_filesystems, power_off, spawn_oci_process, sync_filesystems,
-};
+pub use unsupported::{OciChild, mount_userspace_filesystems, power_off, sync_filesystems};
 
 pub type Result<T, E = EntrypointError> = std::result::Result<T, E>;
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct ProcessSpec {
+    program: String,
+    arguments: Vec<String>,
+    environment: Vec<EnvironmentVariable>,
+    working_directory: PathBuf,
+    uid: u32,
+    gid: u32,
+    additional_gids: Vec<u32>,
+    umask: Option<u32>,
+    rlimits: Vec<ProcessRlimit>,
+    no_new_privileges: bool,
+}
+
+impl ProcessSpec {
+    pub fn new(path: impl AsRef<Path>) -> Result<ProcessSpec> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|source| EntrypointError::OpenProcessSpec {
+            path: path.to_owned(),
+            source,
+        })?;
+        let process: Process = serde_json::from_reader(BufReader::new(file)).map_err(|source| {
+            EntrypointError::DecodeProcessSpec {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        ProcessSpec::try_from(process).map_err(|source| EntrypointError::ParseProcessSpec {
+            path: path.to_owned(),
+            source,
+        })
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct EnvironmentVariable {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct ProcessRlimit {
+    resource: PosixRlimitType,
+    soft: u64,
+    hard: u64,
+}
+
+impl TryFrom<Process> for ProcessSpec {
+    type Error = ParseProcessSpecError;
+
+    fn try_from(process: Process) -> std::result::Result<Self, Self::Error> {
+        let (program, arguments) = process
+            .args()
+            .as_deref()
+            .and_then(|arguments| arguments.split_first())
+            .filter(|(program, _)| !program.is_empty())
+            .ok_or(ParseProcessSpecError::MissingExecutable)?;
+        if !process.cwd().is_absolute() {
+            return Err(ParseProcessSpecError::RelativeWorkingDirectory);
+        }
+        if process.terminal().unwrap_or(false) {
+            return Err(ParseProcessSpecError::UnsupportedField("terminal"));
+        }
+        if process.command_line().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("commandLine"));
+        }
+        if process.capabilities().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("capabilities"));
+        }
+        if process.apparmor_profile().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("apparmorProfile"));
+        }
+        if process.selinux_label().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("selinuxLabel"));
+        }
+        if process.oom_score_adj().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("oomScoreAdj"));
+        }
+        if process.scheduler().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("scheduler"));
+        }
+        if process.io_priority().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("ioPriority"));
+        }
+        if process.exec_cpu_affinity().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("execCPUAffinity"));
+        }
+        if process.user().username().is_some() {
+            return Err(ParseProcessSpecError::UnsupportedField("user.username"));
+        }
+        if process.user().umask().is_some_and(|mask| mask > 0o777) {
+            return Err(ParseProcessSpecError::InvalidUmask);
+        }
+
+        let environment = process
+            .env()
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|variable| {
+                let (name, value) = variable.split_once('=').ok_or_else(|| {
+                    ParseProcessSpecError::InvalidEnvironmentEntry {
+                        entry: variable.clone(),
+                        reason: "must use NAME=VALUE",
+                    }
+                })?;
+                if name.is_empty() || name.as_bytes().contains(&0) {
+                    return Err(ParseProcessSpecError::InvalidEnvironmentEntry {
+                        entry: variable.clone(),
+                        reason: "has an invalid name",
+                    });
+                }
+                Ok(EnvironmentVariable {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut rlimit_types = BTreeSet::new();
+        let rlimits = process
+            .rlimits()
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|rlimit| {
+                let resource = rlimit.typ();
+                if rlimit.soft() > rlimit.hard() {
+                    return Err(ParseProcessSpecError::RlimitSoftExceedsHard(resource));
+                }
+                if !rlimit_types.insert(resource.to_string()) {
+                    return Err(ParseProcessSpecError::DuplicateRlimit(resource));
+                }
+                Ok(ProcessRlimit {
+                    resource,
+                    soft: rlimit.soft(),
+                    hard: rlimit.hard(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            program: program.clone(),
+            arguments: arguments.to_vec(),
+            environment,
+            working_directory: process.cwd().clone(),
+            uid: process.user().uid(),
+            gid: process.user().gid(),
+            additional_gids: process.user().additional_gids().clone().unwrap_or_default(),
+            umask: process.user().umask(),
+            rlimits,
+            no_new_privileges: process.no_new_privileges().unwrap_or(false),
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ParseProcessSpecError {
+    #[error("args must contain a non-empty executable")]
+    MissingExecutable,
+
+    #[error("cwd must be an absolute path")]
+    RelativeWorkingDirectory,
+
+    #[error("OCI process field {0} is not supported by the VM entrypoint")]
+    UnsupportedField(&'static str),
+
+    #[error("user.umask must fit in 0777")]
+    InvalidUmask,
+
+    #[error("environment entry {entry:?} {reason}")]
+    InvalidEnvironmentEntry { entry: String, reason: &'static str },
+
+    #[error("{0} has a soft limit greater than its hard limit")]
+    RlimitSoftExceedsHard(PosixRlimitType),
+
+    #[error("{0} appears more than once")]
+    DuplicateRlimit(PosixRlimitType),
+}
 
 #[derive(Debug, Error)]
 pub enum EntrypointError {
@@ -43,11 +223,12 @@ pub enum EntrypointError {
         source: serde_json::Error,
     },
 
-    #[error("invalid OCI process spec: {0}")]
-    InvalidProcessSpec(String),
-
-    #[error("OCI process field {0} is not supported by the VM entrypoint")]
-    UnsupportedProcessField(&'static str),
+    #[error("failed to parse OCI process spec at {path}: {source}")]
+    ParseProcessSpec {
+        path: PathBuf,
+        #[source]
+        source: ParseProcessSpecError,
+    },
 
     #[error("failed to create mountpoint {path}: {source}")]
     CreateMountpoint {
@@ -95,132 +276,24 @@ pub enum EntrypointError {
     },
 }
 
-pub fn read_process_spec(path: impl AsRef<Path>) -> Result<Process> {
-    let path = path.as_ref();
-    let file = File::open(path).map_err(|source| EntrypointError::OpenProcessSpec {
-        path: path.to_owned(),
-        source,
-    })?;
-    let process = serde_json::from_reader(BufReader::new(file)).map_err(|source| {
-        EntrypointError::DecodeProcessSpec {
-            path: path.to_owned(),
-            source,
-        }
-    })?;
-    validate_process_spec(&process)?;
-    Ok(process)
-}
-
-fn validate_process_spec(process: &Process) -> Result<()> {
-    let arguments = process.args().as_deref().ok_or_else(|| {
-        EntrypointError::InvalidProcessSpec("args must contain an executable".to_owned())
-    })?;
-    if arguments.first().is_none_or(String::is_empty) {
-        return Err(EntrypointError::InvalidProcessSpec(
-            "args must contain a non-empty executable".to_owned(),
-        ));
-    }
-    if !process.cwd().is_absolute() {
-        return Err(EntrypointError::InvalidProcessSpec(
-            "cwd must be an absolute path".to_owned(),
-        ));
-    }
-    if process.terminal().unwrap_or(false) {
-        return Err(EntrypointError::UnsupportedProcessField("terminal"));
-    }
-    if process.command_line().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("commandLine"));
-    }
-    if process.capabilities().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("capabilities"));
-    }
-    if process.apparmor_profile().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("apparmorProfile"));
-    }
-    if process.selinux_label().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("selinuxLabel"));
-    }
-    if process.oom_score_adj().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("oomScoreAdj"));
-    }
-    if process.scheduler().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("scheduler"));
-    }
-    if process.io_priority().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("ioPriority"));
-    }
-    if process.exec_cpu_affinity().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("execCPUAffinity"));
-    }
-    if process.user().username().is_some() {
-        return Err(EntrypointError::UnsupportedProcessField("user.username"));
-    }
-    if process.user().umask().is_some_and(|mask| mask > 0o777) {
-        return Err(EntrypointError::InvalidProcessSpec(
-            "user.umask must fit in 0777".to_owned(),
-        ));
-    }
-
-    if let Some(environment) = process.env() {
-        for variable in environment {
-            let Some((name, _)) = variable.split_once('=') else {
-                return Err(EntrypointError::InvalidProcessSpec(format!(
-                    "environment entry {variable:?} must use NAME=VALUE"
-                )));
-            };
-            if name.is_empty() || name.as_bytes().contains(&0) {
-                return Err(EntrypointError::InvalidProcessSpec(format!(
-                    "environment entry {variable:?} has an invalid name"
-                )));
-            }
-        }
-    }
-
-    let mut rlimit_types = std::collections::BTreeSet::new();
-    if let Some(rlimits) = process.rlimits() {
-        for rlimit in rlimits {
-            if rlimit.soft() > rlimit.hard() {
-                return Err(EntrypointError::InvalidProcessSpec(format!(
-                    "{} has a soft limit greater than its hard limit",
-                    rlimit.typ()
-                )));
-            }
-            if !rlimit_types.insert(rlimit.typ().to_string()) {
-                return Err(EntrypointError::InvalidProcessSpec(format!(
-                    "{} appears more than once",
-                    rlimit.typ()
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{EntrypointError, read_process_spec};
+    use crate::ProcessSpec;
+
+    use super::{EntrypointError, ParseProcessSpecError, PosixRlimitType};
 
     #[test]
-    fn default_guest_process_is_a_valid_oci_process_document() {
+    fn parses_the_default_guest_process() {
         let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("default-process.json");
+        let process = ProcessSpec::new(spec).expect("default process spec should parse");
 
-        let process = read_process_spec(spec).expect("default process spec should be valid");
-
-        assert_eq!(
-            process
-                .args()
-                .as_deref()
-                .and_then(|args| args.first())
-                .map(String::as_str),
-            Some("/bin/sh")
-        );
+        assert_eq!(process.program, "/bin/sh");
     }
 
     #[test]
-    fn reads_an_oci_process_document() {
+    fn parses_an_oci_process_document() {
         let temporary = tempfile::tempdir().expect("temporary directory should be created");
         let spec = temporary.path().join("process.json");
         fs::write(
@@ -237,15 +310,22 @@ mod tests {
         )
         .expect("process spec should be written");
 
-        let process = read_process_spec(&spec).expect("process spec should be read");
+        let process = ProcessSpec::new(&spec).expect("process spec should be read");
 
-        assert_eq!(
-            process.args().as_deref(),
-            Some(["/bin/echo".to_owned(), "hello".to_owned()].as_slice())
-        );
-        assert_eq!(process.user().uid(), 1000);
-        assert_eq!(process.user().gid(), 1000);
-        assert_eq!(process.cwd().to_string_lossy(), "/tmp");
+        assert_eq!(process.program, "/bin/echo");
+        assert_eq!(process.arguments, ["hello"]);
+        assert_eq!(process.environment.len(), 2);
+        assert_eq!(process.environment[1].name, "MESSAGE");
+        assert_eq!(process.environment[1].value, "hello=world");
+        assert_eq!(process.uid, 1000);
+        assert_eq!(process.gid, 1000);
+        assert_eq!(process.additional_gids, [10]);
+        assert_eq!(process.working_directory.to_string_lossy(), "/tmp");
+        assert_eq!(process.rlimits.len(), 1);
+        assert_eq!(process.rlimits[0].resource, PosixRlimitType::RlimitNofile);
+        assert_eq!(process.rlimits[0].soft, 128);
+        assert_eq!(process.rlimits[0].hard, 256);
+        assert!(process.no_new_privileges);
     }
 
     #[test]
@@ -262,9 +342,15 @@ mod tests {
         )
         .expect("process spec should be written");
 
-        let error = read_process_spec(&spec).expect_err("empty args must be rejected");
+        let error = ProcessSpec::new(&spec).expect_err("empty args must be rejected");
 
-        assert!(matches!(error, EntrypointError::InvalidProcessSpec(_)));
+        assert!(matches!(
+            error,
+            EntrypointError::ParseProcessSpec {
+                source: ParseProcessSpecError::MissingExecutable,
+                ..
+            }
+        ));
         assert!(error.to_string().contains("executable"));
     }
 
@@ -282,7 +368,7 @@ mod tests {
         )
         .expect("process spec should be written");
 
-        let error = read_process_spec(&spec).expect_err("relative cwd must be rejected");
+        let error = ProcessSpec::new(&spec).expect_err("relative cwd must be rejected");
 
         assert!(error.to_string().contains("absolute path"));
     }

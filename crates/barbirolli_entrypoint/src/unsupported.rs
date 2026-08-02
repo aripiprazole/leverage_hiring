@@ -1,16 +1,22 @@
 use std::process::ExitStatus;
 
-use oci_spec::runtime::Process;
-
-use crate::{EntrypointError, Result};
+use crate::{EntrypointError, ProcessSpec, Result};
 
 pub struct OciChild;
 
-pub fn mount_userspace_filesystems() -> Result<()> {
-    Err(EntrypointError::UnsupportedPlatform)
+impl OciChild {
+    pub fn supervise_and_reap(self) -> Result<ExitStatus> {
+        Err(EntrypointError::UnsupportedPlatform)
+    }
 }
 
-pub fn spawn_oci_process(_process: Process) -> Result<OciChild> {
+impl ProcessSpec {
+    pub fn spawn(self) -> Result<OciChild> {
+        Err(EntrypointError::UnsupportedPlatform)
+    }
+}
+
+pub fn mount_userspace_filesystems() -> Result<()> {
     Err(EntrypointError::UnsupportedPlatform)
 }
 

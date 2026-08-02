@@ -1,13 +1,12 @@
 use barbirolli_entrypoint::{
-    Result, mount_userspace_filesystems, power_off, read_process_spec, spawn_oci_process,
-    sync_filesystems,
+    ProcessSpec, Result, mount_userspace_filesystems, power_off, sync_filesystems,
 };
 
 fn main() -> Result<()> {
     mount_userspace_filesystems()?;
 
-    let process = read_process_spec("/etc/barbirolli/process.json")?;
-    let child = spawn_oci_process(process)?;
+    let process = ProcessSpec::new("/etc/barbirolli/process.json")?;
+    let child = process.spawn()?;
 
     let exit = child.supervise_and_reap()?;
     sync_filesystems();
