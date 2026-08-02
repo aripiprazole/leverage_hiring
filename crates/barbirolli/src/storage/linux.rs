@@ -19,7 +19,7 @@ use validated::Validated;
 
 use crate::{ApiSocket, MemoryMib, NetworkSpec, VmId, VmInput, VmSpec};
 
-const CONFIG_VERSION: u16 = 3;
+const CONFIG_VERSION: u16 = 4;
 const SOCKET_DIRECTORY: &str = ".sockets";
 
 #[derive(Debug, thiserror::Error)]
@@ -152,7 +152,7 @@ impl VmStore {
                     .join(format!("firecracker-{id}.socket")),
             ),
             memory_mib,
-            port_bindings: input.port_bindings,
+            bindings: input.bindings,
             network: NetworkSpec::new(id)
                 .map_err(|error| StorageError::InvalidInput(error.to_string()))?,
         });
@@ -654,7 +654,7 @@ mod tests {
                             .parse::<AuthorizedKey>()
                             .expect("valid authorized key"),
                     ],
-                    port_bindings: Vec::new(),
+                    bindings: Vec::new(),
                     vcpu_count: VcpuCount::try_from(1).expect("valid vCPU count"),
                 },
                 MemoryMib::from(128),

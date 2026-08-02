@@ -37,7 +37,7 @@ GET /vms
   {
     "id": 0,
     "status": "running",
-    "port_bindings": [{ "internal": 22, "external": 2222 }],
+    "bindings": [{ "internal": 22, "external": 2222 }],
     "network": {
       "vm_id": 0,
       "tap": "fc-tap0",
@@ -103,12 +103,12 @@ POST /vms
 {
   "vcpu_count": 2,
   "authorized_keys": ["ssh-ed25519 ..."],
-  "port_bindings": [{ "internal": 22, "external": 2222 }]
+  "bindings": [{ "internal": 22, "external": 2222 }]
 }
 ```
 
 Creates a stopped VM and returns `201 Created` with its ID. The request contains `vcpu_count`,
-`authorized_keys`, and `port_bindings`; the service copies the kernel and rootfs artifacts from
+`authorized_keys`, and `bindings`; the service copies the kernel and rootfs artifacts from
 `IMAGE_ROOT`. The daemon's provisioning configuration selects memory (256 MiB by default), which
 is persisted in `VmSpec`. Ports are `u16` values in the range `1..=65535`. A binding
 `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
@@ -213,7 +213,7 @@ struct VmSpec {
     vcpu_count: VcpuCount,
     api_socket: ApiSocket,
     memory_mib: MemoryMib,
-    port_bindings: Vec<PortBinding>,
+    bindings: Vec<PortBinding>,
     network: NetworkSpec,
 }
 
@@ -224,7 +224,7 @@ type FirecrackerVm = fctools::vm::Vm<...>;
 struct VmInput {
     vcpu_count: VcpuCount, // 1..=31
     authorized_keys: Vec<AuthorizedKey>,
-    port_bindings: Vec<PortBinding>,
+    bindings: Vec<PortBinding>,
 }
 
 struct PortBinding {
@@ -299,12 +299,12 @@ impl NetworkSpec {
         conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<()>;
 
     fn prepare_managed_network(
         &self,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<PreparedNetwork> {
         let nft_table = format!("fc_vm_{}", self.vm_id);
         // Create the TAP, enable forwarding, and install the per-VM nftables table.
@@ -444,7 +444,7 @@ The start sequence is:
 
 ```rust
 async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
-    let network = spec.network.prepare(&spec.port_bindings).await?;
+    let network = spec.network.prepare(&spec.bindings).await?;
     let mut vm = spec.prepare_vm(barbirolli).await
         .map_err(|error| rollback_network(error, &network))?;
 

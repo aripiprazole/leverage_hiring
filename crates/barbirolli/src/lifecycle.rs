@@ -92,7 +92,7 @@ pub enum VmStatus {
 pub struct VmSummary {
     pub id: VmId,
     pub status: VmStatus,
-    pub port_bindings: Vec<PortBinding>,
+    pub bindings: Vec<PortBinding>,
     pub network: NetworkSpec,
 }
 

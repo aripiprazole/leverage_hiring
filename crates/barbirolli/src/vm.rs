@@ -19,7 +19,7 @@ pub struct VmInput {
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
     #[serde(default)]
-    pub port_bindings: Vec<PortBinding>,
+    pub bindings: Vec<PortBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ pub struct VmSpec {
     pub api_socket: ApiSocket,
     pub memory_mib: MemoryMib,
     #[serde(default)]
-    pub port_bindings: Vec<PortBinding>,
+    pub bindings: Vec<PortBinding>,
     pub network: NetworkSpec,
 }
 

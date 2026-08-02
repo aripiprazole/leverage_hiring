@@ -35,7 +35,7 @@ pub(crate) struct PortForward {
     pub external: Port,
     pub guest_ip: Ipv4Addr,
     pub internal: Port,
-    pub destination_exclusion: Ipv4Network,
+    pub dest_exclusion: Ipv4Network,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -110,7 +110,7 @@ impl NetworkSpec {
             internal: binding.internal,
             external: binding.external,
             guest_ip: self.guest_ip,
-            destination_exclusion: Ipv4Network {
+            dest_exclusion: Ipv4Network {
                 network: VM_NETWORK_POOL,
                 prefix: VM_NETWORK_POOL_PREFIX,
             },
@@ -224,7 +224,7 @@ mod tests {
                 external: Port::try_from(2222).expect("valid external port"),
                 guest_ip: Ipv4Addr::new(172, 16, 0, 2),
                 internal: Port::try_from(22).expect("valid internal port"),
-                destination_exclusion: Ipv4Network {
+                dest_exclusion: Ipv4Network {
                     network: Ipv4Addr::new(172, 16, 0, 0),
                     prefix: 16,
                 },
@@ -244,7 +244,7 @@ mod tests {
             external: Port::try_from(2222).expect("valid external port"),
             guest_ip: Ipv4Addr::new(172, 16, 0, 2),
             internal: Port::try_from(22).expect("valid internal port"),
-            destination_exclusion: Ipv4Network {
+            dest_exclusion: Ipv4Network {
                 network: Ipv4Addr::new(172, 16, 0, 0),
                 prefix: 16,
             },

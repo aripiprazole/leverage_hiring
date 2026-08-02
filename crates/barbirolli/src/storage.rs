@@ -52,6 +52,7 @@ mod tests {
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
     use barbirolli::{Port, PortBinding};
     use barbirolli_derive::firecracker_test;
+    use serde_json::json;
 
     use barbirolli::support::{firecracker::FirecrackerFixture, ssh::SshKeyFixture};
 
@@ -131,6 +132,14 @@ mod tests {
             .create_vm(TestVmConfig::new(2).binding(80, 8080))
             .await;
 
+        let bob_config = bob.storage.config();
+        assert_eq!(bob_config["version"], 4);
+        assert_eq!(
+            bob_config["spec"]["bindings"],
+            json!([{ "internal": 80, "external": 8080 }])
+        );
+        assert!(bob_config["spec"].get("port_bindings").is_none());
+
         let discovered = fixture.storage.open().discover();
         assert_eq!(discovered.len(), 2);
         let reopened_alice = discovered
@@ -146,7 +155,7 @@ mod tests {
         assert!(!reopened_bob.spec.deleted);
         assert_eq!(reopened_bob.spec.api_socket, bob.spec.api_socket);
         assert_eq!(
-            reopened_bob.spec.port_bindings,
+            reopened_bob.spec.bindings,
             vec![PortBinding {
                 internal: Port::try_from(80).expect("valid internal port"),
                 external: Port::try_from(8080).expect("valid external port"),

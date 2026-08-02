@@ -261,25 +261,25 @@ mod tests {
     }
 
     #[test]
-    fn vm_input_accepts_typed_port_bindings_and_defaults_to_none() {
+    fn vm_input_accepts_typed_bindings_and_defaults_to_none() {
         let without_bindings = serde_json::from_value::<VmInput>(json!({
             "vcpu_count": 1
         }))
-        .expect("port bindings should be optional");
-        assert!(without_bindings.port_bindings.is_empty());
+        .expect("bindings should be optional");
+        assert!(without_bindings.bindings.is_empty());
 
         let with_bindings = serde_json::from_value::<VmInput>(json!({
             "vcpu_count": 1,
-            "port_bindings": [
+            "bindings": [
                 {
                     "internal": 22,
                     "external": 2222
                 }
             ]
         }))
-        .expect("valid port bindings should deserialize");
+        .expect("valid bindings should deserialize");
         assert_eq!(
-            with_bindings.port_bindings,
+            with_bindings.bindings,
             vec![PortBinding {
                 internal: Port::try_from(22).expect("valid internal port"),
                 external: Port::try_from(2222).expect("valid external port"),
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_input_rejects_zero_port_bindings() {
+    fn vm_input_rejects_zero_bindings() {
         for field in ["internal", "external"] {
             let mut binding = json!({
                 "internal": 22,
@@ -298,11 +298,22 @@ mod tests {
 
             let error = serde_json::from_value::<VmInput>(json!({
                 "vcpu_count": 1,
-                "port_bindings": [binding]
+                "bindings": [binding]
             }))
             .expect_err("port zero must be rejected");
             assert!(error.to_string().contains("invalid network port"));
         }
+    }
+
+    #[test]
+    fn vm_input_rejects_port_bindings() {
+        let error = serde_json::from_value::<VmInput>(json!({
+            "vcpu_count": 1,
+            "port_bindings": []
+        }))
+        .expect_err("port_bindings must not be accepted");
+
+        assert!(error.to_string().contains("unknown field `port_bindings`"));
     }
 
     #[test]
@@ -312,7 +323,7 @@ mod tests {
             id,
             status: VmStatus::Running,
             network: NetworkSpec::new(id).expect("valid network"),
-            port_bindings: vec![PortBinding {
+            bindings: vec![PortBinding {
                 internal: Port::try_from(22).expect("valid internal port"),
                 external: Port::try_from(2222).expect("valid external port"),
             }],
@@ -323,7 +334,7 @@ mod tests {
             json!({
                 "id": 0,
                 "status": "running",
-                "port_bindings": [
+                "bindings": [
                     {
                         "internal": 22,
                         "external": 2222

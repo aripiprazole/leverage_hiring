@@ -248,7 +248,7 @@ async fn rollback_vm(vm: &mut FirecrackerVm, shutdown_timeout: Duration) -> Resu
 
 impl ManagedVm {
     pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
-        let network = spec.network.prepare(&spec.port_bindings).await?;
+        let network = spec.network.prepare(&spec.bindings).await?;
         let mut vm = match spec.prepare_vm(barbirolli).await {
             Ok(vm) => vm,
             Err(startup) => {

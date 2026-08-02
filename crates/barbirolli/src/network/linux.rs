@@ -20,6 +20,7 @@ pub struct ManagedNetwork {
 }
 
 impl ManagedNetwork {
+    #[tracing::instrument(err)]
     pub async fn cleanup(&self) -> Result<()> {
         self.spec.cleanup(&self.table).await?;
         tracing::info!(
@@ -47,7 +48,7 @@ impl NetworkSpec {
         nftables_conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<()> {
         let tap = route
             .get_link_by_name(self.tap.as_ref())
@@ -58,7 +59,7 @@ impl NetworkSpec {
             .await?;
         route.set_link_up_by_index(tap.ifindex()).await?;
         tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n").await?;
-        self.install_rules(nftables_conn, host, table, port_bindings)
+        self.install_rules(nftables_conn, host, table, bindings)
             .await
     }
 
@@ -72,7 +73,7 @@ impl NetworkSpec {
             guest_ip = %self.guest_ip
         )
     )]
-    pub async fn prepare(&self, port_bindings: &[PortBinding]) -> Result<ManagedNetwork> {
+    pub async fn prepare(&self, bindings: &[PortBinding]) -> Result<ManagedNetwork> {
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -111,7 +112,7 @@ impl NetworkSpec {
             .create_persistent()?;
 
         match self
-            .setup(&route_conn, &nftables_conn, &host, &table, port_bindings)
+            .setup(&route_conn, &nftables_conn, &host, &table, bindings)
             .await
         {
             Ok(()) => {
@@ -165,6 +166,7 @@ impl NetworkSpec {
         }
     }
 
+    #[tracing::instrument(err)]
     async fn cleanup(&self, table: &str) -> Result<(), NetworkError> {
         let nftables = match Connection::<Nftables>::new() {
             Ok(connection) => connection
@@ -191,6 +193,7 @@ impl NetworkSpec {
         }
     }
 
+    #[tracing::instrument(err)]
     pub async fn cleanup_stale(&self) -> Result<(), NetworkError> {
         tracing::info!(
             vm_id = %self.vm_id,
@@ -205,7 +208,7 @@ impl NetworkSpec {
         conn: &Connection<Nftables>,
         host: &InterfaceName,
         table: &str,
-        port_bindings: &[PortBinding],
+        bindings: &[PortBinding],
     ) -> Result<(), NetworkError> {
         let prerouting_chain = Chain::new(table, "prerouting")?
             .family(Family::Ip)
@@ -237,7 +240,7 @@ impl NetworkSpec {
             .match_oif(host.as_ref())
             .masquerade();
 
-        let plan = self.firewall_plan(port_bindings);
+        let plan = self.firewall_plan(bindings);
         let mut transaction = conn
             .transaction()
             .add_table(table, Family::Ip)
@@ -253,8 +256,8 @@ impl NetworkSpec {
                     .family(Family::Ip)
                     .match_iif(host.as_ref())
                     .match_daddr_v4_not(
-                        forward.destination_exclusion.network,
-                        forward.destination_exclusion.prefix,
+                        forward.dest_exclusion.network,
+                        forward.dest_exclusion.prefix,
                     )
                     .match_tcp_dport(forward.external.into())
                     .dnat(forward.guest_ip, Some(forward.internal.into()))
@@ -264,8 +267,8 @@ impl NetworkSpec {
                 Rule::new(table, "output")
                     .family(Family::Ip)
                     .match_daddr_v4_not(
-                        forward.destination_exclusion.network,
-                        forward.destination_exclusion.prefix,
+                        forward.dest_exclusion.network,
+                        forward.dest_exclusion.prefix,
                     )
                     .match_tcp_dport(forward.external.into())
                     .dnat(forward.guest_ip, Some(forward.internal.into()))

@@ -249,25 +249,25 @@ impl BarbirolliVm {
             Self::Discovered(spec) => VmSummary {
                 id: spec.id,
                 status: VmStatus::Discovered,
-                port_bindings: spec.port_bindings.clone(),
+                bindings: spec.bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Failed(spec) => VmSummary {
                 id: spec.id,
                 status: VmStatus::Failed,
-                port_bindings: spec.port_bindings.clone(),
+                bindings: spec.bindings.clone(),
                 network: spec.network.clone(),
             },
             Self::Managed(vm) if vm.failed => VmSummary {
                 id: vm.spec.id,
                 status: VmStatus::Failed,
-                port_bindings: vm.spec.port_bindings.clone(),
+                bindings: vm.spec.bindings.clone(),
                 network: vm.spec.network.clone(),
             },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
                 status: VmStatus::Running,
-                port_bindings: vm.spec.port_bindings.clone(),
+                bindings: vm.spec.bindings.clone(),
                 network: vm.spec.network.clone(),
             },
         }

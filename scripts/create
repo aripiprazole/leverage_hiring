@@ -65,7 +65,7 @@ while (($# > 0)); do
     esac
 done
 
-port_bindings='[]'
+bindings='[]'
 for mapping in "${publish_mappings[@]}"; do
     if [[ "$mapping" != *:* ]]; then
         usage_error "invalid publish mapping $mapping; expected external:internal"
@@ -77,8 +77,8 @@ for mapping in "${publish_mappings[@]}"; do
 
     external="$(validate_integer external-port "${mapping%%:*}" 1 65535)"
     internal="$(validate_integer internal-port "${mapping##*:}" 1 65535)"
-    port_bindings="$(jq -c --argjson external "$external" --argjson internal "$internal" \
-        '. + [{internal: $internal, external: $external}]' <<<"$port_bindings")"
+    bindings="$(jq -c --argjson external "$external" --argjson internal "$internal" \
+        '. + [{internal: $internal, external: $external}]' <<<"$bindings")"
 done
 
 authorized_keys='[]'
@@ -107,7 +107,7 @@ done
 payload="$(jq -nc \
     --argjson vcpu_count "$vcpu_count" \
     --argjson authorized_keys "$authorized_keys" \
-    --argjson port_bindings "$port_bindings" \
-    '{vcpu_count: $vcpu_count, authorized_keys: $authorized_keys, port_bindings: $port_bindings}')"
+    --argjson bindings "$bindings" \
+    '{vcpu_count: $vcpu_count, authorized_keys: $authorized_keys, bindings: $bindings}')"
 
 api_request POST "/vms" "$payload"
