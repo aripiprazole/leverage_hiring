@@ -89,6 +89,7 @@ pub enum VmStatus {
     Discovered,
     Starting,
     Running,
+    Paused,
     ShuttingDown,
     Failed,
 }
@@ -201,6 +202,75 @@ mod tests {
         let deflated = vm.lifecycle.wait_for_balloon(0).await;
         assert_eq!(deflated.target_mib, 0);
         assert_eq!(deflated.actual_mib, 0);
+
+        fixture.finish().await;
+    }
+
+    #[firecracker_test]
+    async fn managed_vm_pauses_and_resumes_idempotently() {
+        let provisioning = ProvisioningConfig {
+            count: 1,
+            ..ProvisioningConfig::default()
+        };
+        let fixture = FirecrackerFixture::new(provisioning).await;
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+
+        vm.lifecycle
+            .start(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Running);
+            })
+            .await;
+        assert!(vm.api_socket.exists());
+
+        vm.lifecycle
+            .pause(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Paused);
+            })
+            .await;
+        vm.lifecycle
+            .pause(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Paused);
+            })
+            .await;
+        vm.lifecycle
+            .start(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Paused);
+            })
+            .await;
+        assert!(vm.api_socket.exists());
+
+        let result = fixture.try_create_vm(TestVmConfig::new(1)).await;
+        assert!(matches!(
+            result,
+            Err(LifecycleError::CapacityReached {
+                running_vms: 1,
+                max_running_vms: 1,
+            })
+        ));
+
+        vm.lifecycle
+            .resume(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Running);
+            })
+            .await;
+        vm.lifecycle
+            .resume(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Running);
+            })
+            .await;
+        assert!(vm.api_socket.exists());
+
+        vm.lifecycle
+            .pause(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Paused);
+            })
+            .await;
+        vm.lifecycle
+            .shutdown(|lifecycle| {
+                assert_eq!(lifecycle.status(), VmStatus::Discovered);
+            })
+            .await;
+        assert!(!vm.api_socket.exists());
 
         fixture.finish().await;
     }
@@ -505,6 +575,82 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn manager_rejects_pause_and_resume_for_inactive_vms() {
+            let fixture = BehaviorFixture::new();
+            let manager = fixture.manager().await;
+            let vm = manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("failed to create manager VM");
+
+            let pause = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.pause(&manager).await
+            };
+            assert!(matches!(
+                pause,
+                Err(LifecycleError::InvalidTransition {
+                    vm_id,
+                    operation: "pause",
+                    status: VmStatus::Discovered,
+                }) if vm_id == vm.id
+            ));
+
+            let resume = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.resume(&manager).await
+            };
+            assert!(matches!(
+                resume,
+                Err(LifecycleError::InvalidTransition {
+                    vm_id,
+                    operation: "resume",
+                    status: VmStatus::Discovered,
+                }) if vm_id == vm.id
+            ));
+
+            let failed_spec = barbirolli::Barbirolli::vm(&manager, vm.id)
+                .expect("missing manager VM")
+                .spec()
+                .clone();
+            manager.vms.insert(
+                vm.id,
+                super::super::BarbirolliVm::Failed(failed_spec.clone()),
+            );
+
+            let pause = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.pause(&manager).await
+            };
+            assert!(matches!(
+                pause,
+                Err(LifecycleError::InvalidTransition {
+                    vm_id,
+                    operation: "pause",
+                    status: VmStatus::Failed,
+                }) if vm_id == vm.id
+            ));
+
+            let resume = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.resume(&manager).await
+            };
+            assert!(matches!(
+                resume,
+                Err(LifecycleError::InvalidTransition {
+                    vm_id,
+                    operation: "resume",
+                    status: VmStatus::Failed,
+                }) if vm_id == vm.id
+            ));
+
+            manager
+                .vms
+                .insert(vm.id, super::super::BarbirolliVm::Discovered(failed_spec));
+            manager.finish().await;
+        }
+
+        #[tokio::test]
         async fn manager_deletion_is_deadlock_free_and_deleted_vms_stay_filtered() {
             let fixture = BehaviorFixture::new();
             assert!(fixture.temporary.path().is_dir());
@@ -606,6 +752,18 @@ mod tests {
                 lifecycle.start(&manager).await
             };
             assert!(matches!(start, Err(LifecycleError::Draining)));
+
+            let pause = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.pause(&manager).await
+            };
+            assert!(matches!(pause, Err(LifecycleError::Draining)));
+
+            let resume = {
+                let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");
+                lifecycle.resume(&manager).await
+            };
+            assert!(matches!(resume, Err(LifecycleError::Draining)));
 
             let balloon_config = {
                 let mut lifecycle = manager.vm_mut(vm.id).expect("missing manager VM");

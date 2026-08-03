@@ -67,6 +67,9 @@ fi
 summary="$(api_request GET "/vms/$vm_id")"
 
 status="$(jq -er '.status' <<<"$summary" | tr '[:upper:]' '[:lower:]')"
+if [[ "$status" == "paused" ]]; then
+    die "VM $vm_id is paused. Run: x vm:resume $vm_id"
+fi
 if [[ "$status" != "running" ]]; then
     die "VM $vm_id is not running (status: $status). Run: x vm:start $vm_id"
 fi

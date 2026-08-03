@@ -377,6 +377,12 @@ impl BarbirolliVm {
                 bindings: vm.spec.bindings.clone(),
                 network: vm.spec.network.clone(),
             },
+            Self::Managed(vm) if vm.paused => VmSummary {
+                id: vm.spec.id,
+                status: VmStatus::Paused,
+                bindings: vm.spec.bindings.clone(),
+                network: vm.spec.network.clone(),
+            },
             Self::Managed(vm) => VmSummary {
                 id: vm.spec.id,
                 status: VmStatus::Running,
@@ -449,6 +455,32 @@ impl BarbirolliVm {
                 status,
             }),
         }
+    }
+
+    #[tracing::instrument(skip(self, barbirolli))]
+    pub fn pause<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, Result<()>> {
+        let vm_id = self.id();
+        async move {
+            barbirolli.is_app_alive()?;
+            self.managed_for("pause")?.pause().await?;
+            tracing::info!(status = "paused", "barbirolli changed the VM state");
+            Ok(())
+        }
+        .instrument(info_span!("pause_vm", %vm_id, operation = "pause"))
+        .boxed()
+    }
+
+    #[tracing::instrument(skip(self, barbirolli))]
+    pub fn resume<'a>(&'a mut self, barbirolli: &'a Barbirolli) -> BoxFuture<'a, Result<()>> {
+        let vm_id = self.id();
+        async move {
+            barbirolli.is_app_alive()?;
+            self.managed_for("resume")?.resume().await?;
+            tracing::info!(status = "running", "barbirolli changed the VM state");
+            Ok(())
+        }
+        .instrument(info_span!("resume_vm", %vm_id, operation = "resume"))
+        .boxed()
     }
 
     #[tracing::instrument(skip(self, policy), fields(vm_id = %self.id()))]

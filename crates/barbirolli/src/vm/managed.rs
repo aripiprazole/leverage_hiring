@@ -66,6 +66,7 @@ type Result<T = (), E = LifecycleError> = std::result::Result<T, E>;
 pub struct ManagedVm {
     pub spec: VmSpec,
     pub failed: bool,
+    pub paused: bool,
     pub pid: Pid,
     pub monitor: Mutex<Option<Monitor>>,
     network: Option<ManagedNetwork>,
@@ -552,6 +553,7 @@ impl ManagedVm {
             vm,
             network: Some(network),
             failed: false,
+            paused: false,
             pid,
             monitor: Mutex::new(None),
             cgroup: Some(cgroup),
@@ -582,9 +584,48 @@ impl ManagedVm {
         Ok(self.vm.get_balloon_statistics().await?)
     }
 
-    pub async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
-        if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+    pub async fn pause(&mut self) -> Result<()> {
+        if self.paused {
             return Ok(());
+        }
+        self.vm.pause().await?;
+        self.paused = true;
+        self.reset_monitor();
+        Ok(())
+    }
+
+    pub async fn resume(&mut self) -> Result<()> {
+        if !self.paused {
+            return Ok(());
+        }
+        self.vm.resume().await?;
+        self.paused = false;
+        self.reset_monitor();
+        Ok(())
+    }
+
+    fn reset_monitor(&mut self) {
+        *self
+            .monitor
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.monitor.clear_poison();
+    }
+
+    pub async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        match self.vm.get_state() {
+            VmState::Exited | VmState::Crashed(_) => return Ok(()),
+            VmState::Paused => {
+                self.vm
+                    .shutdown([VmShutdownAction {
+                        method: VmShutdownMethod::Kill,
+                        timeout: Some(timeout),
+                        graceful: false,
+                    }])
+                    .await?;
+                return Ok(());
+            }
+            VmState::NotStarted | VmState::Running => {}
         }
 
         if cfg!(target_arch = "x86_64") {
