@@ -1,7 +1,16 @@
 #![cfg(target_os = "linux")]
 
 use std::str::FromStr;
+use std::sync::Arc;
 
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{Request, StatusCode},
+    response::Response,
+    routing::any,
+};
 use meier::{
     cli::{
         Cli, Command, CreateArgs, IdArgs, ImageReference, OciCommand, PortMapping, VmCommand, VmId,
@@ -9,10 +18,25 @@ use meier::{
     config::{ClientConfig, Config},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::oneshot,
+    sync::{Mutex, oneshot},
 };
+
+#[derive(Clone)]
+struct Fixture {
+    expected_method: String,
+    expected_path: String,
+    check_create: bool,
+    response_body: String,
+    result: Arc<Mutex<Option<oneshot::Sender<Result<RequestSnapshot, String>>>>>,
+}
+
+#[derive(Debug)]
+struct RequestSnapshot {
+    method: String,
+    path: String,
+    body: String,
+}
 
 #[tokio::test]
 async fn maps_vm_and_oci_operations_to_elhone_requests() {
@@ -73,33 +97,17 @@ async fn maps_vm_and_oci_operations_to_elhone_requests() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
         let address = listener.local_addr().expect("address");
         let (seen_tx, seen_rx) = oneshot::channel();
-        let body = body.to_owned();
-        let method = method.to_owned();
-        let path = path.to_owned();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("request");
-            let request = read_request(&mut socket).await;
-            assert_eq!(request.0, method);
-            assert_eq!(request.1, path);
-            if check_create {
-                assert!(request.2.contains("\"vcpu_count\":2"));
-                assert!(request.2.contains("\"external\":2222"));
-            }
-            let _ = seen_tx.send(());
-            let response = if body.is_empty() {
-                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_owned()
-            } else {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-            };
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("response");
-        });
+        let fixture = Fixture {
+            expected_method: method.to_owned(),
+            expected_path: path.to_owned(),
+            check_create,
+            response_body: body.to_owned(),
+            result: Arc::new(Mutex::new(Some(seen_tx))),
+        };
+        let app = Router::new()
+            .fallback(any(receive_request))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(axum::serve(listener, app));
 
         let mut config = Config::default();
         config.client = ClientConfig {
@@ -112,46 +120,66 @@ async fn maps_vm_and_oci_operations_to_elhone_requests() {
         cli.dispatch_with_config(std::path::Path::new("unused.json"), &config)
             .await
             .expect("request should succeed");
-        seen_rx.await.expect("request should be observed");
+
+        let snapshot = seen_rx
+            .await
+            .expect("request should be observed")
+            .expect("fixture should accept the request");
+        assert_eq!(snapshot.method, method);
+        assert_eq!(snapshot.path, path);
+        if check_create {
+            assert!(snapshot.body.contains("\"vcpu_count\":2"));
+            assert!(snapshot.body.contains("\"external\":2222"));
+        }
+        server.abort();
     }
 }
 
-async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, String, String) {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let read = socket.read(&mut chunk).await.expect("request bytes");
-        if read == 0 {
-            break;
+async fn receive_request(State(fixture): State<Fixture>, request: Request<Body>) -> Response<Body> {
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    let body = match to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+        Err(error) => {
+            let mut sender = fixture.result.lock().await;
+            if let Some(sender) = sender.take() {
+                sender
+                    .send(Err(format!("request body could not be read: {error}")))
+                    .expect("test should still be waiting");
+            }
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .expect("response should build");
         }
-        bytes.extend_from_slice(&chunk[..read]);
-        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-        let header = String::from_utf8_lossy(&bytes[..header_end]);
-        let content_length = header
-            .lines()
-            .find_map(|line| {
-                line.split_once(':').and_then(|(name, value)| {
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-            })
-            .unwrap_or(0);
-        if bytes.len() >= header_end + 4 + content_length {
-            break;
-        }
+    };
+    let accepted = method == fixture.expected_method
+        && path == fixture.expected_path
+        && (!fixture.check_create
+            || (body.contains("\"vcpu_count\":2") && body.contains("\"external\":2222")));
+    let result = if accepted {
+        Ok(RequestSnapshot { method, path, body })
+    } else {
+        Err(format!(
+            "unexpected request: {method} {path} with body {body:?}"
+        ))
+    };
+    let response_body = fixture.response_body;
+    let response = if response_body.is_empty() {
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .expect("response should build")
+    } else {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(response_body))
+            .expect("response should build")
+    };
+    let mut sender = fixture.result.lock().await;
+    if let Some(sender) = sender.take() {
+        sender.send(result).expect("test should still be waiting");
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().expect("request line");
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().expect("method").to_owned();
-    let path = request_parts.next().expect("path").to_owned();
-    let body = text
-        .split_once("\r\n\r\n")
-        .map_or("", |(_, body)| body)
-        .to_owned();
-    (method, path, body)
+    response
 }

@@ -57,7 +57,7 @@ impl SshFixture {
             "mkdir -p {directory}; printf %s {} > {directory}/index.html; \
              nohup python3 -m http.server {port} --bind 0.0.0.0 --directory {directory} \
              < /dev/null > {directory}/server.log 2>&1 &",
-            shell_quote(body)
+            quote(body)
         );
         self.command(&command, |_| {}).await;
     }
@@ -146,10 +146,10 @@ impl SshKeyFixture {
 fn curl_command(url: &str) -> String {
     format!(
         "curl --fail --silent --show-error --connect-timeout 1 --max-time 2 {}",
-        shell_quote(url)
+        quote(url)
     )
 }
 
-fn shell_quote(value: &str) -> String {
+fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

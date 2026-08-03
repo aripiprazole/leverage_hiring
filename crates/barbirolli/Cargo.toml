@@ -18,6 +18,7 @@ nonempty-collections.workspace = true
 serde.workspace = true
 ssh-key.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 validated.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

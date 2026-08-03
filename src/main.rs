@@ -46,14 +46,21 @@ fn default_idle_cpu_low() -> f64 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            env::var("RUST_LOG")
-                .ok()
-                .and_then(|directives| EnvFilter::try_new(directives).ok())
-                .unwrap_or_else(|| EnvFilter::new("info")),
-        )
-        .init();
+    let filter = match env::var("RUST_LOG") {
+        Ok(directives) => match EnvFilter::try_new(directives) {
+            Ok(filter) => filter,
+            Err(error) => {
+                eprintln!("invalid RUST_LOG filter: {error}; using info");
+                EnvFilter::new("info")
+            }
+        },
+        Err(env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(error) => {
+            eprintln!("could not read RUST_LOG: {error}; using info");
+            EnvFilter::new("info")
+        }
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = envy::from_env::<Config>()?;
     run_with_settings(DaemonSettings {

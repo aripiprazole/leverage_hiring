@@ -82,7 +82,7 @@ fn fake_limactl(trace: std::path::PathBuf) -> std::path::PathBuf {
     let script = trace.with_file_name("limactl");
     let contents = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = list ]; then\n  if [ \"$FAKE_STOPPED\" = 1 ]; then printf '[{{\"status\":\"Stopped\"}}]'; else printf '[{{\"status\":\"Running\"}}]'; fi\n  exit 0\nfi\nif [ \"$1\" = shell ]; then\n  [ \"$4\" = meier ] && exit 99\n  printf '[]\\n__MEIER_HTTP_STATUS__200'\n  exit 0\nfi\nexit 64\n",
-        shell_quote(&trace.display().to_string())
+        quote(&trace.display().to_string())
     );
     fs::write(&script, contents).expect("fake limactl");
     let mut permissions = fs::metadata(&script).expect("metadata").permissions();
@@ -91,6 +91,6 @@ fn fake_limactl(trace: std::path::PathBuf) -> std::path::PathBuf {
     script
 }
 
-fn shell_quote(value: &str) -> String {
+fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

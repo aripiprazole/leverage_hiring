@@ -1,18 +1,17 @@
 # meier
 
-`meier` is the cross-platform command-line client for the Barbirolli
-Firecracker VM service. It speaks to a local daemon on Linux and uses a
-configured, already-running Lima guest on macOS. The daemon is the same
-executable built with the `daemon` feature and launched through its hidden
-`__daemon` command; the guest never invokes the public client command.
+`meier` is the Barbirolli command line client.
+
+On Linux, it calls the local daemon. On macOS, it calls the configured Lima
+guest. Lima must already be running. The guest runs the same binary in daemon
+mode.
 
 ```sh
 meier config init
 meier daemon setup
 meier daemon run
+meier vm ps
 ```
 
-In another terminal, use `meier vm` and `meier oci` commands. JSON responses are
-written to stdout and tracing diagnostics are written to stderr. Errors are
-JSON on stderr, while help/version, SSH sessions, and log streams remain raw.
-The existing `x` and Bash commands remain supported.
+The client prints JSON results to stdout. It prints JSON errors to stderr.
+Help, version, SSH, and log output stay raw. The `x` commands stay supported.

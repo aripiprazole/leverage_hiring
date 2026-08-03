@@ -170,7 +170,7 @@ less than the configured `count`.
 # Barbirolli: VM and host-resource boundary
 
 The name comes from [Sir John Barbirolli](https://en.wikipedia.org/wiki/John_Barbirolli). He was a
-British conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The_Hall%C3%A9).
+British conductor associated with [The Halle](https://en.wikipedia.org/wiki/The_Hall%C3%A9).
 
 - `fctools`.
 - `nlink`.
