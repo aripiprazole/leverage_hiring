@@ -280,7 +280,6 @@ impl ProcessSpec {
 
     fn exec(self, original_signal_mask: u8) -> Result<()> {
         let ProcessSpec {
-            source_path: _,
             program,
             arguments,
             environment,
@@ -291,6 +290,7 @@ impl ProcessSpec {
             umask: process_umask,
             rlimits,
             no_new_privileges,
+            ..
         } = self;
         let mut command = Command::new(&program);
         command
