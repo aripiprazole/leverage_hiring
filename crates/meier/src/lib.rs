@@ -412,27 +412,25 @@ pub mod cli {
             let client = config.connect().await?;
             let value = match self {
                 Self::Pull(args) => {
-                    let token = args.image.docker_token(&client).await?;
                     client
                         .post(
                             "/oci/pull",
                             Some(json!({
                                 "name": &args.image.name,
                                 "tag": &args.image.tag,
-                                "token": token,
+                                "token": args.image.docker_token(&client).await?,
                             })),
                         )
                         .await?
                 }
                 Self::Run(args) => {
-                    let token = args.image.docker_token(&client).await?;
                     client
                         .post(
                             "/oci/run",
                             Some(json!({
                                 "name": &args.image.name,
                                 "tag": &args.image.tag,
-                                "token": token,
+                                "token": args.image.docker_token(&client).await?,
                             })),
                         )
                         .await?
@@ -540,14 +538,12 @@ pub mod cli {
 }
 
 mod client {
-    use std::{
-        path::{Path, PathBuf},
-        process::Stdio,
-        time::Duration,
-    };
+    use std::{path::Path, process::Stdio, time::Duration};
 
     #[cfg(not(target_os = "macos"))]
     use std::fs::File;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
 
     use futures::StreamExt;
     use reqwest::Method;
@@ -709,35 +705,28 @@ mod client {
     }
 
     impl Config {
+        #[cfg(target_os = "macos")]
         pub(crate) async fn connect(&self) -> Result<ApiClient> {
-            // `reqwest` is built with `rustls-no-provider` so the binary controls
-            // provider installation explicitly and does not panic on first use.
-            match rustls::crypto::ring::default_provider().install_default() {
-                Ok(()) => tracing::debug!("installed the rustls crypto provider"),
-                Err(error) => {
-                    tracing::debug!(error = ?error, "using the existing rustls crypto provider");
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                lima::ensure_running(&self.lima.instance).await?;
-                Ok(ApiClient {
-                    config: self.clone(),
-                    transport: Transport::Lima {
-                        instance: self.lima.instance.clone(),
-                    },
-                })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let client = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .build()?;
-                Ok(ApiClient {
+            lima::ensure_running(&self.lima.instance).await?;
+            Ok(ApiClient {
+                config: self.clone(),
+                transport: Transport::Lima {
+                    instance: self.lima.instance.clone(),
+                },
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        pub(crate) fn connect(&self) -> std::future::Ready<Result<ApiClient>> {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .map(|client| ApiClient {
                     config: self.clone(),
                     transport: Transport::Local(client),
                 })
-            }
+                .map_err(MeierError::from);
+            std::future::ready(client)
         }
     }
 
@@ -823,6 +812,7 @@ mod client {
                 })?;
             let default_identity = self.config.runtime_paths()?.private_key;
             let identity = args.identity.clone().unwrap_or(default_identity);
+            #[cfg(target_os = "macos")]
             let identity = guest_identity(&self.config, identity).await?;
             #[cfg(not(target_os = "macos"))]
             if !identity.is_file() || File::open(&identity).is_err() {
@@ -928,11 +918,6 @@ mod client {
             };
             return Ok(runtime.join("ssh/id_ed25519"));
         }
-        Ok(identity)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    async fn guest_identity(_config: &Config, identity: PathBuf) -> Result<PathBuf> {
         Ok(identity)
     }
 }
@@ -2984,19 +2969,25 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn maps_vm_and_oci_operations_to_elhone_requests() {
-        use crate::cli::{IdArgs, ImageArgs, PortMapping, VmCommand, VmId};
-        use crate::config::ClientConfig;
-        use tokio::net::TcpListener;
+    struct CliRequestCase {
+        method: &'static str,
+        path: &'static str,
+        body: &'static str,
+        check_create: bool,
+        command: Command,
+    }
 
-        let cases = [
-            (
-                "POST",
-                "/vms",
-                r#"{"id":0}"#,
-                true,
-                Command::Vm(VmCommand::Create(CreateArgs {
+    #[cfg(target_os = "linux")]
+    fn cli_request_cases() -> [CliRequestCase; 5] {
+        use crate::cli::{IdArgs, ImageArgs, PortMapping, VmCommand, VmId};
+
+        [
+            CliRequestCase {
+                method: "POST",
+                path: "/vms",
+                body: r#"{"id":0}"#,
+                check_create: true,
+                command: Command::Vm(VmCommand::Create(CreateArgs {
                     vcpu_count: 2,
                     publish: vec![PortMapping {
                         external: 2222,
@@ -3004,46 +2995,61 @@ mod tests {
                     }],
                     authorized_key_file: Vec::new(),
                 })),
-            ),
-            (
-                "GET",
-                "/vms/0/status",
-                r#"{"status":"running"}"#,
-                false,
-                Command::Vm(VmCommand::Status(IdArgs {
+            },
+            CliRequestCase {
+                method: "GET",
+                path: "/vms/0/status",
+                body: r#"{"status":"running"}"#,
+                check_create: false,
+                command: Command::Vm(VmCommand::Status(IdArgs {
                     id: VmId::from_str("0").expect("id"),
                 })),
-            ),
-            (
-                "POST",
-                "/vms/0/shutdown",
-                "",
-                false,
-                Command::Vm(VmCommand::Shutdown(IdArgs {
+            },
+            CliRequestCase {
+                method: "POST",
+                path: "/vms/0/shutdown",
+                body: "",
+                check_create: false,
+                command: Command::Vm(VmCommand::Shutdown(IdArgs {
                     id: VmId::from_str("0").expect("id"),
                 })),
-            ),
-            (
-                "DELETE",
-                "/vms/0",
-                "",
-                false,
-                Command::Vm(VmCommand::Delete(IdArgs {
+            },
+            CliRequestCase {
+                method: "DELETE",
+                path: "/vms/0",
+                body: "",
+                check_create: false,
+                command: Command::Vm(VmCommand::Delete(IdArgs {
                     id: VmId::from_str("0").expect("id"),
                 })),
-            ),
-            (
-                "POST",
-                "/oci/rm",
-                "",
-                false,
-                Command::Oci(OciCommand::Rm(ImageArgs {
+            },
+            CliRequestCase {
+                method: "POST",
+                path: "/oci/rm",
+                body: "",
+                check_create: false,
+                command: Command::Oci(OciCommand::Rm(ImageArgs {
                     image: "alpine:latest".parse::<ImageReference>().expect("image"),
                 })),
-            ),
-        ];
+            },
+        ]
+    }
 
-        for (method, path, body, check_create, command) in cases {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn maps_vm_and_oci_operations_to_elhone_requests() {
+        use crate::config::ClientConfig;
+        use tokio::net::TcpListener;
+
+        let _provider_installation = rustls::crypto::ring::default_provider().install_default();
+        for CliRequestCase {
+            method,
+            path,
+            body,
+            check_create,
+            command,
+        } in cli_request_cases()
+        {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
             let address = listener.local_addr().expect("address");
             let (seen_tx, seen_rx) = oneshot::channel();

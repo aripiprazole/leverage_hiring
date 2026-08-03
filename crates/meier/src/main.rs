@@ -1,5 +1,8 @@
 #[tokio::main]
 async fn main() {
+    let () = rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
     let result: meier::Result<()> = meier::run().await.and_then(|output| {
         if let Some(value) = output {
             println!("{}", serde_json::to_string_pretty(&value)?);
