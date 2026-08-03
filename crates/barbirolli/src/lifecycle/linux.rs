@@ -1,12 +1,14 @@
 use super::{
-    BalloonConfig, BalloonStatistics, LifecycleError, Result, VmStatus, VmSummary, WarmupFailure,
+    BalloonConfig, BalloonStatistics, JAILED_API_SOCKET, LifecycleError, Result, VmStatus,
+    VmSummary, WarmupFailure,
 };
 
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{Permissions, read},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -32,8 +34,8 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    AuthorizedKey, DaemonConfig, MemoryMib, ProvisioningConfig, Rootfs, StorageError, VmId,
-    VmInput, VmSpec, VmStore,
+    AuthorizedKey, DaemonConfig, FirecrackerExecutorConfig, MemoryMib, ProvisioningConfig, Rootfs,
+    StorageError, VmId, VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
     io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
@@ -78,7 +80,7 @@ impl Barbirolli {
     #[tracing::instrument]
     pub async fn new(store: VmStore, config: DaemonConfig) -> Result<Self, LifecycleError> {
         tracing::info!("barbirolli starts initialization");
-        let firecracker = Firecracker::new(config.firecracker).await?;
+        let firecracker = Firecracker::new(config.firecracker, config.firecracker_executor).await?;
         let specs = store.all()?;
         let barbirolli = Self(Arc::new(BarbirolliInner {
             firecracker,
@@ -93,7 +95,7 @@ impl Barbirolli {
             draining: AtomicBool::new(false),
             idle_policy: config.idle_policy.unwrap_or_default(),
         }));
-        match reconcile(&barbirolli, specs).await {
+        match barbirolli.reconcile(specs).await {
             Validated::Fail(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
             Validated::Good(()) => {
                 tracing::info!("barbirolli is ready");
@@ -271,6 +273,29 @@ impl Barbirolli {
             Ok(())
         }
     }
+
+    async fn reconcile(&self, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {
+        let mut errors = vec![];
+        for spec in specs {
+            if spec.deleted {
+                continue;
+            }
+            match spec.reconcile(self).await {
+                Ok(()) => {
+                    self.vms.insert(spec.id, BarbirolliVm::Discovered(spec));
+                }
+                Err(err) => {
+                    errors.push(WarmupFailure::Reconcile(err));
+                }
+            }
+        }
+        if let Some(errors) = NEVec::try_from_vec(errors) {
+            Validated::Fail(errors)
+        } else {
+            tracing::info!(vm_count = self.vms.len(), "barbirolli reconciled the VMs");
+            Validated::Good(())
+        }
+    }
 }
 
 impl Rootfs {
@@ -294,7 +319,7 @@ impl Rootfs {
                 builder.create_folder("root/.ssh", Permissions::from_mode(0o700))?;
                 builder.write(
                     "root/.ssh/authorized_keys",
-                    authorized_keys_into_bytes(authorized_keys),
+                    AuthorizedKey::into_bytes(authorized_keys),
                     Permissions::from_mode(0o600),
                 )?;
             }
@@ -304,44 +329,15 @@ impl Rootfs {
     }
 }
 
-fn authorized_keys_into_bytes(authorized_keys: &[AuthorizedKey]) -> Vec<u8> {
-    let capacity = authorized_keys
-        .iter()
-        .map(|authorized_key| authorized_key.as_ref().len() + 1)
-        .sum();
-    let mut contents = Vec::with_capacity(capacity);
-    for authorized_key in authorized_keys {
-        contents.extend_from_slice(authorized_key.as_ref().as_bytes());
-        contents.push(b'\n');
-    }
-    contents
-}
-
-async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {
-    let mut errors = vec![];
-    for spec in specs {
-        if spec.deleted {
-            continue;
+impl AuthorizedKey {
+    fn into_bytes(keys: &[Self]) -> Vec<u8> {
+        let capacity = keys.iter().map(|key| key.as_ref().len() + 1).sum();
+        let mut contents = Vec::with_capacity(capacity);
+        for key in keys {
+            contents.extend_from_slice(key.as_ref().as_bytes());
+            contents.push(b'\n');
         }
-        match spec.reconcile(barbirolli).await {
-            Ok(()) => {
-                barbirolli
-                    .vms
-                    .insert(spec.id, BarbirolliVm::Discovered(spec));
-            }
-            Err(err) => {
-                errors.push(WarmupFailure::Reconcile(err));
-            }
-        }
-    }
-    if let Some(errors) = NEVec::try_from_vec(errors) {
-        Validated::Fail(errors)
-    } else {
-        tracing::info!(
-            vm_count = barbirolli.vms.len(),
-            "barbirolli reconciled the VMs"
-        );
-        Validated::Good(())
+        contents
     }
 }
 
@@ -640,7 +636,50 @@ impl BarbirolliVm {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Firecracker {
     pub bin: PathBuf,
+    pub executor: FirecrackerExecutorConfig,
     pub api_socket_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FirecrackerVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+
+impl FirecrackerVersion {
+    #[must_use]
+    fn supported(self) -> bool {
+        self.major == 1 && self.minor == 13
+    }
+}
+
+impl Display for FirecrackerVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl FromStr for FirecrackerVersion {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut components = value.split('.');
+        let major = components.next().and_then(|value| value.parse().ok());
+        let minor = components.next().and_then(|value| value.parse().ok());
+        let patch = components.next().and_then(|value| value.parse().ok());
+        let (Some(major), Some(minor), Some(patch)) = (major, minor, patch) else {
+            return Err(());
+        };
+        if components.next().is_some() {
+            return Err(());
+        }
+        Ok(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -662,31 +701,51 @@ impl crate::IoError for PidError {
 }
 
 impl Firecracker {
-    pub async fn new(firecracker: impl Into<PathBuf>) -> Result<Firecracker> {
+    pub async fn new(
+        firecracker: impl Into<PathBuf>,
+        executor: FirecrackerExecutorConfig,
+    ) -> Result<Firecracker> {
         let firecracker = firecracker.into();
-        let output = Command::new(&firecracker)
-            .arg("--version")
-            .output()
-            .await
-            .map_err(|error| ManagedLifecycleError::UnsupportedFirecracker(error.to_string()))?;
-        let version = if output.stdout.is_empty() {
-            String::from_utf8_lossy(&output.stderr).trim().to_owned()
-        } else {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        };
-        if output.status.success() && version.starts_with("Firecracker v1.13.") {
-            tracing::debug!(
-                path = %firecracker.display(),
-                %version,
-                "barbirolli verified the Firecracker executable"
-            );
-            Ok(Firecracker {
-                bin: firecracker,
-                api_socket_timeout: Duration::from_secs(10),
-            })
-        } else {
-            Err(ManagedLifecycleError::UnsupportedFirecracker(version).into())
+        if let Some(jailer) = executor.jailer() {
+            Self::validate_trusted_path(&firecracker, TrustedPathKind::Executable)?;
+            Self::validate_trusted_path(&jailer.jailer, TrustedPathKind::Executable)?;
+            Self::validate_trusted_path(&jailer.chroot_base, TrustedPathKind::Directory)?;
+            Self::validate_jailer_socket_path(jailer, &firecracker)?;
         }
+        let firecracker_version = Self::tool_version(&firecracker, "Firecracker")
+            .await
+            .map_err(ManagedLifecycleError::UnsupportedFirecracker)?;
+        if !firecracker_version.supported() {
+            return Err(ManagedLifecycleError::UnsupportedFirecracker(format!(
+                "Firecracker v{firecracker_version}"
+            ))
+            .into());
+        }
+
+        if let Some(jailer) = executor.jailer() {
+            let jailer_version = Self::tool_version(&jailer.jailer, "Jailer")
+                .await
+                .map_err(ManagedLifecycleError::UnsupportedJailer)?;
+            if jailer_version != firecracker_version {
+                return Err(ManagedLifecycleError::MismatchedJailerVersion {
+                    firecracker: firecracker_version.to_string(),
+                    jailer: jailer_version.to_string(),
+                }
+                .into());
+            }
+        }
+
+        tracing::debug!(
+            path = %firecracker.display(),
+            version = %firecracker_version,
+            executor = ?executor,
+            "barbirolli verified the Firecracker toolchain"
+        );
+        Ok(Firecracker {
+            bin: firecracker,
+            executor,
+            api_socket_timeout: Duration::from_secs(10),
+        })
     }
 
     #[tracing::instrument(err)]
@@ -732,4 +791,161 @@ impl Firecracker {
         }
         Err(PidError::ProcessNotFound)
     }
+
+    #[must_use]
+    pub(crate) fn effective_path(&self, spec: &VmSpec, local_path: impl AsRef<Path>) -> PathBuf {
+        match self.jail_root(spec) {
+            Some(root) => root.join(
+                local_path
+                    .as_ref()
+                    .strip_prefix("/")
+                    .unwrap_or_else(|_| local_path.as_ref()),
+            ),
+            None => local_path.as_ref().to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn vmm_api_socket(&self, spec: &VmSpec) -> PathBuf {
+        match &self.executor {
+            FirecrackerExecutorConfig::Jailed(_) => PathBuf::from(JAILED_API_SOCKET),
+            FirecrackerExecutorConfig::Unrestricted => spec.api_socket.clone().into(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn effective_api_socket(&self, spec: &VmSpec) -> PathBuf {
+        self.effective_path(spec, self.vmm_api_socket(spec))
+    }
+
+    pub(crate) fn cleanup_jail(&self, spec: &VmSpec) -> std::io::Result<()> {
+        let Some(root) = self.jail_root(spec) else {
+            return Ok(());
+        };
+        let Some(jail) = root.parent() else {
+            return Ok(());
+        };
+        match std::fs::remove_dir_all(jail) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+
+    pub(crate) fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+
+    fn jail_root(&self, spec: &VmSpec) -> Option<PathBuf> {
+        let FirecrackerExecutorConfig::Jailed(config) = &self.executor else {
+            return None;
+        };
+        Some(config.jail_root(&self.bin, spec.id))
+    }
+    fn validate_jailer_socket_path(
+        config: &crate::JailerConfig,
+        firecracker: &Path,
+    ) -> Result<(), ManagedLifecycleError> {
+        const MAX_LINUX_UNIX_SOCKET_PATH: usize = 107;
+
+        let highest_id = VmId::try_from(16_383).expect("the maximum VM ID is valid");
+        let path = config
+            .jail_root(firecracker, highest_id)
+            .join(JAILED_API_SOCKET.trim_start_matches('/'));
+        if path.as_os_str().as_encoded_bytes().len() > MAX_LINUX_UNIX_SOCKET_PATH {
+            return Err(ManagedLifecycleError::JailerSocketPathTooLong(path));
+        }
+        Ok(())
+    }
+
+    async fn tool_version(
+        path: &Path,
+        name: &'static str,
+    ) -> std::result::Result<FirecrackerVersion, String> {
+        let output = Command::new(path)
+            .arg("--version")
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        let success = output.status.success();
+        let rendered = if output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stderr).trim().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        let version = rendered
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .strip_prefix(name)
+            .map(str::trim)
+            .and_then(|value| value.strip_prefix('v'))
+            .and_then(|value| value.parse().ok());
+        match (success, version) {
+            (true, Some(version)) => Ok(version),
+            _ => Err(rendered),
+        }
+    }
+
+    #[tracing::instrument(err)]
+    fn validate_trusted_path(
+        path: &Path,
+        expected: TrustedPathKind,
+    ) -> Result<(), ManagedLifecycleError> {
+        let canonical =
+            path.canonicalize()
+                .map_err(|source| ManagedLifecycleError::UntrustedJailerPath {
+                    path: path.to_owned(),
+                    reason: source.to_string(),
+                })?;
+        let target =
+            canonical
+                .metadata()
+                .map_err(|source| ManagedLifecycleError::UntrustedJailerPath {
+                    path: canonical.clone(),
+                    reason: source.to_string(),
+                })?;
+        let expected_type = match expected {
+            TrustedPathKind::Executable => {
+                target.is_file() && target.permissions().mode() & 0o111 != 0
+            }
+            TrustedPathKind::Directory => target.is_dir(),
+        };
+        if !expected_type {
+            return Err(ManagedLifecycleError::UntrustedJailerPath {
+                path: canonical,
+                reason: "unexpected file type or missing executable bit".to_owned(),
+            });
+        }
+
+        for trusted in canonical.ancestors() {
+            let metadata = trusted.metadata().map_err(|source| {
+                ManagedLifecycleError::UntrustedJailerPath {
+                    path: trusted.to_owned(),
+                    reason: source.to_string(),
+                }
+            })?;
+            if metadata.uid() != 0 {
+                return Err(ManagedLifecycleError::UntrustedJailerPath {
+                    path: trusted.to_owned(),
+                    reason: format!("owned by UID {}, expected UID 0", metadata.uid()),
+                });
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(ManagedLifecycleError::UntrustedJailerPath {
+                    path: trusted.to_owned(),
+                    reason: "group- or world-writable".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrustedPathKind {
+    Executable,
+    Directory,
 }

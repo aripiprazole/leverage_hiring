@@ -44,7 +44,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
     quote! {
         #(#attributes)*
         #test_attribute
-        #[ignore = "requires Linux, KVM, Firecracker, and VM artifacts"]
+        #[ignore = "requires Linux, KVM, Firecracker, jailer, and VM artifacts"]
         #[allow(clippy::await_holding_lock)]
         #visibility #signature {
             let _firecracker_test_guard = crate::support::lock_firecracker_tests();
@@ -53,10 +53,18 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                 .is_some_and(|path| std::path::Path::new(&path).is_file());
             let image_root = std::env::var_os("IMAGE_ROOT")
                 .is_some_and(|path| std::path::Path::new(&path).is_dir());
+            let unrestricted = std::env::var("FIRECRACKER_EXECUTOR").as_deref()
+                == Ok("unrestricted");
+            let jailer = std::env::var_os("JAILER")
+                .is_some_and(|path| std::path::Path::new(&path).is_file());
+            let jailer_identity = ["JAILER_UID_BASE", "JAILER_GID_BASE"]
+                .into_iter()
+                .all(|name| std::env::var(name).ok().and_then(|value| value.parse::<u32>().ok()).is_some());
             let prerequisites = cfg!(target_os = "linux")
                 && std::path::Path::new("/dev/kvm").exists()
                 && firecracker
-                && image_root;
+                && image_root
+                && (unrestricted || (jailer && jailer_identity));
 
             if !prerequisites {
                 let run_on_lima = std::env::var_os("RUN_ON_LIMA").is_some();
@@ -90,7 +98,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                     return;
                 }
                 panic!(
-                    "install KVM, Firecracker, and test artifacts or enable RUN_ON_LIMA"
+                    "install KVM, matching Firecracker/jailer, configure jailer identities, and test artifacts or enable RUN_ON_LIMA"
                 );
             }
 

@@ -9,8 +9,8 @@ usage() {
     cat <<'EOF'
 Usage: x daemon:setup
 
-Download and prepare Firecracker 1.13, a guest kernel, a writable rootfs,
-and the SSH key used by local development.
+Install a matching root-owned Firecracker 1.13 and jailer toolchain, then
+prepare a guest kernel, writable rootfs, and local-development SSH key.
 EOF
 }
 
@@ -28,7 +28,7 @@ fi
 
 require_linux
 require_commands \
-    basename cargo cmp curl grep id install mkdir mkfs.ext4 mktemp mv rm \
+    basename cargo cmp curl grep id install mkdir mkfs.ext4 mktemp mv rm stat \
     sha256sum ssh-keygen sudo tar truncate uname unsquashfs
 
 ARCH="$(normalize_arch "$(uname -m)")"
@@ -45,7 +45,7 @@ info "building guest entrypoint"
         "$BARBIROLLI_ENTRYPOINT"
 )
 
-if runtime_is_prepared; then
+if setup_is_prepared; then
     info "runtime is already prepared at $BARBIROLLI_RUNTIME_DIR"
     exit 0
 fi
@@ -64,8 +64,12 @@ download() {
 }
 
 prepare_firecracker() {
-    if firecracker_is_compatible; then
-        info "Firecracker is already prepared"
+    sudo install -d -o root -g root -m 0755 \
+        "$FIRECRACKER_TOOLCHAIN_DIR" \
+        "$JAILER_CHROOT_BASE"
+
+    if firecracker_toolchain_is_compatible; then
+        info "Firecracker and jailer are already prepared"
         return
     fi
 
@@ -85,13 +89,16 @@ prepare_firecracker() {
 
     extraction="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.firecracker.XXXXXX")"
     tar -xzf "$archive" -C "$extraction"
-    install -m 0755 \
+    sudo install -o root -g root -m 0755 \
         "$extraction/release-$FIRECRACKER_VERSION-$ARCH/firecracker-$FIRECRACKER_VERSION-$ARCH" \
         "$FIRECRACKER"
+    sudo install -o root -g root -m 0755 \
+        "$extraction/release-$FIRECRACKER_VERSION-$ARCH/jailer-$FIRECRACKER_VERSION-$ARCH" \
+        "$JAILER"
     rm -rf -- "$extraction"
 
-    firecracker_is_compatible ||
-        die "downloaded Firecracker does not report a supported 1.13 version"
+    firecracker_toolchain_is_compatible ||
+        die "downloaded Firecracker and jailer are not a trusted matching $FIRECRACKER_VERSION toolchain"
 }
 
 prepare_key() {
@@ -195,5 +202,5 @@ prepare_key
 prepare_kernel
 prepare_rootfs
 
-runtime_is_prepared || die "setup finished without producing all required artifacts"
+setup_is_prepared || die "setup finished without producing all required artifacts"
 info "runtime prepared at $BARBIROLLI_RUNTIME_DIR"

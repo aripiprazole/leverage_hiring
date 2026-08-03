@@ -2,8 +2,6 @@
 
 ## Limitations/Known problems
 
-- Unrestricted Firecracker VMM: The VMM runs only trusted binaries and root filesystems. The
-  project does not use it in production.
 - Secret management with Firecracker MDS: The service does not implement this function.
 - UDP port bindings: The service does not implement this function.
 
@@ -53,8 +51,20 @@ In the Lima VM, run these commands:
 ```bash
 # Install the dependencies
 ./x daemon:setup
+export JAILER_UID_BASE=100000
+export JAILER_GID_BASE=200000
 ./x daemon:run
 ```
+
+`daemon:setup` installs the matching Firecracker and jailer binaries as root under
+`/usr/local/libexec/barbirolli` and creates the root-owned jail base
+`/srv/jailer/barbirolli`. Each VM uses the stable UID/GID pair `base + VM ID`; the bases are
+required explicitly and must leave room for every ID through `16383`.
+
+The daemon uses attached jailer execution by default. The jailer chroots Firecracker, drops it to
+the VM-specific identity, and places it in Barbirolli's pre-created cgroup while the daemon keeps
+the serial pipes and host TAP networking. For the explicit development fallback only, run with
+`FIRECRACKER_EXECUTOR=unrestricted`.
 
 ## Example commands
 

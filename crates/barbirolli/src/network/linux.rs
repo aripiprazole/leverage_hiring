@@ -82,7 +82,11 @@ impl NetworkSpec {
     ///
     /// Returns an error if the host network cannot be inspected or configured.
     /// If setup and rollback both fail, both errors are retained.
-    pub async fn prepare(&self, bindings: &[PortBinding]) -> Result<ManagedNetwork> {
+    pub async fn prepare(
+        &self,
+        bindings: &[PortBinding],
+        owner: Option<u32>,
+    ) -> Result<ManagedNetwork> {
         let table = format!("fc_vm_{}", self.vm_id);
         let route_conn = Connection::<Route>::new()?;
 
@@ -115,10 +119,11 @@ impl NetworkSpec {
             .await?;
         route_conn.del_link_if_exists(self.tap.as_ref()).await?;
 
-        TunTap::builder()
-            .name(self.tap.as_ref())
-            .mode(Mode::Tap)
-            .create_persistent()?;
+        let tap = TunTap::builder().name(self.tap.as_ref()).mode(Mode::Tap);
+        match owner {
+            Some(uid) => tap.owner(uid).create_persistent()?,
+            None => tap.create_persistent()?,
+        };
 
         match self
             .setup(&route_conn, &nftables_conn, &host, &table, bindings)
@@ -570,7 +575,7 @@ mod tests {
         };
         let table = format!("fc_vm_{}", network.vm_id);
         let managed = network
-            .prepare(&[binding])
+            .prepare(&[binding], None)
             .await
             .expect("failed to prepare VM network");
 

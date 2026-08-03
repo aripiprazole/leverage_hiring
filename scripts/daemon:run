@@ -9,8 +9,11 @@ usage() {
     cat <<'EOF'
 Usage: x daemon:run
 
-Build the daemon, then run it with the privileges required for KVM,
-TAP, nftables, and IPv4 forwarding.
+Build the daemon, then run it jailed by default with the privileges required
+for the jailer, cgroups, KVM, TAP, nftables, and IPv4 forwarding.
+
+JAILER_UID_BASE and JAILER_GID_BASE are required in jailed mode. Set
+FIRECRACKER_EXECUTOR=unrestricted only for the explicit development fallback.
 EOF
 }
 
@@ -27,9 +30,26 @@ if (($# > 0)); then
 fi
 
 require_linux
-require_commands cargo cmp grep mkfs.ext4 sha256sum sudo
+require_commands cargo cmp grep mkfs.ext4 sha256sum stat sudo
 require_runtime_artifacts
 [[ -e /dev/kvm ]] || die "/dev/kvm is unavailable inside this Lima guest"
+
+case "$FIRECRACKER_EXECUTOR" in
+    jailed)
+        [[ -n "${JAILER_UID_BASE:-}" ]] ||
+            usage_error "JAILER_UID_BASE is required when FIRECRACKER_EXECUTOR=jailed"
+        [[ -n "${JAILER_GID_BASE:-}" ]] ||
+            usage_error "JAILER_GID_BASE is required when FIRECRACKER_EXECUTOR=jailed"
+        JAILER_UID_BASE="$(validate_integer "jailer UID base" "$JAILER_UID_BASE" 1 4294950911)"
+        JAILER_GID_BASE="$(validate_integer "jailer GID base" "$JAILER_GID_BASE" 1 4294950911)"
+        export JAILER_UID_BASE JAILER_GID_BASE
+        ;;
+    unrestricted)
+        ;;
+    *)
+        usage_error "invalid FIRECRACKER_EXECUTOR: expected jailed or unrestricted, got $FIRECRACKER_EXECUTOR"
+        ;;
+esac
 
 mkdir -p "$VM_ROOT" "$CARGO_TARGET_DIR"
 
@@ -41,5 +61,5 @@ info "building the daemon"
 
 info "starting HTTP at $ELHONE_ADDR"
 exec sudo \
-    --preserve-env=VM_ROOT,IMAGE_ROOT,FIRECRACKER,BARBIROLLI_ENTRYPOINT,ELHONE_ADDR,RUST_LOG,IDLE_INITIAL_INTERVAL_SECONDS,IDLE_STRIKE_INTERVAL_SECONDS,IDLE_FINAL_INTERVAL_SECONDS,IDLE_CPU_HIGH_PERCENT,IDLE_CPU_LOW_PERCENT \
+    --preserve-env=VM_ROOT,IMAGE_ROOT,FIRECRACKER,FIRECRACKER_EXECUTOR,JAILER,JAILER_CHROOT_BASE,JAILER_UID_BASE,JAILER_GID_BASE,BARBIROLLI_ENTRYPOINT,ELHONE_ADDR,RUST_LOG,IDLE_INITIAL_INTERVAL_SECONDS,IDLE_STRIKE_INTERVAL_SECONDS,IDLE_FINAL_INTERVAL_SECONDS,IDLE_CPU_HIGH_PERCENT,IDLE_CPU_LOW_PERCENT \
     "$CARGO_TARGET_DIR/debug/ssh"

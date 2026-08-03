@@ -17,8 +17,8 @@ validated.workspace = true
 dashmap.workspace = true
 fctools = { workspace = true, features = [
     "direct-process-spawner",
+    "either-vmm-executor",
     "tokio-runtime",
-    "unrestricted-vmm-executor",
     "vm",
     "metrics-extension",
     "rustix-syscall-backend",
