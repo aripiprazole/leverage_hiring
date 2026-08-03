@@ -79,6 +79,7 @@ impl Default for ProvisioningConfig {
 pub struct DaemonConfig {
     pub provisioning: ProvisioningConfig,
     pub firecracker: PathBuf,
+    pub entrypoint: PathBuf,
     pub idle_policy: Option<IdlePolicy>,
 }
 
@@ -209,6 +210,10 @@ mod tests {
         let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
 
         let first = fixture.create_vm(TestVmConfig::new(1)).await;
+        assert_eq!(
+            first.api_socket,
+            first.storage.artifact_dir.join("firecracker.socket")
+        );
         first
             .lifecycle
             .start_concurrently(|lifecycle| {
@@ -219,6 +224,10 @@ mod tests {
 
         let second = fixture.create_vm(TestVmConfig::new(2)).await;
         assert_ne!(first.id, second.id);
+        assert_eq!(
+            second.api_socket,
+            second.storage.artifact_dir.join("firecracker.socket")
+        );
         second
             .lifecycle
             .start(|lifecycle| {
@@ -338,6 +347,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     mod behavior {
+        use std::fs;
+
         use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
         use barbirolli::{
             LifecycleError, MemoryMib, NetworkSpec, ProvisioningConfig, VmId, VmStatus,
@@ -363,6 +374,50 @@ mod tests {
             ));
             assert!(manager.list().await.is_empty());
             assert!(fixture.storage.open().discover().is_empty());
+            manager.finish().await;
+        }
+
+        #[tokio::test]
+        async fn serial_log_reconciliation_preserves_and_repairs_logs() {
+            let fixture = BehaviorFixture::new();
+            let manager = fixture.manager().await;
+            let retained = manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("failed to create retained-log VM");
+            let legacy = manager
+                .try_create_vm(TestVmConfig::new(1))
+                .await
+                .expect("failed to create legacy VM");
+            fs::write(retained.storage.serial_log(), b"first boot\n")
+                .expect("failed to seed retained serial log");
+            fs::remove_file(legacy.storage.serial_log())
+                .expect("failed to remove legacy serial log");
+            let retained_spec = barbirolli::Barbirolli::vm(&manager, retained.id)
+                .expect("missing retained-log VM")
+                .spec()
+                .clone();
+            let legacy_spec = barbirolli::Barbirolli::vm(&manager, legacy.id)
+                .expect("missing legacy VM")
+                .spec()
+                .clone();
+
+            retained_spec
+                .ensure_serial_log()
+                .expect("failed to reconcile retained serial log");
+            legacy_spec
+                .ensure_serial_log()
+                .expect("failed to reconcile legacy serial log");
+
+            assert_eq!(
+                fs::read(retained.storage.serial_log())
+                    .expect("failed to read retained serial log"),
+                b"first boot\n"
+            );
+            assert_eq!(
+                fs::read(legacy.storage.serial_log()).expect("failed to read repaired serial log"),
+                b""
+            );
             manager.finish().await;
         }
 

@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x create [options]
+Usage: x vm:create [options]
 
 Options:
   --vcpu-count <count>          Number of vCPUs (1-31). Default: 1.
@@ -16,13 +16,13 @@ Options:
   --help, -h                    Show this help message.
 
 Examples:
-  x create
-  x create --vcpu-count 2 --publish 2222:22
-  x create --authorized-key-file ~/my_key.pub --publish 8080:80
+  x vm:create
+  x vm:create --vcpu-count 2 --publish 2222:22
+  x vm:create --authorized-key-file ~/my_key.pub --publish 8080:80
 
 Note:
   If you pass any --authorized-key-file values, those keys replace the default
-  key in the rootfs. Use --identity with `x ssh` if you need to connect with a
+  key in the rootfs. Use --identity with `x vm:ssh` if you need to connect with a
   custom key.
 EOF
 }

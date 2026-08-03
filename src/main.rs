@@ -1,6 +1,6 @@
 use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 
-use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, VmStore};
+use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, Rootfs, VmStore};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -10,6 +10,7 @@ struct Config {
     vm_root: PathBuf,
     image_root: PathBuf,
     firecracker: PathBuf,
+    barbirolli_entrypoint: PathBuf,
     #[serde(default = "default_elhone_address")]
     elhone_addr: SocketAddr,
     #[serde(default = "default_idle_initial_interval")]
@@ -56,10 +57,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
+    let standard_rootfs = Rootfs::from(config.image_root.join("ubuntu-24.04.ext4"));
     let daemon = Barbirolli::new(
         VmStore::new(config.vm_root, config.image_root)?,
         DaemonConfig {
             firecracker: config.firecracker,
+            entrypoint: config.barbirolli_entrypoint,
             provisioning: ProvisioningConfig::default(),
             idle_policy: Some(IdlePolicy {
                 initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
@@ -73,9 +76,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     let listener = TcpListener::bind(config.elhone_addr).await?;
-    let elhone = axum::serve(listener, elhone::router(daemon.clone()));
+    let elhone = axum::serve(listener, elhone::router(daemon.clone(), standard_rootfs));
 
-    tracing::info!(addr = %config.elhone_addr, "HTTP service started");
+    tracing::info!(addr = %config.elhone_addr, "http service started");
     let service = tokio::select! {
         result = elhone => result.map_err(|error| error.to_string()),
         result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
@@ -107,6 +110,10 @@ mod tests {
                 "FIRECRACKER".to_owned(),
                 "/usr/local/bin/firecracker".to_owned(),
             ),
+            (
+                "BARBIROLLI_ENTRYPOINT".to_owned(),
+                "/usr/local/bin/barbirolli_entrypoint".to_owned(),
+            ),
             ("ELHONE_ADDR".to_owned(), "127.0.0.1:4000".to_owned()),
         ])
         .expect("configuration should deserialize");
@@ -116,6 +123,10 @@ mod tests {
         assert_eq!(
             config.firecracker,
             PathBuf::from("/usr/local/bin/firecracker")
+        );
+        assert_eq!(
+            config.barbirolli_entrypoint,
+            PathBuf::from("/usr/local/bin/barbirolli_entrypoint")
         );
         assert_eq!(
             config.elhone_addr,

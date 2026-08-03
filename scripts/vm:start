@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x start <vm_id>
+Usage: x vm:start <vm_id>
 
 Start one VM.
 EOF

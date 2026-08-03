@@ -1,9 +1,6 @@
-use std::{
-    fmt::{self, Display},
-    net::Ipv4Addr,
-    str::FromStr,
-};
+use std::{net::Ipv4Addr, str::FromStr};
 
+use derive_more::{Debug, Display};
 use serde::{Deserialize, Serialize};
 
 use crate::{ParseValueError, VmId};
@@ -15,6 +12,7 @@ use crate::{Port, PortBinding};
 const VM_NETWORK_POOL: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 0);
 #[cfg(any(target_os = "linux", test))]
 const VM_NETWORK_POOL_PREFIX: u8 = 16;
+const BARBIROLLI_ENTRYPOINT: &str = "/barbirolli_entrypoint";
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -105,7 +103,7 @@ impl NetworkSpec {
     #[must_use]
     pub fn kernel_boot_args(&self) -> String {
         format!(
-            "keep_bootcon console=ttyS0 reboot=k panic=1 ip={}::{}:255.255.255.252::eth0:off nameserver=1.1.1.1",
+            "keep_bootcon console=ttyS0 reboot=k panic=1 init={BARBIROLLI_ENTRYPOINT} ip={}::{}:255.255.255.252::eth0:off nameserver=1.1.1.1",
             self.guest_ip, self.host_ip
         )
     }
@@ -149,9 +147,11 @@ impl NetworkSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
+#[debug("{_0}")]
+#[display("{_0}")]
 pub struct InterfaceName(String);
 
 impl FromStr for InterfaceName {
@@ -168,12 +168,6 @@ impl FromStr for InterfaceName {
         } else {
             Err(ParseValueError::new("network interface", value))
         }
-    }
-}
-
-impl Display for InterfaceName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
     }
 }
 
@@ -203,7 +197,7 @@ mod tests {
         assert_eq!(first.subnet_cidr(), "172.16.0.0/30");
         assert_eq!(
             first.kernel_boot_args(),
-            "keep_bootcon console=ttyS0 reboot=k panic=1 ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off nameserver=1.1.1.1"
+            "keep_bootcon console=ttyS0 reboot=k panic=1 init=/barbirolli_entrypoint ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off nameserver=1.1.1.1"
         );
 
         let last = NetworkSpec::new(VmId::try_from(16_383).expect("valid VM ID"))

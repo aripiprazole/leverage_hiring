@@ -1,10 +1,9 @@
 use std::{
-    fmt::{self, Display},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
-use derive_more::{Display, From, Into};
+use derive_more::{Debug, Display, From, Into};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::NetworkSpec;
@@ -15,11 +14,18 @@ pub(crate) mod managed;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VmInput {
+    pub rootfs: Rootfs,
+    #[serde(default = "default_provision_ssh_keys")]
+    pub provision_ssh_keys: bool,
     pub vcpu_count: VcpuCount,
     #[serde(default)]
     pub authorized_keys: Vec<AuthorizedKey>,
     #[serde(default)]
     pub bindings: Vec<PortBinding>,
+}
+
+fn default_provision_ssh_keys() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,13 +36,20 @@ pub struct VmSpec {
     pub deleted: bool,
     pub artifact_dir: PathBuf,
     pub kernel: PathBuf,
-    pub rootfs: PathBuf,
+    pub rootfs: Rootfs,
     pub vcpu_count: VcpuCount,
     pub api_socket: ApiSocket,
     pub memory_mib: MemoryMib,
     #[serde(default)]
     pub bindings: Vec<PortBinding>,
     pub network: NetworkSpec,
+}
+
+impl VmSpec {
+    #[must_use]
+    pub fn serial_log(&self) -> PathBuf {
+        self.artifact_dir.join("serial.log")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -47,10 +60,26 @@ pub struct PortBinding {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+    Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
 )]
 #[serde(transparent)]
+#[debug("{}", _0.display())]
+#[display("{}", _0.display())]
 pub struct ApiSocket(PathBuf);
+
+#[derive(
+    Debug, Display, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Into, From,
+)]
+#[serde(transparent)]
+#[debug("{}", _0.display())]
+#[display("{}", _0.display())]
+pub struct Rootfs(PathBuf);
+
+impl AsRef<Path> for Rootfs {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
 
 impl ApiSocket {
     #[cfg(target_os = "linux")]
@@ -67,6 +96,7 @@ impl ApiSocket {
 /// TCP only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct Port(u16);
 
@@ -97,6 +127,7 @@ impl<'de> Deserialize<'de> for Port {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct AuthorizedKey(String);
 
@@ -126,7 +157,9 @@ impl<'de> Deserialize<'de> for AuthorizedKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[debug("{_0}")]
+#[display("{_0}")]
 pub struct VmId(u16);
 
 impl TryFrom<u16> for VmId {
@@ -163,14 +196,9 @@ impl<'de> Deserialize<'de> for VmId {
     }
 }
 
-impl Display for VmId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Serialize)]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct VcpuCount(u8);
 
@@ -204,6 +232,7 @@ impl<'de> Deserialize<'de> for VcpuCount {
     Debug, Clone, Copy, PartialEq, From, Into, Eq, Hash, PartialOrd, Ord, Display, Serialize,
 )]
 #[serde(transparent)]
+#[debug("{_0}")]
 #[display("{_0}")]
 pub struct MemoryMib(u16);
 

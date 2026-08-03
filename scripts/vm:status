@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x status <vm_id>
+Usage: x vm:status <vm_id>
 
 Show VM lifecycle status.
 EOF
@@ -30,4 +30,3 @@ case "$1" in
         api_request GET "/vms/$vm_id/status"
         ;;
 esac
-

@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x run_daemon
+Usage: x daemon:run
 
 Build the daemon, then run it with the privileges required for KVM,
 TAP, nftables, and IPv4 forwarding.
@@ -27,7 +27,7 @@ if (($# > 0)); then
 fi
 
 require_linux
-require_commands cargo cmp grep sudo
+require_commands cargo cmp grep mkfs.ext4 sha256sum sudo
 require_runtime_artifacts
 [[ -e /dev/kvm ]] || die "/dev/kvm is unavailable inside this Lima guest"
 
@@ -41,5 +41,5 @@ info "building the daemon"
 
 info "starting HTTP at $ELHONE_ADDR"
 exec sudo \
-    --preserve-env=VM_ROOT,IMAGE_ROOT,FIRECRACKER,ELHONE_ADDR,RUST_LOG,IDLE_INITIAL_INTERVAL_SECONDS,IDLE_STRIKE_INTERVAL_SECONDS,IDLE_FINAL_INTERVAL_SECONDS,IDLE_CPU_HIGH_PERCENT,IDLE_CPU_LOW_PERCENT \
+    --preserve-env=VM_ROOT,IMAGE_ROOT,FIRECRACKER,BARBIROLLI_ENTRYPOINT,ELHONE_ADDR,RUST_LOG,IDLE_INITIAL_INTERVAL_SECONDS,IDLE_STRIKE_INTERVAL_SECONDS,IDLE_FINAL_INTERVAL_SECONDS,IDLE_CPU_HIGH_PERCENT,IDLE_CPU_LOW_PERCENT \
     "$CARGO_TARGET_DIR/debug/ssh"

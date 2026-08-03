@@ -13,23 +13,16 @@
               "--target",
               "aarch64-unknown-linux-gnu",
               "--all-targets",
-              "--message-format=json"
-            ]
-          }
+              "--message-format=json",
+            ],
+          },
         },
         "check": {
           "overrideCommand": [
-            "cargo",
-            "check",
-            "-p",
-            "barbirolli",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-            "--all-targets",
-            "--message-format=json"
-          ]
-        }
-      }
-    }
-  }
+            "rust-analyzer-check",
+          ],
+        },
+      },
+    },
+  },
 }

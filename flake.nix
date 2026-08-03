@@ -24,6 +24,42 @@
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nightly-rustfmt = pkgs.rust-bin.nightly.latest.rustfmt;
         aarch64-linux-headers = pkgs.pkgsCross.aarch64-multiplatform.linuxHeaders;
+        rust-analyzer-check = pkgs.writeShellApplication {
+          name = "rust-analyzer-check";
+          runtimeInputs = [ rust ];
+          text =
+            if pkgs.stdenv.isDarwin then
+              ''
+                daemon_check_status=0
+                elhone_check_status=0
+
+                cargo check \
+                  -p barbirolli \
+                  --target aarch64-unknown-linux-gnu \
+                  --all-targets \
+                  --message-format=json \
+                  || daemon_check_status=$?
+
+                cargo check \
+                  -p elhone \
+                  --all-targets \
+                  --message-format=json \
+                  || elhone_check_status=$?
+
+                if (( daemon_check_status != 0 )); then
+                  exit "$daemon_check_status"
+                fi
+                exit "$elhone_check_status"
+              ''
+            else
+              ''
+                exec cargo check \
+                  --workspace \
+                  --target aarch64-unknown-linux-gnu \
+                  --all-targets \
+                  --message-format=json
+              '';
+        };
         x-cli = pkgs.writeShellApplication {
           name = "x";
           runtimeInputs = [ pkgs.git pkgs.curl pkgs.jq pkgs.openssh ];
@@ -68,8 +104,9 @@
             pkgs.jq
             pkgs.lima
             pkgs.cargo-mutants
+            rust-analyzer-check
             x-cli
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.e2fsprogs ];
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu =
             "-I${aarch64-linux-headers}/include";
           RUST_BACKTRACE = "1";

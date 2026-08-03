@@ -7,14 +7,15 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x delete <vm_id>
+Usage: x vm:ps
 
-Delete one VM.
+List all existing VM summaries.
 EOF
 }
 
 if (($# == 0)); then
-    usage_error "missing VM_ID"
+    api_request GET "/vms"
+    exit 0
 fi
 
 case "$1" in
@@ -23,10 +24,6 @@ case "$1" in
         exit 0
         ;;
     *)
-        vm_id="$(require_vm_id "$1")"
-        if (($# != 1)); then
-            usage_error "unexpected extra argument: $2"
-        fi
-        api_request DELETE "/vms/$vm_id"
+        usage_error "unexpected argument: $1"
         ;;
 esac

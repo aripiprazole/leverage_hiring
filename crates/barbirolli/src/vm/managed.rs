@@ -11,7 +11,7 @@ use derive_more::Debug;
 use fctools::{
     extension::metrics::Metrics,
     process_spawner::DirectProcessSpawner,
-    runtime::tokio::TokioRuntime,
+    runtime::{Runtime, RuntimeChild, tokio::TokioRuntime},
     vm::{
         Vm, VmError as FctoolsVmError, VmState,
         api::{VmApi, VmApiError},
@@ -34,12 +34,14 @@ use fctools::{
         },
     },
 };
-use futures::{FutureExt, future::BoxFuture};
+use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, future::BoxFuture};
 use nonempty_collections::NEVec;
 use rustix::process::Pid;
 use tokio::{
+    fs::OpenOptions,
     io::{AsyncBufReadExt, BufReader},
     task::JoinHandle,
+    time::{sleep, timeout},
 };
 use tracing::{Instrument as _, info_span};
 use validated::Validated;
@@ -54,6 +56,10 @@ use crate::{
 
 type FirecrackerResourceSystem = ResourceSystem<DirectProcessSpawner, TokioRuntime>;
 type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
+type FirecrackerChild = <TokioRuntime as Runtime>::Child;
+type FirecrackerStdout = <FirecrackerChild as RuntimeChild>::Stdout;
+type FirecrackerStderr = <FirecrackerChild as RuntimeChild>::Stderr;
+type FirecrackerStdin = <FirecrackerChild as RuntimeChild>::Stdin;
 type Result<T = (), E = LifecycleError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -69,6 +75,199 @@ pub struct ManagedVm {
     metrics: Arc<RwLock<Option<Metrics>>>,
     #[debug(skip)]
     metrics_task: JoinHandle<()>,
+    console: SerialConsole,
+}
+
+#[derive(Debug)]
+struct SerialConsole {
+    #[debug("{vm_id}")]
+    vm_id: VmId,
+    #[debug("{}", path.display())]
+    path: PathBuf,
+    #[debug("{}", if stdin.is_some() { "open" } else { "closed" })]
+    stdin: Option<FirecrackerStdin>,
+    #[debug(
+        "{}",
+        match stdout_task.as_ref() {
+            Some(task) if task.is_finished() => "finished",
+            Some(_) => "running",
+            None => "released",
+        }
+    )]
+    stdout_task: Option<JoinHandle<()>>,
+    #[debug(
+        "{}",
+        match stderr_task.as_ref() {
+            Some(task) if task.is_finished() => "finished",
+            Some(_) => "running",
+            None => "released",
+        }
+    )]
+    stderr_task: Option<JoinHandle<()>>,
+}
+
+impl SerialConsole {
+    #[tracing::instrument(
+        name = "attach_serial_console",
+        skip(vm, path),
+        fields(%vm_id, path = %path.display()),
+        err
+    )]
+    async fn new(vm: &mut FirecrackerVm, vm_id: VmId, path: PathBuf) -> Result<Self> {
+        let file = io_error!(
+            HealthError,
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await,
+            path.clone()
+        )?;
+        let pipes = vm.take_pipes()?;
+        let console = Self {
+            vm_id,
+            path: path.clone(),
+            stdin: Some(pipes.stdin),
+            stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, path)),
+            stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
+        };
+        tracing::debug!(
+            ?console,
+            "barbirolli attached the Firecracker serial console"
+        );
+        Ok(console)
+    }
+
+    #[tracing::instrument(
+        name = "write_serial_console",
+        skip(self, bytes),
+        fields(vm_id = %self.vm_id, path = %self.path.display(), byte_count = bytes.len()),
+        err
+    )]
+    async fn write(&mut self, bytes: &[u8]) -> std::result::Result<(), SerialShutdownError> {
+        tracing::debug!("barbirolli writes to the Firecracker serial input");
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or(SerialShutdownError::MissingStdin)?;
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(SerialShutdownError::Write)?;
+        stdin.flush().await.map_err(SerialShutdownError::Write)
+    }
+
+    #[tracing::instrument(
+        name = "finish_serial_console",
+        skip(self),
+        fields(vm_id = %self.vm_id, path = %self.path.display())
+    )]
+    async fn finish(&mut self) {
+        drop(self.stdin.take());
+        join_serial_task(&mut self.stdout_task, "stdout").await;
+        join_serial_task(&mut self.stderr_task, "stderr").await;
+        tracing::debug!(console = ?self, "the Firecracker serial console stopped");
+    }
+
+    #[tracing::instrument(
+        name = "abort_serial_console",
+        skip(self),
+        fields(vm_id = %self.vm_id, path = %self.path.display())
+    )]
+    fn abort(&mut self) {
+        drop(self.stdin.take());
+        if let Some(task) = self.stdout_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+        tracing::warn!(
+            console = ?self,
+            "barbirolli stopped the Firecracker serial-console readers"
+        );
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SerialShutdownError {
+    #[error("Firecracker serial stdin is unavailable")]
+    MissingStdin,
+    #[error("failed to write Firecracker serial stdin: {0}")]
+    Write(#[source] std::io::Error),
+    #[error("Firecracker did not exit before the serial shutdown timeout")]
+    Timeout,
+}
+
+fn spawn_serial_stdout_reader(
+    mut stdout: FirecrackerStdout,
+    mut file: tokio::fs::File,
+    vm_id: VmId,
+    path: PathBuf,
+) -> JoinHandle<()> {
+    let span = info_span!("serial_reader", %vm_id, stream = "stdout", path = %path.display());
+    tokio::spawn(
+        async move {
+            let mut buffer = vec![0_u8; 8 * 1024];
+            let mut recording = true;
+            loop {
+                let read = match stdout.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(error) => {
+                        tracing::error!(%error, "the Firecracker stdout reader failed");
+                        break;
+                    }
+                };
+                if recording
+                    && let Err(error) =
+                        tokio::io::AsyncWriteExt::write_all(&mut file, &buffer[..read]).await
+                {
+                    tracing::error!(
+                        %error,
+                        "the stdout reader continues because the Firecracker serial-log write failed"
+                    );
+                    recording = false;
+                }
+            }
+            if recording && let Err(error) = tokio::io::AsyncWriteExt::flush(&mut file).await {
+                tracing::error!(%error, "the Firecracker serial-log flush failed");
+            }
+        }
+        .instrument(span),
+    )
+}
+
+fn spawn_serial_stderr_reader(mut stderr: FirecrackerStderr, vm_id: VmId) -> JoinHandle<()> {
+    let span = info_span!("serial_reader", %vm_id, stream = "stderr");
+    tokio::spawn(
+        async move {
+            let mut buffer = vec![0_u8; 8 * 1024];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(read) => tracing::warn!(
+                        byte_count = read,
+                        stderr = ?String::from_utf8_lossy(&buffer[..read]),
+                        "the Firecracker process wrote to stderr"
+                    ),
+                    Err(error) => {
+                        tracing::error!(%error, "the Firecracker stderr reader failed");
+                        break;
+                    }
+                }
+            }
+        }
+        .instrument(span),
+    )
+}
+
+async fn join_serial_task(task: &mut Option<JoinHandle<()>>, stream: &'static str) {
+    if let Some(task) = task.take()
+        && let Err(error) = task.await
+    {
+        tracing::error!(%error, stream, "the Firecracker serial-reader task failed");
+    }
 }
 
 impl VmSpec {
@@ -109,6 +308,9 @@ impl VmSpec {
             if let Err(err) = self.cleanup_cgroup_and_metrics() {
                 errors.push(ReconcileFailure::Health(err));
             }
+            if let Err(err) = self.ensure_serial_log() {
+                errors.push(ReconcileFailure::SerialLog(err));
+            }
             match NEVec::try_from_vec(errors) {
                 Some(failures) => Err(LifecycleError::Reconcile(Validated::Fail(failures))),
                 None => Ok(()),
@@ -134,9 +336,19 @@ impl VmSpec {
         self.artifact_dir.join("metrics.fifo")
     }
 
+    pub(crate) fn ensure_serial_log(&self) -> Result<(), HealthError> {
+        let path = self.serial_log();
+        io_error!(
+            HealthError,
+            fs::OpenOptions::new().create(true).append(true).open(&path),
+            path
+        )?;
+        Ok(())
+    }
+
     #[tracing::instrument(err)]
     fn cleanup_cgroup_and_metrics(&self) -> Result<(), HealthError> {
-        tracing::info!("cleaning up cgroup and metrics");
+        tracing::info!("barbirolli starts cgroup and metrics cleanup");
         let metrics = self.metrics_path();
         let metrics_cleanup = match fs::remove_file(&metrics) {
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
@@ -166,7 +378,7 @@ fn vm_config(
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
     let rootfs = resources.create_resource(
-        &spec.rootfs,
+        spec.rootfs.as_ref(),
         ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
     )?;
     let metrics = resources.create_resource(
@@ -246,7 +458,22 @@ async fn rollback_vm(vm: &mut FirecrackerVm, shutdown_timeout: Duration) -> Resu
     }
 }
 
+async fn rollback_vm_with_console(
+    vm: &mut FirecrackerVm,
+    console: &mut SerialConsole,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    let rollback = rollback_vm(vm, shutdown_timeout).await;
+    if matches!(vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+        console.finish().await;
+    } else {
+        console.abort();
+    }
+    rollback
+}
+
 impl ManagedVm {
+    #[tracing::instrument(skip(spec, barbirolli), fields(vm_id = %spec.id), err)]
     pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
         let network = spec.network.prepare(&spec.bindings).await?;
         let mut vm = match spec.prepare_vm(barbirolli).await {
@@ -271,15 +498,33 @@ impl ManagedVm {
             });
         }
 
+        let mut console = match SerialConsole::new(&mut vm, spec.id, spec.serial_log()).await {
+            Ok(serial_console) => serial_console,
+            Err(startup) => {
+                return Err(LifecycleError::StartupRollback {
+                    startup_error: Box::new(startup),
+                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
+                        .await
+                        .err()
+                        .map(Box::new),
+                    network_rollback_error: network.cleanup().await.err().map(Box::new),
+                });
+            }
+        };
+
         let pid = match barbirolli.firecracker.pid(&spec).await {
             Ok(pid) => pid,
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
                     startup_error: Box::new(LifecycleError::Health(error.into())),
-                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
-                        .await
-                        .err()
-                        .map(Box::new),
+                    vm_rollback_error: rollback_vm_with_console(
+                        &mut vm,
+                        &mut console,
+                        barbirolli.shutdown_timeout,
+                    )
+                    .await
+                    .err()
+                    .map(Box::new),
                     network_rollback_error: network.cleanup().await.err().map(Box::new),
                 });
             }
@@ -289,17 +534,21 @@ impl ManagedVm {
             Err(error) => {
                 return Err(LifecycleError::StartupRollback {
                     startup_error: Box::new(LifecycleError::Health(error)),
-                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
-                        .await
-                        .err()
-                        .map(Box::new),
+                    vm_rollback_error: rollback_vm_with_console(
+                        &mut vm,
+                        &mut console,
+                        barbirolli.shutdown_timeout,
+                    )
+                    .await
+                    .err()
+                    .map(Box::new),
                     network_rollback_error: network.cleanup().await.err().map(Box::new),
                 });
             }
         };
         let metrics = Arc::new(RwLock::new(None));
 
-        Ok(Self {
+        let managed = Self {
             vm,
             network: Some(network),
             failed: false,
@@ -308,8 +557,14 @@ impl ManagedVm {
             cgroup: Some(cgroup),
             metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
             metrics,
+            console,
             spec,
-        })
+        };
+        tracing::info!(
+            pid = managed.pid.as_raw_pid(),
+            "barbirolli started the managed VM"
+        );
+        Ok(managed)
     }
 
     pub async fn balloon_config(&mut self) -> Result<BalloonDevice> {
@@ -331,17 +586,38 @@ impl ManagedVm {
         if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
             return Ok(());
         }
+
+        if cfg!(target_arch = "x86_64") {
+            self.vm
+                .shutdown([
+                    VmShutdownAction {
+                        method: VmShutdownMethod::CtrlAltDel,
+                        timeout: Some(timeout),
+                        graceful: true,
+                    },
+                    VmShutdownAction {
+                        method: VmShutdownMethod::PauseThenKill,
+                        timeout: Some(timeout / 2),
+                        graceful: false,
+                    },
+                    VmShutdownAction {
+                        method: VmShutdownMethod::Kill,
+                        timeout: Some(timeout / 2),
+                        graceful: false,
+                    },
+                ])
+                .await?;
+            return Ok(());
+        }
+
+        if let Err(error) = self.shutdown_through_serial(timeout).await {
+            tracing::warn!(%error, vm_id = %self.spec.id, "the graceful serial shutdown failed");
+        }
+        if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+            return Ok(());
+        }
         self.vm
             .shutdown([
-                VmShutdownAction {
-                    method: if cfg!(target_arch = "x86_64") {
-                        VmShutdownMethod::CtrlAltDel
-                    } else {
-                        VmShutdownMethod::WriteToSerial(b"reboot\n".to_vec())
-                    },
-                    timeout: Some(timeout),
-                    graceful: true,
-                },
                 VmShutdownAction {
                     method: VmShutdownMethod::PauseThenKill,
                     timeout: Some(timeout / 2),
@@ -357,10 +633,32 @@ impl ManagedVm {
         Ok(())
     }
 
-    #[tracing::instrument(err)]
+    async fn shutdown_through_serial(
+        &mut self,
+        duration: Duration,
+    ) -> Result<(), SerialShutdownError> {
+        self.console.write(b"reboot\n").await?;
+        timeout(duration, async {
+            loop {
+                if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| SerialShutdownError::Timeout)
+    }
+
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     pub async fn cleanup(&mut self) -> Result<()> {
-        tracing::info!("managed vm cleanup");
+        tracing::info!("barbirolli starts managed VM cleanup");
         self.metrics_task.abort();
+        if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+            self.console.finish().await;
+        } else {
+            self.console.abort();
+        }
         let vm = self.vm.cleanup().await.map_err(LifecycleError::from);
         let network = match self.network.as_ref() {
             Some(network) => network.cleanup().await,
@@ -423,7 +721,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
 fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = read_metrics(&path, &latest).await {
-            tracing::error!(%error, path = %path.display(), "Firecracker metrics reader stopped");
+            tracing::error!(%error, path = %path.display(), "the Firecracker metrics reader failed");
         }
     })
 }
@@ -435,7 +733,7 @@ async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Resul
         let metrics = match serde_json::from_str(&line) {
             Ok(metrics) => metrics,
             Err(error) => {
-                tracing::warn!(%error, "discarding invalid Firecracker metrics");
+                tracing::warn!(%error, "barbirolli discarded invalid Firecracker metrics");
                 continue;
             }
         };
@@ -618,4 +916,124 @@ pub enum ReconcileFailure {
     Socket(#[source] std::io::Error),
     #[error("failed to clean up stale health resources")]
     Health(#[source] HealthError),
+    #[error("failed to prepare the VM serial log")]
+    SerialLog(#[source] HealthError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, path::Path};
+
+    use super::*;
+
+    fn shell(script: &str) -> FirecrackerChild {
+        TokioRuntime
+            .spawn_process(
+                Path::new("/bin/sh").as_os_str(),
+                &[OsString::from("-c"), OsString::from(script)],
+                true,
+                true,
+                true,
+            )
+            .expect("failed to spawn test process")
+    }
+
+    #[tokio::test]
+    async fn serial_reader_appends_ordered_stdout_and_excludes_stderr() {
+        let temporary = tempfile::tempdir().expect("failed to create temporary directory");
+        let path = temporary.path().join("serial.log");
+        tokio::fs::write(&path, b"previous boot\n")
+            .await
+            .expect("failed to seed serial log");
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .expect("failed to open serial log");
+        let mut child =
+            shell("printf 'first line\\n'; printf 'stderr only\\n' >&2; printf 'second line\\n'");
+        let stdout = child.take_stdout().expect("missing stdout pipe");
+        let stderr = child.take_stderr().expect("missing stderr pipe");
+        let vm_id = VmId::try_from(0).expect("valid test VM ID");
+        let stdout_task = spawn_serial_stdout_reader(stdout, file, vm_id, path.clone());
+        let stderr_task = spawn_serial_stderr_reader(stderr, vm_id);
+
+        assert!(
+            child
+                .wait()
+                .await
+                .expect("test process wait failed")
+                .success()
+        );
+        stdout_task.await.expect("stdout reader task failed");
+        stderr_task.await.expect("stderr reader task failed");
+
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("failed to read serial log"),
+            b"previous boot\nfirst line\nsecond line\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_console_retains_stdin_for_shutdown_writes() {
+        let temporary = tempfile::tempdir().expect("failed to create temporary directory");
+        let path = temporary.path().join("serial.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .expect("failed to open serial log");
+        let mut child = shell("IFS= read -r line; printf '%s\\n' \"$line\"");
+        let vm_id = VmId::try_from(0).expect("valid test VM ID");
+        let mut console = SerialConsole {
+            vm_id,
+            path: path.clone(),
+            stdin: child.take_stdin(),
+            stdout_task: Some(spawn_serial_stdout_reader(
+                child.take_stdout().expect("missing stdout pipe"),
+                file,
+                vm_id,
+                path.clone(),
+            )),
+            stderr_task: Some(spawn_serial_stderr_reader(
+                child.take_stderr().expect("missing stderr pipe"),
+                vm_id,
+            )),
+        };
+
+        let active = format!("{console:?}");
+        assert!(active.contains("vm_id: 0"));
+        assert!(active.contains(&format!("path: {}", path.display())));
+        assert!(active.contains("stdin: open"));
+        assert!(active.contains("stdout_task: running"));
+        assert!(active.contains("stderr_task: running"));
+
+        console
+            .write(b"reboot\n")
+            .await
+            .expect("failed to write retained serial stdin");
+        assert!(
+            child
+                .wait()
+                .await
+                .expect("test process wait failed")
+                .success()
+        );
+        console.finish().await;
+
+        let finished = format!("{console:?}");
+        assert!(finished.contains("stdin: closed"));
+        assert!(finished.contains("stdout_task: released"));
+        assert!(finished.contains("stderr_task: released"));
+
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("failed to read serial log"),
+            b"reboot\n"
+        );
+    }
 }

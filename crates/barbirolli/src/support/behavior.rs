@@ -1,7 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
 use barbirolli::{
-    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, VmId, VmSpec, VmStore, VmSummary,
+    Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig, Rootfs, VmId, VmSpec, VmStore,
+    VmSummary,
 };
 use derive_more::{Deref, DerefMut};
 use futures::future::try_join_all;
@@ -16,6 +17,7 @@ pub struct BehaviorFixture {
     pub storage: StorageEnvironmentFixture,
     pub temporary: TempDir,
     firecracker: PathBuf,
+    entrypoint: PathBuf,
 }
 
 #[derive(Clone)]
@@ -41,6 +43,7 @@ pub struct BehaviorManagerFixture {
     #[deref]
     #[deref_mut]
     manager: Barbirolli,
+    rootfs: Rootfs,
 }
 
 pub struct BehaviorVmFixture {
@@ -64,12 +67,12 @@ impl BehaviorFixture {
         fs::create_dir(&image_root).expect("failed to create IMAGE_ROOT");
 
         let source_kernel = temporary.path().join("source-vmlinux");
-        let source_rootfs = temporary.path().join("source-alpine.ext4");
+        let source_rootfs = temporary.path().join("source-ubuntu-24.04.ext4");
         fs::write(&source_kernel, b"kernel").expect("failed to create kernel");
         fs::write(&source_rootfs, b"rootfs").expect("failed to create rootfs");
         std::os::unix::fs::symlink(&source_kernel, image_root.join("vmlinux"))
             .expect("failed to link kernel");
-        std::os::unix::fs::symlink(&source_rootfs, image_root.join("alpine.ext4"))
+        std::os::unix::fs::symlink(&source_rootfs, image_root.join("ubuntu-24.04.ext4"))
             .expect("failed to link rootfs");
 
         let firecracker = temporary.path().join("firecracker");
@@ -85,12 +88,16 @@ impl BehaviorFixture {
         fs::set_permissions(&firecracker, permissions)
             .expect("failed to make fake Firecracker executable");
 
+        let entrypoint = temporary.path().join("barbirolli_entrypoint");
+        fs::write(&entrypoint, b"entrypoint").expect("failed to create fake guest entrypoint");
+
         Self {
             storage: StorageEnvironmentFixture {
                 vm_root,
                 image_root,
             },
             firecracker,
+            entrypoint,
             temporary,
         }
     }
@@ -110,12 +117,16 @@ impl BehaviorFixture {
             DaemonConfig {
                 provisioning,
                 firecracker: self.firecracker.clone(),
+                entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },
         )
         .await
         .expect("failed to create Barbirolli");
-        BehaviorManagerFixture { manager }
+        BehaviorManagerFixture {
+            manager,
+            rootfs: Rootfs::from(self.storage.image_root.join("ubuntu-24.04.ext4")),
+        }
     }
 }
 
@@ -131,14 +142,15 @@ impl StorageEnvironmentFixture {
 
 impl StoreFixture {
     pub async fn create_vm(&self, config: TestVmConfig) -> StoredVmFixture {
-        let spec = self
+        let input = config.into_input(Rootfs::from(
+            self.store.image_root.join("ubuntu-24.04.ext4"),
+        ));
+        let creation = self
             .store
-            .create(
-                config.into_input(),
-                ProvisioningConfig::default().default_vm_mem,
-            )
+            .create(input, ProvisioningConfig::default().default_vm_mem)
             .await
             .expect("failed to create stored VM");
+        let spec = creation.finish().expect("failed to persist stored VM");
         StoredVmFixture::new(spec)
     }
 
@@ -176,7 +188,10 @@ impl BehaviorManagerFixture {
         &self,
         config: TestVmConfig,
     ) -> Result<BehaviorVmFixture, LifecycleError> {
-        let id = self.manager.create(config.into_input()).await?;
+        let id = self
+            .manager
+            .create_for_behavior_test(config.into_input(self.rootfs.clone()))
+            .await?;
         self.try_vm(id)
     }
 
@@ -189,9 +204,12 @@ impl BehaviorManagerFixture {
         let ids = try_join_all(configs.map(|config| {
             let manager = self.manager.clone();
             let barrier = barrier.clone();
+            let rootfs = self.rootfs.clone();
             async move {
                 barrier.wait().await;
-                manager.create(config.into_input()).await
+                manager
+                    .create_for_behavior_test(config.into_input(rootfs))
+                    .await
             }
         }))
         .await

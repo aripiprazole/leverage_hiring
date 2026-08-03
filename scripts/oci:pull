@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/oci.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x oci:pull <name:tag>
+
+Pull a public Docker Hub image for the host platform and retain its root filesystem.
+
+Example:
+  x oci:pull alpine:latest
+EOF
+}
+
+if (($# == 0)); then
+    usage_error "missing OCI image"
+fi
+
+case "$1" in
+    help | --help | -h)
+        usage
+        exit 0
+        ;;
+esac
+
+(($# == 1)) || usage_error "unexpected extra argument: $2"
+require_commands curl jq
+parse_oci_reference "$1"
+api_request POST "/oci/pull" "$(oci_pull_payload)"

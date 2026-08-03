@@ -2,15 +2,16 @@
 
 ## Limitations/Known problems
 
-- Unrestricted firecracker vmm: It's only running trusted binary / root fs, and it's not running in production.
-- Secret Management using Firecracker MDS: not implemented
-- UDP port bindings: not implemented
+- Unrestricted Firecracker VMM: The VMM runs only trusted binaries and root filesystems. The
+  project does not use it in production.
+- Secret management with Firecracker MDS: The service does not implement this function.
+- UDP port bindings: The service does not implement this function.
 
 ## Lima
 
-The projects should run inside of a Linux machine with KVM support.
+Run the projects in a Linux VM that has KVM support.
 
-> Only tested using Lima on MacOS with Nested Virtualization.
+> Tested the projects only with Lima on macOS and nested virtualization.
 
 ```bash
 limactl start --set '.nestedVirtualization=true' --name=provisioning template://default
@@ -18,9 +19,8 @@ limactl start --set '.nestedVirtualization=true' --name=provisioning template://
 
 ## Dependencies
 
-Required dependencies on Ubuntu
-
 ```bash
+# ubuntu deps
 sudo apt-get update
 sudo apt-get install -y \
   build-essential \
@@ -42,61 +42,48 @@ cargo --version
 
 ## Booting
 
-From the macOS host, open a shell in the repository inside Lima:
+On the macOS host, open a shell in the repository inside Lima:
 
 ```bash
 limactl shell --workdir "$PWD" provisioning
 ```
 
-Then, inside Lima:
+In the Lima VM, run these commands:
 
 ```bash
-./x setup_daemon
-./x run_daemon
+# Install the dependencies
+./x daemon:setup
+./x daemon:run
 ```
 
 ## Example commands
 
 ```sh
-# Show available VM commands
-./x help
-
-# Create a VM
-./x create --publish 2222:22
-
-# Start a VM
-./x start 0
-
-# Stop a VM
-./x shutdown 0
-
-# Check status
-./x status 0
-
-# Delete a VM
-./x delete 0
+./x help # Show available VM commands
+./x vm:create --publish 2222:22 # Create a VM
+./x vm:start 0 # Start a VM
+./x vm:shutdown 0 # Stop a VM
+./x vm:status 0 # Check the VM status
+./x vm:logs 0 # Print retained serial output and follow new output
+./x vm:delete 0 # Delete a VM
 ```
 
-New VMs use the daemon provisioning default of 256 MiB. Memory is not selected per create request.
+The daemon gives each new VM the default memory size of 256 MiB. The `vm:create` command has no
+memory option.
 
 ## CLI helpers
 
 ```sh
-# Inspect the current state
-./x ps
-./x show 0
-
-# Open SSH using the VM's default key
-./x ssh 0
-
-# Use a custom key if you passed --authorized-key-file on create
-./x ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release"
-
-# Help for a specific command
-./x help create
+./x vm:ps
+./x vm:show 0 # Show the current VM state
+./x vm:ssh 0 # Open SSH with the VM's default key
+./x vm:logs 0 --pull # Print the stored serial output and exit
+./x vm:logs 0 --attach # Use the full form of the default follow mode
+./x vm:ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use the private key that matches --authorized-key-file
+./x help vm:create # Help for a specific command
 ```
 
-If you use the provided Nix shell, `x` is also available in `PATH`:
+When you use the Nix shell, `x` is also in `PATH`:
 
 ```bash
 nix develop --command x help
@@ -104,68 +91,84 @@ nix develop --command x help
 
 ## Examples
 
-Run these from the repository root inside the Linux/Lima guest. Keep
-`./x run_daemon` running in another Linux/Lima terminal.
+Run these commands from the repository root in the Linux/Lima VM. Run `./x daemon:run` in another
+Linux/Lima terminal.
+
+### OCI image lifecycle
+
+The OCI store uses the image name and tag as its key. This example pulls Alpine and starts its
+single VM. It then stops the VM and keeps the image. Finally, it removes the stopped lifecycle and
+its artifacts:
+
+```sh
+./x oci:pull alpine:latest
+./x oci:run alpine:latest
+./x oci:stop alpine:latest
+./x oci:rm alpine:latest
+```
+
+You can use `oci:run` when the image is not in the store. The command pulls the image automatically.
+Stop the VM before you use `oci:rm`.
 
 ### SQLite
 
 ```sh
-VM_ID=$(./x create | jq -r .id)
+VM_ID=$(./x vm:create | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "apt-get update &&
+./x vm:ssh "$VM_ID" -- "apt-get update &&
    apt-get install -y sqlite3 &&
    sqlite3 /root/example.db 'CREATE TABLE messages (body TEXT);' &&
    sqlite3 /root/example.db \"INSERT INTO messages VALUES ('hello');\" &&
    sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-./x ssh "$VM_ID" -- sync
-./x shutdown "$VM_ID"
+./x vm:ssh "$VM_ID" -- sync
+./x vm:shutdown "$VM_ID"
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "sqlite3 /root/example.db 'SELECT * FROM messages;'"
+./x vm:ssh "$VM_ID" -- "sqlite3 /root/example.db 'SELECT * FROM messages;'"
 
-./x shutdown "$VM_ID"
+./x vm:shutdown "$VM_ID"
 
-./x delete "$VM_ID"
+./x vm:delete "$VM_ID"
 ```
 
 ### HTTP
 
 ```sh
-VM_ID=$(./x create --publish 8080:80 | jq -r .id)
+VM_ID=$(./x vm:create --publish 8080:80 | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "mkdir -p /srv/hello &&
+./x vm:ssh "$VM_ID" -- "mkdir -p /srv/hello &&
    echo '<h1>Hello from a microVM</h1>' > /srv/hello/index.html &&
    python3 -m http.server 80 --directory /srv/hello"
 ```
 
-From another terminal inside the same Linux/Lima guest:
+Run this command in another terminal in the same Linux/Lima VM:
 
 ```sh
 HOST_IP=$(ip -j route get 1.1.1.1 | jq -r '.[0].prefsrc')
 curl --fail "http://$HOST_IP:8080"
 ```
 
-Press `Ctrl-C` in the HTTP server terminal, then run:
+Press `Ctrl-C` in the HTTP server terminal. Then run:
 
 ```sh
-./x shutdown "$VM_ID"
-./x delete "$VM_ID"
+./x vm:shutdown "$VM_ID"
+./x vm:delete "$VM_ID"
 ```
 
 ### PostgreSQL
 
 ```sh
-VM_ID=$(./x create --publish 5432:5432 | jq -r .id)
+VM_ID=$(./x vm:create --publish 5432:5432 | jq -r .id)
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "export DEBIAN_FRONTEND=noninteractive &&
+./x vm:ssh "$VM_ID" -- "export DEBIAN_FRONTEND=noninteractive &&
    apt-get update &&
    apt-get install -y postgresql &&
    sed -i \"s/^#listen_addresses = 'localhost'/listen_addresses = '*'/\" \
@@ -186,11 +189,11 @@ env PGPASSWORD=postgres \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-./x shutdown "$VM_ID"
+./x vm:shutdown "$VM_ID"
 
-./x start "$VM_ID"
+./x vm:start "$VM_ID"
 
-./x ssh "$VM_ID" -- "service postgresql start"
+./x vm:ssh "$VM_ID" -- "service postgresql start"
 
 env PGPASSWORD=postgres \
   psql --host "$HOST_IP" --port 5432 \
@@ -198,6 +201,6 @@ env PGPASSWORD=postgres \
     --tuples-only --no-align \
     --command 'SELECT body FROM messages;'
 
-./x shutdown "$VM_ID"
-./x delete "$VM_ID"
+./x vm:shutdown "$VM_ID"
+./x vm:delete "$VM_ID"
 ```

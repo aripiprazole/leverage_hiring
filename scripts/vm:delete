@@ -7,9 +7,9 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x show <vm_id>
+Usage: x vm:delete <vm_id>
 
-Show full details for one VM.
+Delete one VM.
 EOF
 }
 
@@ -27,7 +27,6 @@ case "$1" in
         if (($# != 1)); then
             usage_error "unexpected extra argument: $2"
         fi
-        api_request GET "/vms/$vm_id"
+        api_request DELETE "/vms/$vm_id"
         ;;
 esac
-

@@ -18,8 +18,6 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("no VM IDs remain")]
     IdsExhausted,
-    #[error("socket directory")]
-    SocketDirectory,
     #[error("stale VM creation directory")]
     CreatingDirectory,
     #[error("storage operation failed for {path}: {source}")]
@@ -32,7 +30,7 @@ pub enum StorageError {
     InvalidConfig { path: PathBuf, message: String },
     #[cfg(target_os = "linux")]
     #[error(transparent)]
-    SshAccess(#[from] SshAccessError),
+    RootfsProvision(#[from] RootfsProvisionError),
 }
 
 #[cfg(target_os = "linux")]
@@ -47,31 +45,62 @@ impl StorageError {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::fs;
+    use std::{fs, io};
 
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
-    use barbirolli::{Port, PortBinding};
+    use barbirolli::{ApiSocket, Port, PortBinding, Rootfs};
     use barbirolli_derive::firecracker_test;
     use serde_json::json;
 
     use barbirolli::support::{firecracker::FirecrackerFixture, ssh::SshKeyFixture};
 
+    use super::RootfsProvisionError;
     use crate::ProvisioningConfig;
 
+    fn read_entrypoint(rootfs: &Rootfs) -> Result<Option<Vec<u8>>, RootfsProvisionError> {
+        rootfs.provision(|builder| match builder.read("barbirolli_entrypoint") {
+            Ok(contents) => Ok(Some(contents)),
+            Err(RootfsProvisionError::Operation { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        })
+    }
+
     #[firecracker_test]
-    async fn authorized_key_allows_an_ssh_connection_to_the_vm() {
+    async fn daemon_installs_the_entrypoint_and_authorized_key_before_boot() {
         let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        assert_eq!(
+            read_entrypoint(&fixture.source_rootfs()).expect("failed to inspect source rootfs"),
+            None,
+            "the input rootfs must not already contain the daemon-owned entrypoint"
+        );
         let key = SshKeyFixture::generate().await;
         let vm = fixture
             .create_vm(TestVmConfig::new(1).authorized_key(key.public_key.clone()))
             .await;
+        assert_eq!(
+            read_entrypoint(&Rootfs::from(vm.storage.rootfs()))
+                .expect("failed to inspect private rootfs"),
+            Some(fs::read(&fixture.entrypoint).expect("failed to read daemon entrypoint")),
+            "Barbirolli must install the entrypoint into the copied input rootfs"
+        );
         vm.lifecycle.start(|_| {}).await;
 
         vm.ssh
             .with_private_key(key.private_key.clone())
-            .command("printf barbirolli-ssh", |output| {
-                assert_eq!(output.stdout, "barbirolli-ssh");
-            })
+            .command(
+                "printf 'barbirolli-ssh\\n'; readlink /proc/1/exe; \
+                 set -- $(cat /proc/1/task/1/children); readlink /proc/$1/exe",
+                |output| {
+                    assert_eq!(
+                        output.stdout,
+                        "barbirolli-ssh\n/barbirolli_entrypoint\n/usr/sbin/sshd\n"
+                    );
+                },
+            )
             .await;
 
         fixture.finish().await;
@@ -87,6 +116,11 @@ mod tests {
         assert!(!alice.spec.deleted);
         assert_eq!(alice.spec.artifact_dir, fixture.storage.vm_root.join("0"));
         assert_eq!(
+            alice.spec.api_socket,
+            ApiSocket::from(alice.storage.artifact_dir.join("firecracker.socket"))
+        );
+        assert!(!fixture.storage.vm_root.join(".sockets").exists());
+        assert_eq!(
             fs::read(alice.storage.kernel()).expect("failed to read copied kernel"),
             b"kernel"
         );
@@ -94,9 +128,35 @@ mod tests {
             fs::read(alice.storage.rootfs()).expect("failed to read copied rootfs"),
             b"rootfs"
         );
+        assert_eq!(
+            fs::read(alice.storage.serial_log()).expect("failed to read serial log"),
+            b""
+        );
         assert!(
             !alice.storage.authorized_keys().exists(),
             "authorized keys must not be copied beside VM artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_copies_the_rootfs_from_vm_input() {
+        let fixture = BehaviorFixture::new();
+        let selected_rootfs = fixture.temporary.path().join("selected-rootfs.ext4");
+        fs::write(&selected_rootfs, b"selected rootfs").expect("failed to create selected rootfs");
+        let store = fixture.storage.open();
+
+        let creation = store
+            .create(
+                TestVmConfig::new(1).into_input(Rootfs::from(selected_rootfs)),
+                ProvisioningConfig::default().default_vm_mem,
+            )
+            .await
+            .expect("failed to create stored VM");
+        let spec = creation.finish().expect("failed to persist stored VM");
+
+        assert_eq!(
+            fs::read(spec.rootfs.as_ref()).expect("failed to read copied rootfs"),
+            b"selected rootfs"
         );
     }
 
@@ -148,12 +208,25 @@ mod tests {
             .expect("Alice's persisted VM was not discovered");
         assert!(!reopened_alice.spec.deleted);
         assert_eq!(reopened_alice.spec.api_socket, alice.spec.api_socket);
+        assert_eq!(
+            reopened_alice.spec.api_socket,
+            ApiSocket::from(
+                reopened_alice
+                    .storage
+                    .artifact_dir
+                    .join("firecracker.socket")
+            )
+        );
         let reopened_bob = discovered
             .iter()
             .find(|vm| vm.spec.id == bob.spec.id)
             .expect("Bob's persisted VM was not discovered");
         assert!(!reopened_bob.spec.deleted);
         assert_eq!(reopened_bob.spec.api_socket, bob.spec.api_socket);
+        assert_eq!(
+            reopened_bob.spec.api_socket,
+            ApiSocket::from(reopened_bob.storage.artifact_dir.join("firecracker.socket"))
+        );
         assert_eq!(
             reopened_bob.spec.bindings,
             vec![PortBinding {

@@ -33,6 +33,11 @@ impl VmStorageFixture {
     }
 
     #[must_use]
+    pub fn serial_log(&self) -> PathBuf {
+        self.artifact_dir.join("serial.log")
+    }
+
+    #[must_use]
     pub fn authorized_keys(&self) -> PathBuf {
         self.artifact_dir.join("authorized_keys")
     }

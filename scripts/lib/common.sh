@@ -20,13 +20,18 @@ IMAGE_ROOT="$BARBIROLLI_RUNTIME_DIR/images"
 VM_ROOT="$BARBIROLLI_RUNTIME_DIR/vms"
 SSH_DIR="$BARBIROLLI_RUNTIME_DIR/ssh"
 FIRECRACKER="$BARBIROLLI_RUNTIME_DIR/bin/firecracker"
+BARBIROLLI_ENTRYPOINT="$BARBIROLLI_RUNTIME_DIR/bin/barbirolli_entrypoint"
 DEFAULT_AUTHORIZED_KEYS="$SSH_DIR/id_ed25519.pub"
 SSH_PRIVATE_KEY="$SSH_DIR/id_ed25519"
 KERNEL_IMAGE="$IMAGE_ROOT/vmlinux"
-ROOTFS_IMAGE="$IMAGE_ROOT/alpine.ext4"
+ROOTFS_IMAGE="$IMAGE_ROOT/ubuntu-$ROOTFS_VERSION.ext4"
 ROOTFS_SQUASHFS="$DOWNLOAD_DIR/ubuntu-$ROOTFS_VERSION.squashfs"
 ROOTFS_KEY_MARKER="$ROOTFS_IMAGE.authorized_key"
 ROOTFS_RESOLVER_MARKER="$ROOTFS_IMAGE.resolver"
+ROOTFS_LAYOUT_MARKER="$ROOTFS_IMAGE.layout"
+ROOTFS_LAYOUT_VERSION="package-manager-runtime-v4"
+DEFAULT_PROCESS_SPEC="$REPO_ROOT/crates/barbirolli_entrypoint/default-process.json"
+ROOTFS_PROCESS_SPEC_MARKER="$ROOTFS_IMAGE.process.json"
 
 export BARBIROLLI_RUNTIME_DIR
 export CARGO_TARGET_DIR
@@ -34,6 +39,7 @@ export VM_ROOT
 export IMAGE_ROOT
 export DEFAULT_AUTHORIZED_KEYS
 export FIRECRACKER
+export BARBIROLLI_ENTRYPOINT
 export ELHONE_URL
 export ELHONE_ADDR
 export RUST_LOG
@@ -102,19 +108,32 @@ rootfs_resolver_matches() {
         grep -qx 'nameserver 1.1.1.1' "$ROOTFS_RESOLVER_MARKER"
 }
 
+rootfs_layout_matches() {
+    [[ -s "$ROOTFS_LAYOUT_MARKER" ]] &&
+        grep -qx "$ROOTFS_LAYOUT_VERSION" "$ROOTFS_LAYOUT_MARKER"
+}
+
+rootfs_process_spec_matches() {
+    [[ -s "$ROOTFS_PROCESS_SPEC_MARKER" ]] &&
+        cmp -s "$DEFAULT_PROCESS_SPEC" "$ROOTFS_PROCESS_SPEC_MARKER"
+}
+
 runtime_is_prepared() {
     firecracker_is_compatible &&
         [[ -s "$KERNEL_IMAGE" ]] &&
         [[ -s "$ROOTFS_IMAGE" ]] &&
+        [[ -x "$BARBIROLLI_ENTRYPOINT" ]] &&
         [[ -s "$SSH_PRIVATE_KEY" ]] &&
         [[ -s "$DEFAULT_AUTHORIZED_KEYS" ]] &&
         rootfs_key_matches &&
-        rootfs_resolver_matches
+        rootfs_resolver_matches &&
+        rootfs_layout_matches &&
+        rootfs_process_spec_matches
 }
 
 require_runtime_artifacts() {
     runtime_is_prepared ||
-        die "runtime artifacts are missing or invalid; run x setup_daemon first"
+        die "runtime artifacts are missing or invalid; run x daemon:setup first"
 }
 
 validate_integer() {

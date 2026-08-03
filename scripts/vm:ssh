@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x ssh [--identity <path>] <vm_id> [-- command...]
+Usage: x vm:ssh [--identity <path>] <vm_id> [-- command...]
 
 Open an SSH session into a running VM.
 
@@ -16,8 +16,8 @@ Options:
   --help, -h         Show this help message.
 
 Examples:
-  x ssh 0
-  x ssh --identity ~/.ssh/personal.pem 0 -- ls -l
+  x vm:ssh 0
+  x vm:ssh --identity ~/.ssh/personal.pem 0 -- ls -l
 EOF
 }
 
@@ -68,7 +68,7 @@ summary="$(api_request GET "/vms/$vm_id")"
 
 status="$(jq -er '.status' <<<"$summary" | tr '[:upper:]' '[:lower:]')"
 if [[ "$status" != "running" ]]; then
-    die "VM $vm_id is not running (status: $status). Run: x start $vm_id"
+    die "VM $vm_id is not running (status: $status). Run: x vm:start $vm_id"
 fi
 
 guest_ip="$(jq -er '.network.guest_ip' <<<"$summary")"

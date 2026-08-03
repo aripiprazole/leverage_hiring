@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, VmId, VmStore, VmSummary};
+use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, Rootfs, VmId, VmStore, VmSummary};
 use futures::future::try_join_all;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -11,12 +11,13 @@ use super::{
 };
 
 pub struct FirecrackerFixture {
-    manager: Barbirolli,
-    temporary: TempDir,
-    vm_root: PathBuf,
-    image_root: PathBuf,
-    firecracker: PathBuf,
-    ssh_private_key: PathBuf,
+    pub manager: Barbirolli,
+    pub temp: TempDir,
+    pub vm_root: PathBuf,
+    pub image_root: PathBuf,
+    pub firecracker: PathBuf,
+    pub entrypoint: PathBuf,
+    pub ssh_private_key: PathBuf,
 }
 
 #[derive(Clone)]
@@ -31,15 +32,18 @@ pub struct FirecrackerVmFixture {
 
 impl FirecrackerFixture {
     pub async fn new(provisioning: ProvisioningConfig) -> Self {
-        let temporary = tempfile::Builder::new()
+        let temp = tempfile::Builder::new()
             .prefix("barbirolli-firecracker-")
             .tempdir_in("/var/tmp")
             .expect("failed to create temporary storage");
-        let vm_root = temporary.path().join("vms");
+        let vm_root = temp.path().join("vms");
         let image_root =
             PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
         let firecracker =
             PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
+        let entrypoint = PathBuf::from(
+            std::env::var_os("BARBIROLLI_ENTRYPOINT").expect("BARBIROLLI_ENTRYPOINT is required"),
+        );
         let ssh_private_key = std::env::var_os("SSH_PRIVATE_KEY").map_or_else(
             || {
                 image_root
@@ -56,6 +60,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning,
                 firecracker: firecracker.clone(),
+                entrypoint: entrypoint.clone(),
                 idle_policy: None,
             },
         )
@@ -64,10 +69,11 @@ impl FirecrackerFixture {
 
         Self {
             manager,
-            temporary,
+            temp,
             vm_root,
             image_root,
             firecracker,
+            entrypoint,
             ssh_private_key,
         }
     }
@@ -78,11 +84,19 @@ impl FirecrackerFixture {
             .expect("failed to create fixture VM")
     }
 
+    #[must_use]
+    pub fn source_rootfs(&self) -> Rootfs {
+        Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"))
+    }
+
     pub async fn try_create_vm(
         &self,
         config: TestVmConfig,
     ) -> Result<FirecrackerVmFixture, barbirolli::LifecycleError> {
-        let id = self.manager.create(config.into_input()).await?;
+        let id = self
+            .manager
+            .create(config.into_input(Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"))))
+            .await?;
         Ok(self.vm(id))
     }
 
@@ -92,12 +106,14 @@ impl FirecrackerFixture {
         inspect: impl FnOnce(&[FirecrackerVmFixture; N]),
     ) -> [FirecrackerVmFixture; N] {
         let barrier = Arc::new(Barrier::new(N.max(1)));
+        let rootfs = Rootfs::from(self.image_root.join("ubuntu-24.04.ext4"));
         let ids = try_join_all(configs.map(|config| {
             let manager = self.manager.clone();
             let barrier = barrier.clone();
+            let rootfs = rootfs.clone();
             async move {
                 barrier.wait().await;
-                manager.create(config.into_input()).await
+                manager.create(config.into_input(rootfs)).await
             }
         }))
         .await
@@ -161,6 +177,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning: ProvisioningConfig::default(),
                 firecracker: self.firecracker.clone(),
+                entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },
         )

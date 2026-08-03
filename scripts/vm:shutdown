@@ -7,15 +7,14 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-Usage: x ps
+Usage: x vm:shutdown <vm_id>
 
-List all existing VM summaries.
+Shutdown one VM.
 EOF
 }
 
 if (($# == 0)); then
-    api_request GET "/vms"
-    exit 0
+    usage_error "missing VM_ID"
 fi
 
 case "$1" in
@@ -24,6 +23,10 @@ case "$1" in
         exit 0
         ;;
     *)
-        usage_error "unexpected argument: $1"
+        vm_id="$(require_vm_id "$1")"
+        if (($# != 1)); then
+            usage_error "unexpected extra argument: $2"
+        fi
+        api_request POST "/vms/$vm_id/shutdown"
         ;;
 esac

@@ -4,7 +4,9 @@ use super::{
 
 use std::{
     fmt::Debug,
-    path::PathBuf,
+    fs::{Permissions, read},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,7 +32,8 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    DaemonConfig, MemoryMib, ProvisioningConfig, VmId, VmInput, VmSpec, VmStore,
+    AuthorizedKey, DaemonConfig, MemoryMib, ProvisioningConfig, Rootfs, StorageError, VmId,
+    VmInput, VmSpec, VmStore,
     idle::{IdleDecision, IdlePolicy, Monitor, Observation},
     io_error,
     vm::managed::{LifecycleError as ManagedLifecycleError, ManagedVm},
@@ -55,6 +58,7 @@ pub struct BarbirolliInner {
     pub provisioning: ProvisioningConfig,
     pub store: VmStore,
     pub firecracker: Firecracker,
+    pub entrypoint: PathBuf,
     pub shutdown_timeout: Duration,
     pub draining: AtomicBool,
     pub idle_policy: IdlePolicy,
@@ -73,7 +77,7 @@ impl Barbirolli {
     /// cannot be loaded, or one or more VMs fail warmup reconciliation.
     #[tracing::instrument]
     pub async fn new(store: VmStore, config: DaemonConfig) -> Result<Self, LifecycleError> {
-        tracing::info!("initializing barbirolli");
+        tracing::info!("barbirolli starts initialization");
         let firecracker = Firecracker::new(config.firecracker).await?;
         let specs = store.all()?;
         let barbirolli = Self(Arc::new(BarbirolliInner {
@@ -84,6 +88,7 @@ impl Barbirolli {
             },
             provisioning: config.provisioning,
             store,
+            entrypoint: config.entrypoint,
             shutdown_timeout: Duration::from_secs(10),
             draining: AtomicBool::new(false),
             idle_policy: config.idle_policy.unwrap_or_default(),
@@ -91,7 +96,7 @@ impl Barbirolli {
         match reconcile(&barbirolli, specs).await {
             Validated::Fail(errors) => Err(LifecycleError::Warmup(Validated::Fail(errors))),
             Validated::Good(()) => {
-                tracing::info!("barbirolli ready");
+                tracing::info!("barbirolli is ready");
                 Ok(barbirolli)
             }
         }
@@ -119,7 +124,9 @@ impl Barbirolli {
 
     /// Prune resources at the host machine by stopping idle vms, and by
     /// removing idle vms it does free resources to be allocated to used vms
+    #[tracing::instrument]
     pub async fn autoscale(&self) {
+        tracing::info!("barbirolli starts autoscale");
         let mut interval = interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         while self.is_app_alive().is_ok() {
@@ -138,7 +145,27 @@ impl Barbirolli {
     /// Returns an error if the manager is draining, capacity is exhausted, or
     /// the VM artifacts cannot be created.
     #[tracing::instrument(skip(self, input), err)]
-    pub async fn create(&self, input: VmInput) -> Result<VmId, LifecycleError> {
+    pub async fn create(&self, input: VmInput) -> Result<VmId> {
+        self.create_with_rootfs_provisioning(input, Rootfs::provision_rootfs)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_for_behavior_test(&self, input: VmInput) -> Result<VmId> {
+        self.create_with_rootfs_provisioning(input, |_, _, _, _| Ok(()))
+            .await
+    }
+
+    async fn create_with_rootfs_provisioning(
+        &self,
+        input: VmInput,
+        provision_rootfs: impl FnOnce(
+            &Rootfs,
+            &Path,
+            &[AuthorizedKey],
+            bool,
+        ) -> Result<(), StorageError>,
+    ) -> Result<VmId> {
         self.is_app_alive()?;
         let running_vms = self
             .vms
@@ -156,16 +183,25 @@ impl Barbirolli {
                 max_running_vms: self.provisioning.count,
             });
         }
-        let spec = self
+        let authorized_keys = input.authorized_keys.clone();
+        let provision_ssh_keys = input.provision_ssh_keys;
+        let creation = self
             .store
             .create(input, self.provisioning.default_vm_mem)
             .await?;
+        provision_rootfs(
+            &creation.rootfs,
+            &self.entrypoint,
+            &authorized_keys,
+            provision_ssh_keys,
+        )?;
+        let spec = creation.finish()?;
         let id = spec.id;
         self.vms.insert(id, BarbirolliVm::Discovered(spec));
         tracing::info!(
             vm_id = %id,
             status = "discovered",
-            "VM state transition"
+            "barbirolli changed the VM state"
         );
         Ok(id)
     }
@@ -194,14 +230,14 @@ impl Barbirolli {
         let Entry::Occupied(mut vm) = self.vms.entry(vm_id) else {
             return Err(LifecycleError::NotFound(vm_id));
         };
-        tracing::info!(status = "deleting", "VM state transition");
+        tracing::info!(status = "deleting", "barbirolli changed the VM state");
         let () = {
             let vm = vm.get_mut();
             vm.shutdown(self).await?;
             self.store.delete(vm.spec())?;
         };
         vm.remove();
-        tracing::info!(status = "deleted", "VM state transition");
+        tracing::info!(status = "deleted", "barbirolli changed the VM state");
         Ok(())
     }
 
@@ -212,11 +248,11 @@ impl Barbirolli {
     /// Returns an aggregate error when one or more VMs fail to shut down.
     #[tracing::instrument(skip(self), fields(vm_count = self.vms.len()), err)]
     pub async fn shutdown(&self) -> Result<(), LifecycleError> {
-        tracing::info!("draining barbirolli");
+        tracing::info!("barbirolli starts shutdown");
         self.draining.store(true, Ordering::Release);
         let mut errors = vec![];
         for mut vm in self.vms.iter_mut() {
-            tracing::info!(id = ?vm.key(), "shutting down");
+            tracing::info!(id = ?vm.key(), "barbirolli stops the VM");
             if let Err(err) = vm.value_mut().shutdown(self).await {
                 errors.push(Box::new(err));
             }
@@ -224,7 +260,7 @@ impl Barbirolli {
         if let Some(errors) = NEVec::try_from_vec(errors) {
             return Err(LifecycleError::Shutdown(Validated::Fail(errors)));
         }
-        tracing::info!("barbirolli shutdown complete");
+        tracing::info!("barbirolli stopped");
         Ok(())
     }
 
@@ -235,6 +271,50 @@ impl Barbirolli {
             Ok(())
         }
     }
+}
+
+impl Rootfs {
+    fn provision_rootfs(
+        &self,
+        entrypoint: &Path,
+        authorized_keys: &[AuthorizedKey],
+        provision_ssh_keys: bool,
+    ) -> Result<(), StorageError> {
+        let entrypoint_contents = read(entrypoint).map_err(|source| StorageError::Io {
+            path: entrypoint.to_owned(),
+            source,
+        })?;
+        self.provision(|builder| {
+            builder.write(
+                "barbirolli_entrypoint",
+                entrypoint_contents,
+                Permissions::from_mode(0o755),
+            )?;
+            if !authorized_keys.is_empty() && provision_ssh_keys {
+                builder.create_folder("root/.ssh", Permissions::from_mode(0o700))?;
+                builder.write(
+                    "root/.ssh/authorized_keys",
+                    authorized_keys_into_bytes(authorized_keys),
+                    Permissions::from_mode(0o600),
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(StorageError::from)
+    }
+}
+
+fn authorized_keys_into_bytes(authorized_keys: &[AuthorizedKey]) -> Vec<u8> {
+    let capacity = authorized_keys
+        .iter()
+        .map(|authorized_key| authorized_key.as_ref().len() + 1)
+        .sum();
+    let mut contents = Vec::with_capacity(capacity);
+    for authorized_key in authorized_keys {
+        contents.extend_from_slice(authorized_key.as_ref().as_bytes());
+        contents.push(b'\n');
+    }
+    contents
 }
 
 async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(), WarmupFailure> {
@@ -257,7 +337,10 @@ async fn reconcile(barbirolli: &Barbirolli, specs: Vec<VmSpec>) -> Validated<(),
     if let Some(errors) = NEVec::try_from_vec(errors) {
         Validated::Fail(errors)
     } else {
-        tracing::info!(vm_count = barbirolli.vms.len(), "reconciliation done");
+        tracing::info!(
+            vm_count = barbirolli.vms.len(),
+            "barbirolli reconciled the VMs"
+        );
         Validated::Good(())
     }
 }
@@ -376,17 +459,17 @@ impl BarbirolliVm {
         let sample = match managed.activity_sample() {
             Ok(sample) => sample,
             Err(error) => {
-                tracing::debug!(%error, "idle sample unavailable");
+                tracing::debug!(%error, "the idle sample is not available");
                 return None;
             }
         };
         let Ok(mut monitor) = managed.monitor.lock() else {
-            tracing::error!("VM monitor lock was poisoned");
+            tracing::error!("the VM monitor lock is poisoned");
             return None;
         };
         let Some(monitor) = monitor.as_mut() else {
             *monitor = Some(Monitor::new(sample, policy));
-            tracing::debug!("idle baseline established");
+            tracing::debug!("barbirolli set the idle baseline");
             return None;
         };
         Some(monitor.observation(sample, policy))
@@ -417,12 +500,12 @@ impl BarbirolliVm {
                     established_tcp_connections = sample.established_tcp_connections,
                     total_connections = sample.total_connections,
                     cpu_threshold_percent = barbirolli.idle_policy.cpu_threshold_percent(),
-                    "VM idle timer reset"
+                    "activity reset the VM idle timer"
                 ),
                 IdleDecision::Strike(strike) => tracing::info!(
                     strike,
                     idle_for_seconds = sample.sampled_at.duration_since(last_activity).as_secs(),
-                    "VM idle strike"
+                    "the VM idle-strike count increased"
                 ),
                 IdleDecision::Shutdown => {
                     self.final_heartbeat_and_shutdown(sample.instance_pid, barbirolli)
@@ -443,20 +526,22 @@ impl BarbirolliVm {
         let vm_id = self.id();
         async move {
             if !matches!(self, Self::Managed(managed) if managed.pid.as_raw_pid() == expected_pid) {
-                tracing::debug!("VM instance changed before final idle check");
+                tracing::debug!("the VM instance changed before the final idle check");
                 return;
             }
             let Some(observation) = self.observation(barbirolli.idle_policy) else {
-                tracing::warn!("final idle observation failed. postponing shutdown");
+                tracing::warn!(
+                    "barbirolli did not start VM shutdown because the final idle observation failed"
+                );
                 return;
             };
             if observation.decision != IdleDecision::Shutdown {
-                tracing::info!("final idle check observed activity");
+                tracing::info!("the final idle check found VM activity");
                 return;
             }
-            tracing::info!("VM remained idle. beginning automatic shutdown");
+            tracing::info!("barbirolli starts automatic VM shutdown because the VM remained idle");
             if let Err(error) = self.shutdown(barbirolli).await {
-                tracing::error!(%error, "automatic VM shutdown failed");
+                tracing::error!(%error, "the automatic VM shutdown failed");
             }
         }
         .instrument(info_span!(
@@ -487,10 +572,10 @@ impl BarbirolliVm {
                 }
                 BarbirolliVm::Managed(_) => return Ok(()),
             };
-            tracing::info!(status = "starting", "VM state transition");
+            tracing::info!(status = "starting", "barbirolli changed the VM state");
             match ManagedVm::start(spec.clone(), barbirolli).await {
                 Ok(managed) => {
-                    tracing::info!(status = "running", "VM state transition");
+                    tracing::info!(status = "running", "barbirolli changed the VM state");
                     *self = BarbirolliVm::Managed(managed);
                     Ok(())
                 }
@@ -498,7 +583,7 @@ impl BarbirolliVm {
                     tracing::error!(
                         status = "failed",
                         %error,
-                        "VM startup failed"
+                        "the VM startup failed"
                     );
                     *self = BarbirolliVm::Failed(spec);
                     Err(error.into())
@@ -521,19 +606,22 @@ impl BarbirolliVm {
                     Ok(())
                 }
                 Self::Managed(managed) => {
-                    tracing::info!(status = "shutting_down", "VM state transition");
+                    tracing::info!(status = "shutting_down", "barbirolli changed the VM state");
                     let shutdown = managed.shutdown(barbirolli.shutdown_timeout).await;
                     let cleanup = managed.cleanup().await;
                     match (shutdown, cleanup) {
                         (Ok(()), Ok(())) => {
                             let spec = managed.spec.clone();
-                            tracing::info!(status = "discovered", "VM state transition");
+                            tracing::info!(
+                                status = "discovered",
+                                "barbirolli changed the VM state"
+                            );
                             *self = Self::Discovered(spec);
                             Ok(())
                         }
                         (shutdown, cleanup) => {
                             managed.failed = true;
-                            tracing::error!(status = "failed", "VM shutdown failed");
+                            tracing::error!(status = "failed", "the VM shutdown failed");
                             Err(ManagedLifecycleError::ShutdownCleanup {
                                 shutdown: shutdown.err().map(Box::new),
                                 cleanup: cleanup.err().map(Box::new),
@@ -590,7 +678,7 @@ impl Firecracker {
             tracing::debug!(
                 path = %firecracker.display(),
                 %version,
-                "verified Firecracker executable"
+                "barbirolli verified the Firecracker executable"
             );
             Ok(Firecracker {
                 bin: firecracker,

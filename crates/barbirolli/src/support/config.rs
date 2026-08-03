@@ -1,4 +1,4 @@
-use barbirolli::{AuthorizedKey, Port, PortBinding, VcpuCount, VmInput};
+use barbirolli::{AuthorizedKey, Port, PortBinding, Rootfs, VcpuCount, VmInput};
 
 pub struct TestVmConfig {
     vcpu_count: u8,
@@ -32,8 +32,10 @@ impl TestVmConfig {
     }
 
     #[must_use]
-    pub fn into_input(self) -> VmInput {
+    pub fn into_input(self, rootfs: Rootfs) -> VmInput {
         VmInput {
+            rootfs,
+            provision_ssh_keys: true,
             vcpu_count: VcpuCount::try_from(self.vcpu_count).expect("valid vCPU count"),
             authorized_keys: self.authorized_keys,
             bindings: self.bindings,

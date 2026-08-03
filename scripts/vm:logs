@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: x vm:logs <vm_id> [-a|--attach|-p|--pull]
+
+Read a VM's retained serial output.
+
+Options:
+  -a, --attach  Print retained output and follow new output until interrupted.
+  -p, --pull    Print the current retained output and exit.
+  --help, -h    Show this help message.
+
+With no mode flag, vm:logs attaches.
+EOF
+}
+
+vm_id=""
+mode=""
+while (($# > 0)); do
+    case "$1" in
+        -a | --attach)
+            [[ -z "$mode" ]] || usage_error "log modes are mutually exclusive"
+            mode="attach"
+            shift
+            ;;
+        -p | --pull)
+            [[ -z "$mode" ]] || usage_error "log modes are mutually exclusive"
+            mode="pull"
+            shift
+            ;;
+        --help | -h | help)
+            usage
+            exit 0
+            ;;
+        *)
+            if [[ -z "$vm_id" ]]; then
+                vm_id="$(require_vm_id "$1")"
+                shift
+                continue
+            fi
+            usage_error "unexpected argument: $1"
+            ;;
+    esac
+done
+
+[[ -n "$vm_id" ]] || usage_error "missing VM_ID"
+[[ -n "$mode" ]] || mode="attach"
+
+require_commands curl
+
+url="${ELHONE_URL%/}/vms/$vm_id/logs"
+curl_options=(
+    --fail-with-body
+    --silent
+    --show-error
+    --header 'Accept: application/octet-stream'
+)
+
+if [[ "$mode" == "attach" ]]; then
+    exec curl "${curl_options[@]}" --no-buffer "$url?follow=true"
+fi
+
+exec curl "${curl_options[@]}" "$url?follow=false"
