@@ -1,37 +1,55 @@
 use std::{
-    ffi::{CStr, CString},
-    fs, io,
-    mem::MaybeUninit,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, process::CommandExt as _, process::ExitStatusExt as _},
-    },
+    env, fs, io,
+    os::unix::process::CommandExt as _,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
-    ptr,
 };
 
+use nix::{
+    errno::Errno,
+    mount::{MsFlags, mount},
+    sys::{
+        prctl::set_no_new_privs,
+        reboot::{RebootMode, reboot},
+        resource::{Resource, setrlimit},
+        signal::{SigSet, SigmaskHow, Signal, killpg},
+        stat::{Mode, umask},
+    },
+    unistd::{Gid, Pid, Uid, chdir, setgroups, setpgid, setresgid, setresuid, sync},
+};
 use oci_spec::runtime::PosixRlimitType;
 
-use crate::{EntrypointError, ProcessSpec, Result};
+use crate::{
+    EntrypointError, ProcessSpec, RUN_PROCESS_SIGNAL_MASK_ENV, RUN_PROCESS_SPEC_ENV, Result,
+};
 
-const SUPERVISED_SIGNALS: [libc::c_int; 7] = [
-    libc::SIGCHLD,
-    libc::SIGTERM,
-    libc::SIGINT,
-    libc::SIGHUP,
-    libc::SIGQUIT,
-    libc::SIGUSR1,
-    libc::SIGUSR2,
+const SUPERVISED_SIGNALS: [Signal; 7] = [
+    Signal::SIGCHLD,
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGHUP,
+    Signal::SIGQUIT,
+    Signal::SIGUSR1,
+    Signal::SIGUSR2,
 ];
+const SUPERVISED_SIGNAL_BITS: u8 = 0b0111_1111;
+
+macro_rules! configure {
+    ($operation:literal, $result:expr $(,)?) => {
+        $result.map_err(|source| EntrypointError::ConfigureProcess {
+            operation: $operation,
+            source,
+        })
+    };
+}
 
 struct MountSpec {
-    source: &'static CStr,
-    filesystem: &'static CStr,
+    source: &'static str,
+    filesystem: &'static str,
     filesystem_name: &'static str,
     target: Target,
-    flags: libc::c_ulong,
-    data: Option<&'static CStr>,
+    flags: MsFlags,
+    data: Option<&'static str>,
 }
 
 impl MountSpec {
@@ -45,90 +63,96 @@ impl MountSpec {
             return Ok(());
         }
 
-        let target = CString::new(target.as_os_str().as_bytes())
-            .expect("static mountpoint paths cannot contain NUL bytes");
-        let data = self
-            .data
-            .map_or(ptr::null(), |options| options.as_ptr().cast());
-
-        // SAFETY: every pointer is backed by a live C string for the duration of
-        // the call, and `data` is either null or a live filesystem option string.
-        let result = unsafe {
-            libc::mount(
-                self.source.as_ptr(),
-                target.as_ptr(),
-                self.filesystem.as_ptr(),
-                self.flags,
-                data,
-            )
-        };
-        if result == -1 {
-            return Err(EntrypointError::MountFilesystem {
-                filesystem: self.filesystem_name,
-                target: self.target.0,
-                source: io::Error::last_os_error(),
-            });
-        }
-        Ok(())
+        mount(
+            Some(self.source),
+            target,
+            Some(self.filesystem),
+            self.flags,
+            self.data,
+        )
+        .map_err(|source| EntrypointError::MountFilesystem {
+            filesystem: self.filesystem_name,
+            target: self.target.0,
+            source,
+        })
     }
+
+    const PROC: MountSpec = MountSpec {
+        source: "proc",
+        filesystem: "proc",
+        filesystem_name: "proc",
+        target: Target("/proc"),
+        flags: MsFlags::MS_NOSUID
+            .union(MsFlags::MS_NODEV)
+            .union(MsFlags::MS_NOEXEC),
+        data: None,
+    };
+
     const USERSPACE: [MountSpec; 7] = [
+        MountSpec::PROC,
         MountSpec {
-            source: c"proc",
-            filesystem: c"proc",
-            filesystem_name: "proc",
-            target: Target("/proc"),
-            flags: (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
-            data: None,
-        },
-        MountSpec {
-            source: c"sysfs",
-            filesystem: c"sysfs",
+            source: "sysfs",
+            filesystem: "sysfs",
             filesystem_name: "sysfs",
             target: Target("/sys"),
-            flags: (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            flags: MsFlags::MS_NOSUID
+                .union(MsFlags::MS_NODEV)
+                .union(MsFlags::MS_NOEXEC),
             data: None,
         },
         MountSpec {
-            source: c"devtmpfs",
-            filesystem: c"devtmpfs",
+            source: "devtmpfs",
+            filesystem: "devtmpfs",
             filesystem_name: "devtmpfs",
             target: Target("/dev"),
-            flags: libc::MS_NOSUID as libc::c_ulong,
-            data: Some(c"mode=0755"),
+            flags: MsFlags::MS_NOSUID,
+            data: Some("mode=0755"),
         },
         MountSpec {
-            source: c"devpts",
-            filesystem: c"devpts",
+            source: "devpts",
+            filesystem: "devpts",
             filesystem_name: "devpts",
             target: Target("/dev/pts"),
-            flags: (libc::MS_NOSUID | libc::MS_NOEXEC) as libc::c_ulong,
-            data: Some(c"newinstance,ptmxmode=0666,mode=0620,gid=5"),
+            flags: MsFlags::MS_NOSUID.union(MsFlags::MS_NOEXEC),
+            data: Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
         },
         MountSpec {
-            source: c"tmpfs",
-            filesystem: c"tmpfs",
+            source: "tmpfs",
+            filesystem: "tmpfs",
             filesystem_name: "tmpfs",
             target: Target("/dev/shm"),
-            flags: (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-            data: Some(c"mode=1777"),
+            flags: MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV),
+            data: Some("mode=1777"),
         },
         MountSpec {
-            source: c"tmpfs",
-            filesystem: c"tmpfs",
+            source: "tmpfs",
+            filesystem: "tmpfs",
             filesystem_name: "tmpfs",
             target: Target("/run"),
-            flags: (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-            data: Some(c"mode=0755"),
+            flags: MsFlags::MS_NOSUID.union(MsFlags::MS_NODEV),
+            data: Some("mode=0755"),
         },
         MountSpec {
-            source: c"cgroup2",
-            filesystem: c"cgroup2",
+            source: "cgroup2",
+            filesystem: "cgroup2",
             filesystem_name: "cgroup2",
             target: Target("/sys/fs/cgroup"),
-            flags: (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC) as libc::c_ulong,
+            flags: MsFlags::MS_NOSUID
+                .union(MsFlags::MS_NODEV)
+                .union(MsFlags::MS_NOEXEC),
             data: None,
         },
     ];
+}
+
+/// Mounts procfs so [`pid1`] can resolve the current executable before it
+/// relaunches PID 1.
+///
+/// # Errors
+///
+/// Returns an error when `/proc` cannot be created, inspected, or mounted.
+pub fn mount_proc_filesystem() -> Result<()> {
+    MountSpec::PROC.mount()
 }
 
 /// Mounts the filesystems required by the VM userspace.
@@ -161,100 +185,102 @@ impl Target {
     }
 }
 
-#[derive(Debug)]
-struct ChildSettings {
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    additional_gids: Vec<libc::gid_t>,
-    umask: Option<libc::mode_t>,
-    rlimits: Vec<RlimitSetting>,
-    no_new_privileges: bool,
-}
-
-impl ChildSettings {
-    fn configure(&self, original_mask: &libc::sigset_t) -> io::Result<()> {
-        unsafe {
-            let result = libc::pthread_sigmask(libc::SIG_SETMASK, original_mask, ptr::null_mut());
-            if result != 0 {
-                return Err(io::Error::from_raw_os_error(result));
-            }
-
-            bail(libc::setpgid(0, 0))?;
-            for setting in &self.rlimits {
-                let limit = libc::rlimit {
-                    rlim_cur: setting.soft,
-                    rlim_max: setting.hard,
-                };
-                bail(libc::setrlimit(setting.resource, &raw const limit))?;
-            }
-            bail(libc::setgroups(
-                self.additional_gids.len(),
-                self.additional_gids.as_ptr(),
-            ))?;
-            bail(libc::setresgid(self.gid, self.gid, self.gid))?;
-            bail(libc::setresuid(self.uid, self.uid, self.uid))?;
-            if self.no_new_privileges {
-                bail(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
-            }
-            if let Some(mask) = self.umask {
-                libc::umask(mask);
-            }
-            Ok(())
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RlimitSetting {
-    resource: RlimitResource,
-    soft: libc::rlim_t,
-    hard: libc::rlim_t,
-}
-
 pub struct OciChild {
     child: Child,
     signal_mask: SignalMask,
 }
 
 impl OciChild {
-    fn restore_signal_mask(&mut self) -> io::Result<()> {
-        self.signal_mask.restore()
+    fn restore_signal_mask(&mut self) -> Result<()> {
+        self.signal_mask
+            .restore()
+            .map_err(EntrypointError::SignalSupervision)
     }
 
-    /// Waits for the OCI process while forwarding signals and reaping descendants.
+    /// Waits for the OCI process while forwarding signals to its process group.
+    ///
+    /// The outer [`pid1`] supervisor adopts and reaps orphaned descendants.
     ///
     /// # Errors
     ///
-    /// Returns an error when signal supervision cannot be configured, a signal
-    /// cannot be forwarded, or a descendant cannot be reaped.
+    /// Returns an error when a signal cannot be received or forwarded, the OCI
+    /// process cannot be waited on, or the entrypoint signal mask cannot be
+    /// restored.
     pub fn supervise_and_reap(mut self) -> Result<ExitStatus> {
-        let process_group = i32::try_from(self.child.id()).map_err(|_| {
-            EntrypointError::SignalSupervision(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "OCI process ID does not fit in pid_t",
-            ))
-        })?;
-        let result = SignalFd::new(&self.signal_mask)?.supervise(process_group);
-        let restore = self
-            .restore_signal_mask()
-            .map_err(EntrypointError::SignalSupervision);
+        let process_id = self.child.id();
+        let process_group = i32::try_from(process_id)
+            .map(Pid::from_raw)
+            .map_err(|_| EntrypointError::InvalidProcessId(process_id))?;
+        let result = self.supervise(process_group);
+        let restore = self.restore_signal_mask();
 
         match (result, restore) {
             (Ok(exit), Ok(())) => Ok(exit),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
+
+    fn supervise(&mut self, process_group: Pid) -> Result<ExitStatus> {
+        loop {
+            if let Some(exit) = self
+                .child
+                .try_wait()
+                .map_err(EntrypointError::WaitForProcess)?
+            {
+                return Ok(exit);
+            }
+
+            let signal = self.signal_mask.wait()?;
+            if signal == Signal::SIGCHLD {
+                continue;
+            }
+            if let Err(source) = killpg(process_group, signal)
+                && source != Errno::ESRCH
+            {
+                return Err(EntrypointError::ForwardSignal { signal, source });
+            }
+        }
+    }
 }
 
 impl ProcessSpec {
-    /// Spawns the configured OCI process.
+    /// Spawns the configured OCI process through a clean entrypoint re-exec.
+    ///
+    /// The re-exec lets the child apply its `nix` process settings before the
+    /// final `exec` without running Rust code in a `pre_exec` callback.
     ///
     /// # Errors
     ///
-    /// Returns an error when signal supervision cannot be configured or the OCI
-    /// process cannot be spawned.
+    /// Returns an error when signal supervision cannot be configured, the
+    /// current entrypoint executable cannot be located, or the helper process
+    /// cannot be spawned.
     pub fn spawn(self) -> Result<OciChild> {
+        let source_path = self
+            .source_path
+            .as_ref()
+            .ok_or(EntrypointError::InMemoryProcessSpec)?;
+        let program = self.program.clone();
+        let signal_mask = SignalMask::block()?;
+        let entrypoint = env::current_exe().map_err(EntrypointError::CurrentExecutable)?;
+        let child = Command::new(entrypoint)
+            .env(RUN_PROCESS_SPEC_ENV, source_path)
+            .env(
+                RUN_PROCESS_SIGNAL_MASK_ENV,
+                signal_mask.original_bits().to_string(),
+            )
+            .process_group(0)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|source| EntrypointError::SpawnProcess { program, source })?;
+
+        Ok(OciChild { child, signal_mask })
+    }
+
+    fn exec(self, original_signal_mask: u8) -> Result<()> {
         let ProcessSpec {
+            source_path: _,
             program,
             arguments,
             environment,
@@ -262,14 +288,13 @@ impl ProcessSpec {
             uid,
             gid,
             additional_gids,
-            umask,
+            umask: process_umask,
             rlimits,
             no_new_privileges,
         } = self;
         let mut command = Command::new(&program);
         command
             .args(arguments)
-            .current_dir(working_directory)
             .env_clear()
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -278,120 +303,123 @@ impl ProcessSpec {
             command.env(variable.name, variable.value);
         }
 
-        let settings = ChildSettings {
-            uid,
-            gid,
-            additional_gids,
-            umask,
-            rlimits: rlimits
-                .into_iter()
-                .map(|rlimit| RlimitSetting {
-                    resource: rlimit_resource(rlimit.resource),
-                    soft: rlimit.soft as libc::rlim_t,
-                    hard: rlimit.hard as libc::rlim_t,
-                })
-                .collect(),
-            no_new_privileges,
-        };
-
-        let signal_mask = SignalMask::block()?;
-        let child_signal_mask = signal_mask.original();
-        // SAFETY: `configure_child` only makes async-signal-safe syscalls between
-        // `fork` and `exec`, as required by `pre_exec`.
-        unsafe {
-            command.pre_exec(move || settings.configure(&child_signal_mask));
+        restore_process_signal_mask(original_signal_mask)?;
+        configure!("process group", setpgid(Pid::from_raw(0), Pid::from_raw(0)))?;
+        configure!("working directory", chdir(&working_directory))?;
+        for rlimit in rlimits {
+            configure!(
+                "resource limits",
+                setrlimit(rlimit_resource(rlimit.resource), rlimit.soft, rlimit.hard),
+            )?;
         }
-        let child = command
-            .spawn()
-            .map_err(|source| EntrypointError::SpawnProcess { program, source })?;
 
-        Ok(OciChild { child, signal_mask })
+        let additional_gids = additional_gids
+            .into_iter()
+            .map(Gid::from_raw)
+            .collect::<Vec<_>>();
+        configure!("supplementary groups", setgroups(&additional_gids))?;
+        let gid = Gid::from_raw(gid);
+        configure!("group IDs", setresgid(gid, gid, gid))?;
+        let uid = Uid::from_raw(uid);
+        configure!("user IDs", setresuid(uid, uid, uid))?;
+        if no_new_privileges {
+            configure!("no_new_privileges", set_no_new_privs())?;
+        }
+        if let Some(mask) = process_umask {
+            let mask = Mode::from_bits(mask).ok_or(EntrypointError::InvalidProcessRunnerState)?;
+            umask(mask);
+        }
+
+        let source = command.exec();
+        Err(EntrypointError::SpawnProcess { program, source })
     }
 }
 
-fn bail(result: libc::c_int) -> io::Result<()> {
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+/// Runs the OCI process when this entrypoint was relaunched as its safe process
+/// configuration helper.
+///
+/// # Errors
+///
+/// Returns an error when the helper state is invalid, the process specification
+/// cannot be loaded, process settings cannot be applied, or the final `exec`
+/// fails.
+pub fn run_oci_process_if_requested() -> Result<()> {
+    let Some(spec_path) = env::var_os(RUN_PROCESS_SPEC_ENV) else {
+        return Ok(());
+    };
+    let original_signal_mask = env::var(RUN_PROCESS_SIGNAL_MASK_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|mask| mask & !SUPERVISED_SIGNAL_BITS == 0)
+        .ok_or(EntrypointError::InvalidProcessRunnerState)?;
+
+    ProcessSpec::new(spec_path)?.exec(original_signal_mask)
 }
 
-#[cfg(target_env = "gnu")]
-type RlimitResource = libc::__rlimit_resource_t;
-#[cfg(not(target_env = "gnu"))]
-type RlimitResource = libc::c_int;
-
-fn rlimit_resource(resource: PosixRlimitType) -> RlimitResource {
+fn rlimit_resource(resource: PosixRlimitType) -> Resource {
     match resource {
-        PosixRlimitType::RlimitCpu => libc::RLIMIT_CPU,
-        PosixRlimitType::RlimitFsize => libc::RLIMIT_FSIZE,
-        PosixRlimitType::RlimitData => libc::RLIMIT_DATA,
-        PosixRlimitType::RlimitStack => libc::RLIMIT_STACK,
-        PosixRlimitType::RlimitCore => libc::RLIMIT_CORE,
-        PosixRlimitType::RlimitRss => libc::RLIMIT_RSS,
-        PosixRlimitType::RlimitNproc => libc::RLIMIT_NPROC,
-        PosixRlimitType::RlimitNofile => libc::RLIMIT_NOFILE,
-        PosixRlimitType::RlimitMemlock => libc::RLIMIT_MEMLOCK,
-        PosixRlimitType::RlimitAs => libc::RLIMIT_AS,
-        PosixRlimitType::RlimitLocks => libc::RLIMIT_LOCKS,
-        PosixRlimitType::RlimitSigpending => libc::RLIMIT_SIGPENDING,
-        PosixRlimitType::RlimitMsgqueue => libc::RLIMIT_MSGQUEUE,
-        PosixRlimitType::RlimitNice => libc::RLIMIT_NICE,
-        PosixRlimitType::RlimitRtprio => libc::RLIMIT_RTPRIO,
-        PosixRlimitType::RlimitRttime => libc::RLIMIT_RTTIME,
+        PosixRlimitType::RlimitCpu => Resource::RLIMIT_CPU,
+        PosixRlimitType::RlimitFsize => Resource::RLIMIT_FSIZE,
+        PosixRlimitType::RlimitData => Resource::RLIMIT_DATA,
+        PosixRlimitType::RlimitStack => Resource::RLIMIT_STACK,
+        PosixRlimitType::RlimitCore => Resource::RLIMIT_CORE,
+        PosixRlimitType::RlimitRss => Resource::RLIMIT_RSS,
+        PosixRlimitType::RlimitNproc => Resource::RLIMIT_NPROC,
+        PosixRlimitType::RlimitNofile => Resource::RLIMIT_NOFILE,
+        PosixRlimitType::RlimitMemlock => Resource::RLIMIT_MEMLOCK,
+        PosixRlimitType::RlimitAs => Resource::RLIMIT_AS,
+        PosixRlimitType::RlimitLocks => Resource::RLIMIT_LOCKS,
+        PosixRlimitType::RlimitSigpending => Resource::RLIMIT_SIGPENDING,
+        PosixRlimitType::RlimitMsgqueue => Resource::RLIMIT_MSGQUEUE,
+        PosixRlimitType::RlimitNice => Resource::RLIMIT_NICE,
+        PosixRlimitType::RlimitRtprio => Resource::RLIMIT_RTPRIO,
+        PosixRlimitType::RlimitRttime => Resource::RLIMIT_RTTIME,
     }
 }
 
 struct SignalMask {
-    blocked: libc::sigset_t,
-    original: libc::sigset_t,
+    blocked: SigSet,
+    original: SigSet,
     active: bool,
 }
 
 impl SignalMask {
     fn block() -> Result<Self> {
-        unsafe {
-            let mut blocked = MaybeUninit::<libc::sigset_t>::uninit();
-            bail(libc::sigemptyset(blocked.as_mut_ptr()))
-                .map_err(EntrypointError::SignalSupervision)?;
-            let mut blocked = blocked.assume_init();
-            for signal in SUPERVISED_SIGNALS {
-                bail(libc::sigaddset(&raw mut blocked, signal))
-                    .map_err(EntrypointError::SignalSupervision)?;
-            }
+        let blocked = supervised_signal_set();
+        let original = blocked
+            .thread_swap_mask(SigmaskHow::SIG_BLOCK)
+            .map_err(EntrypointError::SignalSupervision)?;
+        Ok(Self {
+            blocked,
+            original,
+            active: true,
+        })
+    }
 
-            let mut original = MaybeUninit::<libc::sigset_t>::uninit();
-            let result =
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, original.as_mut_ptr());
-            if result != 0 {
-                return Err(EntrypointError::SignalSupervision(
-                    io::Error::from_raw_os_error(result),
-                ));
-            }
-
-            Ok(Self {
-                blocked,
-                original: original.assume_init(),
-                active: true,
+    fn original_bits(&self) -> u8 {
+        SUPERVISED_SIGNALS
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (index, signal)| {
+                if self.original.contains(*signal) {
+                    bits | (1 << index)
+                } else {
+                    bits
+                }
             })
-        }
     }
 
-    fn original(&self) -> libc::sigset_t {
-        copy_signal_set(&self.original)
+    fn wait(&self) -> Result<Signal> {
+        self.blocked
+            .wait()
+            .map_err(EntrypointError::SignalSupervision)
     }
 
-    fn restore(&mut self) -> io::Result<()> {
+    fn restore(&mut self) -> nix::Result<()> {
         if !self.active {
             return Ok(());
         }
-        let result = unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.original, ptr::null_mut())
-        };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result));
-        }
+        self.original.thread_set_mask()?;
         self.active = false;
         Ok(())
     }
@@ -399,111 +427,34 @@ impl SignalMask {
 
 impl Drop for SignalMask {
     fn drop(&mut self) {
-        if let Err(err) = self.restore() {
-            eprintln!("barbirolli_entrypoint: signal-mask cleanup failed: {err:?}");
+        if let Err(error) = self.restore() {
+            eprintln!("barbirolli_entrypoint: signal-mask cleanup failed: {error:?}");
         }
     }
 }
 
-fn copy_signal_set(signal_set: &libc::sigset_t) -> libc::sigset_t {
-    // SAFETY: `sigset_t` is a plain C value with no destructor. A bitwise copy
-    // is the representation-preserving operation required by the libc APIs.
-    unsafe { ptr::read(signal_set) }
+fn supervised_signal_set() -> SigSet {
+    SUPERVISED_SIGNALS.into_iter().collect()
 }
 
-struct SignalFd(OwnedFd);
-
-impl SignalFd {
-    fn new(mask: &SignalMask) -> Result<Self> {
-        let fd = unsafe { libc::signalfd(-1, &raw const mask.blocked, libc::SFD_CLOEXEC) };
-        if fd == -1 {
-            return Err(EntrypointError::SignalSupervision(
-                io::Error::last_os_error(),
-            ));
-        }
-        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
-    }
-
-    fn read(&self) -> Result<libc::c_int> {
-        let mut info = MaybeUninit::<libc::signalfd_siginfo>::uninit();
-        loop {
-            let bytes = unsafe {
-                libc::read(
-                    self.0.as_raw_fd(),
-                    info.as_mut_ptr().cast(),
-                    size_of::<libc::signalfd_siginfo>(),
-                )
-            };
-            if bytes == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(EntrypointError::SignalSupervision(error));
-            }
-            if usize::try_from(bytes) == Ok(size_of::<libc::signalfd_siginfo>()) {
-                let signal = libc::c_int::try_from(unsafe { info.assume_init() }.ssi_signo)
-                    .map_err(|_| {
-                        EntrypointError::SignalSupervision(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "signalfd returned a signal number that does not fit in c_int",
-                        ))
-                    })?;
-                return Ok(signal);
-            }
-            return Err(EntrypointError::SignalSupervision(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "signalfd returned a partial signal record",
-            )));
+fn restore_process_signal_mask(original_bits: u8) -> Result<()> {
+    let mut mask =
+        SigSet::thread_get_mask().map_err(|source| EntrypointError::ConfigureProcess {
+            operation: "signal mask",
+            source,
+        })?;
+    for (index, signal) in SUPERVISED_SIGNALS.iter().enumerate() {
+        if original_bits & (1 << index) == 0 {
+            mask.remove(*signal);
+        } else {
+            mask.add(*signal);
         }
     }
-
-    fn supervise(&self, process_group: libc::pid_t) -> Result<ExitStatus> {
-        loop {
-            if let Some(exit) = reap_descendants(process_group)? {
-                return Ok(exit);
-            }
-
-            let signal = self.read()?;
-            if signal != libc::SIGCHLD {
-                let result = unsafe { libc::kill(-process_group, signal) };
-                if result == -1 {
-                    let source = io::Error::last_os_error();
-                    if source.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(EntrypointError::ForwardSignal { signal, source });
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn reap_descendants(main_process: libc::pid_t) -> Result<Option<ExitStatus>> {
-    let mut main_exit = None;
-    loop {
-        let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
-        if pid > 0 {
-            if pid == main_process {
-                main_exit = Some(ExitStatus::from_raw(status));
-            }
-            continue;
-        }
-        if pid == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-            return Ok(main_exit);
-        }
-
-        let source = io::Error::last_os_error();
-        if source.kind() != io::ErrorKind::Interrupted {
-            return Err(EntrypointError::WaitForProcess(source));
-        }
-    }
+    configure!("signal mask", mask.thread_set_mask())
 }
 
 pub fn sync_filesystems() {
-    unsafe {
-        libc::sync();
-    }
+    sync();
 }
 
 /// Powers off the VM after the OCI process exits.
@@ -515,39 +466,8 @@ pub fn sync_filesystems() {
 pub fn power_off(exit: ExitStatus) -> Result<()> {
     eprintln!("barbirolli_entrypoint: OCI process exited with {exit}");
     eprintln!("barbirolli_entrypoint: VM starts power-off");
-    let result = unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF) };
-    debug_assert_eq!(result, -1, "a successful power-off syscall cannot return");
-    Err(EntrypointError::PowerOff {
-        exit,
-        source: io::Error::last_os_error(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use oci_spec::runtime::Process;
-    use serde_json::json;
-
-    use crate::ProcessSpec;
-
-    #[test]
-    #[ignore = "requires root to apply OCI user and supplementary-group settings"]
-    fn spawns_and_reaps_the_oci_process() {
-        let process: Process = serde_json::from_value(json!({
-            "terminal": false,
-            "user": { "uid": 0, "gid": 0 },
-            "args": ["/bin/sh", "-c", "exit 23"],
-            "env": ["PATH=/bin:/usr/bin"],
-            "cwd": "/",
-            "noNewPrivileges": true
-        }))
-        .expect("test OCI process should deserialize");
-        let process = ProcessSpec::try_from(process).expect("test OCI process should parse");
-        let child = process.spawn().expect("OCI process should spawn");
-        let exit = child
-            .supervise_and_reap()
-            .expect("OCI process should be reaped");
-
-        assert_eq!(exit.code(), Some(23));
+    match reboot(RebootMode::RB_POWER_OFF) {
+        Ok(never) => match never {},
+        Err(source) => Err(EntrypointError::PowerOff { exit, source }),
     }
 }

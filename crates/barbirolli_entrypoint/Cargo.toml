@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-libc.workspace = true
+nix.workspace = true
 oci-spec.workspace = true
+pid1.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
