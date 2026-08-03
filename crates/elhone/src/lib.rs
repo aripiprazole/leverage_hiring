@@ -15,7 +15,7 @@ use axum::{
 };
 use barbirolli::{
     AuthorizedKey, Barbirolli, LifecycleError, PortBinding, Rootfs, StorageError, VcpuCount, VmId,
-    VmInput, VmStatus,
+    VmInput, VmStats, VmStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -38,6 +38,7 @@ pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
         .route("/vms/{id}", get(vm).delete(delete_vm))
         .route("/vms/{id}/logs", get(vm_logs))
         .route("/vms/{id}/status", get(vm_status))
+        .route("/vms/{id}/stats", get(vm_stats))
         .route("/vms/{id}/start", post(start_vm))
         .route("/vms/{id}/shutdown", post(shutdown_vm))
         .route("/oci/pull", post(oci::pull))
@@ -75,6 +76,12 @@ struct StatusResponse {
 #[serde(default, deny_unknown_fields)]
 struct VmLogsQuery {
     follow: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct VmStatsQuery {
+    force: bool,
 }
 
 struct VmLogStreamState {
@@ -265,6 +272,24 @@ async fn vm_status(
     }))
 }
 
+#[tracing::instrument(skip(state, query))]
+async fn vm_stats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<VmStatsQuery>, QueryRejection>,
+) -> Result<Json<VmStats>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts to get VM stats");
+    let id = parse_vm_id(&id)?;
+    let Query(query) = query.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
+    let stats = state
+        .manager
+        .stats(id, query.force)
+        .await
+        .map_err(ApiError::from)?;
+    tracing::info!(%id, force = query.force, "elhone read VM stats");
+    Ok(Json(stats))
+}
+
 #[tracing::instrument(skip(state))]
 async fn start_vm(
     State(state): State<AppState>,
@@ -336,6 +361,8 @@ enum ApiError {
     #[error("{0}")]
     BadGateway(String),
     #[error("{0}")]
+    ServiceUnavailable(String),
+    #[error("{0}")]
     InternalServerError(String),
 }
 
@@ -347,6 +374,7 @@ impl ApiError {
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -379,6 +407,7 @@ impl From<LifecycleError> for ApiError {
             LifecycleError::Draining
             | LifecycleError::CapacityReached { .. }
             | LifecycleError::InvalidTransition { .. } => Self::Conflict(message),
+            LifecycleError::StatsUnavailable(_) => Self::ServiceUnavailable(message),
             LifecycleError::Storage(
                 StorageError::CreatingDirectory
                 | StorageError::Io { .. }
@@ -432,12 +461,14 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use axum::{extract::Query, http::Uri};
-    use barbirolli::{NetworkSpec, Port, PortBinding, Rootfs, VmId, VmStatus, VmSummary};
+    use barbirolli::{
+        ByteStats, NetworkSpec, Port, PortBinding, Rootfs, VmId, VmStats, VmStatus, VmSummary,
+    };
     use futures::{StreamExt, TryStreamExt};
     use serde_json::json;
-    use tokio::io::AsyncWriteExt;
+    use tokio::{io::AsyncWriteExt, time::timeout};
 
-    use super::{CreateVmRequest, VmLogsQuery, vm_log_stream};
+    use super::{ApiError, CreateVmRequest, VmLogsQuery, VmStatsQuery, vm_log_stream};
 
     #[test]
     fn vm_logs_query_defaults_to_pull_and_rejects_invalid_input() {
@@ -463,6 +494,95 @@ mod tests {
                 .expect("valid URI");
             assert!(Query::<VmLogsQuery>::try_from_uri(&uri).is_err());
         }
+    }
+
+    #[test]
+    fn vm_stats_query_defaults_to_cached_and_rejects_invalid_input() {
+        let Query(defaults) = Query::<VmStatsQuery>::try_from_uri(
+            &"http://localhost/vms/0/stats"
+                .parse::<Uri>()
+                .expect("valid URI"),
+        )
+        .expect("an absent query should use defaults");
+        assert!(!defaults.force);
+
+        let Query(force) = Query::<VmStatsQuery>::try_from_uri(
+            &"http://localhost/vms/0/stats?force=true"
+                .parse::<Uri>()
+                .expect("valid URI"),
+        )
+        .expect("force=true should deserialize");
+        assert!(force.force);
+
+        for query in ["force=maybe", "unknown=true"] {
+            let uri = format!("http://localhost/vms/0/stats?{query}")
+                .parse::<Uri>()
+                .expect("valid URI");
+            assert!(Query::<VmStatsQuery>::try_from_uri(&uri).is_err());
+        }
+    }
+
+    #[test]
+    fn vm_stats_serializes_nested_byte_stats_exactly() {
+        let stats = VmStats {
+            id: VmId::try_from(0).expect("valid VM ID"),
+            sample_age_ms: 84,
+            cpu_percent: Some(0.42),
+            memory_bytes: 67_108_864,
+            process_count: 5,
+            network_bytes: ByteStats {
+                latest: 1_024,
+                total: 4_096,
+            },
+            disk_bytes: ByteStats {
+                latest: 2_048,
+                total: 8_192,
+            },
+            established_tcp_connections: 1,
+            total_connections: 2,
+        };
+
+        assert_eq!(
+            serde_json::to_value(stats).expect("stats should serialize"),
+            json!({
+                "id": 0,
+                "sample_age_ms": 84,
+                "cpu_percent": 0.42,
+                "memory_bytes": 67108864,
+                "process_count": 5,
+                "network_bytes": { "latest": 1024, "total": 4096 },
+                "disk_bytes": { "latest": 2048, "total": 8192 },
+                "established_tcp_connections": 1,
+                "total_connections": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn vm_stats_errors_map_to_the_public_status_codes() {
+        use barbirolli::LifecycleError;
+
+        assert_eq!(
+            ApiError::from(LifecycleError::NotFound(VmId::try_from(0).unwrap())).status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ApiError::from(LifecycleError::InvalidTransition {
+                vm_id: VmId::try_from(0).unwrap(),
+                operation: "read VM stats",
+                status: VmStatus::Discovered,
+            })
+            .status(),
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::UnprocessableEntity("invalid VM ID".to_owned()).status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            ApiError::from(LifecycleError::StatsUnavailable("no sample".to_owned())).status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -517,12 +637,12 @@ mod tests {
         let second = vm_log_stream(second_file, path.clone(), true, 0);
         futures::pin_mut!(first, second);
 
-        let first_retained = tokio::time::timeout(Duration::from_secs(1), first.next())
+        let first_retained = timeout(Duration::from_secs(1), first.next())
             .await
             .expect("retained output timed out")
             .expect("follow stream ended")
             .expect("follow stream failed");
-        let second_retained = tokio::time::timeout(Duration::from_secs(1), second.next())
+        let second_retained = timeout(Duration::from_secs(1), second.next())
             .await
             .expect("second retained output timed out")
             .expect("second follow stream ended")
@@ -530,13 +650,13 @@ mod tests {
         assert_eq!(first_retained, b"retained\n"[..]);
         assert_eq!(second_retained, b"retained\n"[..]);
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), first.next())
+            timeout(Duration::from_millis(50), first.next())
                 .await
                 .is_err(),
             "first follow stream must wait rather than end at EOF"
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), second.next())
+            timeout(Duration::from_millis(50), second.next())
                 .await
                 .is_err(),
             "second follow stream must wait rather than end at EOF"
@@ -553,12 +673,12 @@ mod tests {
             .expect("failed to append serial log");
         writer.flush().await.expect("failed to flush serial log");
 
-        let first_appended = tokio::time::timeout(Duration::from_secs(1), first.next())
+        let first_appended = timeout(Duration::from_secs(1), first.next())
             .await
             .expect("appended output timed out")
             .expect("follow stream ended")
             .expect("follow stream failed");
-        let second_appended = tokio::time::timeout(Duration::from_secs(1), second.next())
+        let second_appended = timeout(Duration::from_secs(1), second.next())
             .await
             .expect("second appended output timed out")
             .expect("second follow stream ended")

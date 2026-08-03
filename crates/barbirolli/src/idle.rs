@@ -19,7 +19,9 @@ pub struct Sample {
     pub memory_bytes: u64,
     pub process_count: u64,
     pub network_bytes: u64,
+    pub latest_network_bytes: u64,
     pub disk_bytes: u64,
+    pub latest_disk_bytes: u64,
     pub established_tcp_connections: u64,
     pub total_connections: u64,
     pub vcpu_count: u8,
@@ -51,6 +53,7 @@ pub struct Observation {
 #[derive(Debug, Clone, Copy)]
 pub struct Monitor {
     pub last_sample: Sample,
+    pub cpu_percent: Option<f64>,
     pub last_activity: Instant,
     pub strikes: u8,
     pub next_check: Instant,
@@ -68,6 +71,7 @@ impl Monitor {
     pub fn new(sample: Sample, policy: IdlePolicy) -> Self {
         Self {
             last_sample: sample,
+            cpu_percent: None,
             last_activity: sample.sampled_at,
             strikes: 0,
             next_check: sample.sampled_at + policy.initial_interval,
@@ -77,6 +81,7 @@ impl Monitor {
     pub fn observe(&mut self, sample: Sample, policy: IdlePolicy) -> (IdleDecision, Activity) {
         let activity = sample.activity_since(self.last_sample, policy);
         self.last_sample = sample;
+        self.cpu_percent = activity.cpu_percent;
         if activity.active {
             self.last_activity = sample.sampled_at;
             self.strikes = 0;
@@ -112,7 +117,7 @@ impl Monitor {
 }
 
 impl Sample {
-    fn cpu_percent_since(self, previous: Self) -> Option<f64> {
+    pub(crate) fn cpu_percent_since(self, previous: Self) -> Option<f64> {
         let elapsed = self
             .sampled_at
             .checked_duration_since(previous.sampled_at)?;
@@ -158,15 +163,19 @@ impl Default for IdlePolicy {
 mod tests {
     use super::*;
 
-    fn sample(origin: Instant, at: u64, cpu: u64) -> Sample {
+    type SampleCase = (&'static str, fn(&mut Sample));
+
+    fn sample(origin: Instant, at: u64) -> Sample {
         Sample {
             instance_pid: 10,
             sampled_at: origin + Duration::from_secs(at),
-            cpu_usage_usec: cpu,
+            cpu_usage_usec: 0,
             memory_bytes: 100,
             process_count: 1,
             network_bytes: 0,
+            latest_network_bytes: 0,
             disk_bytes: 0,
+            latest_disk_bytes: 0,
             established_tcp_connections: 0,
             total_connections: 0,
             vcpu_count: 1,
@@ -174,81 +183,181 @@ mod tests {
     }
 
     #[test]
-    fn threshold_defaults_to_one_percent() {
-        assert!((IdlePolicy::default().cpu_threshold_percent() - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn cpu_is_normalized_by_elapsed_time_and_vcpus() {
+    fn cpu_threshold_and_vcpu_normalization_match_the_specification() {
         let origin = Instant::now();
-        let old = sample(origin, 0, 0);
-        let mut new = sample(origin, 60, 600_000);
+        let policy = IdlePolicy::default();
+        let old = sample(origin, 0);
+        let mut new = sample(origin, 60);
+        new.cpu_usage_usec = 600_000;
+
+        assert!((policy.cpu_threshold_percent() - 1.0).abs() < f64::EPSILON);
         assert_eq!(new.cpu_percent_since(old), Some(1.0));
+        assert!(!new.activity_since(old, policy).active);
+
         new.vcpu_count = 2;
         assert_eq!(new.cpu_percent_since(old), Some(0.5));
     }
 
     #[test]
-    fn fixed_timeline_reaches_shutdown() {
+    fn monitor_retains_nullable_cpu_calculations() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let mut monitor = Monitor::new(sample(origin, 0, 0), policy);
-        assert_eq!(
-            monitor.observe(sample(origin, 300, 0), policy).0,
-            IdleDecision::Strike(1)
-        );
-        assert_eq!(
-            monitor.observe(sample(origin, 360, 0), policy).0,
-            IdleDecision::Strike(2)
-        );
-        assert_eq!(
-            monitor.observe(sample(origin, 420, 0), policy).0,
-            IdleDecision::Strike(3)
-        );
-        let observation = monitor.observation(sample(origin, 450, 0), policy);
-        assert_eq!(observation.decision, IdleDecision::Shutdown);
-        assert_eq!(
-            observation.sample.sampled_at,
-            origin + Duration::from_secs(450)
-        );
-        assert_eq!(observation.last_activity, origin);
+        let first = sample(origin, 0);
+        let mut monitor = Monitor::new(first, policy);
+        assert_eq!(monitor.cpu_percent, None);
+
+        let mut second = first;
+        second.sampled_at = origin + Duration::from_secs(60);
+        second.cpu_usage_usec = 600_000;
+        let (_, activity) = monitor.observe(second, policy);
+        assert_eq!(activity.cpu_percent, Some(1.0));
+        assert_eq!(monitor.cpu_percent, Some(1.0));
+
+        let mut reset = second;
+        reset.sampled_at = origin + Duration::from_secs(61);
+        reset.cpu_usage_usec = 1;
+        let (_, activity) = monitor.observe(reset, policy);
+        assert_eq!(activity.cpu_percent, None);
+        assert_eq!(monitor.cpu_percent, None);
     }
 
     #[test]
-    fn activity_resets_but_memory_does_not() {
+    fn idle_comparisons_use_accumulated_bytes_not_latest_intervals() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let mut monitor = Monitor::new(sample(origin, 0, 0), policy);
-        monitor.observe(sample(origin, 300, 0), policy);
-        let mut memory = sample(origin, 301, 0);
-        memory.memory_bytes = 200;
-        assert_eq!(monitor.observe(memory, policy).0, IdleDecision::None);
-        let mut traffic = sample(origin, 302, 0);
-        traffic.memory_bytes = 200;
-        traffic.network_bytes = 1;
+        let mut monitor = Monitor::new(sample(origin, 0), policy);
+        let mut first = sample(origin, 60);
+        first.network_bytes = 100;
+        first.latest_network_bytes = 100;
         assert_eq!(
-            monitor.observe(traffic, policy).0,
+            monitor.observe(first, policy).0,
             IdleDecision::ActivityReset
         );
-        assert_eq!(monitor.strikes, 0);
+
+        let mut next = first;
+        next.sampled_at = origin + Duration::from_secs(120);
+        next.latest_network_bytes = 1;
+        next.network_bytes = 101;
+        assert_eq!(monitor.observe(next, policy).0, IdleDecision::ActivityReset);
+
+        let mut no_new_bytes = next;
+        no_new_bytes.sampled_at = origin + Duration::from_secs(180);
+        no_new_bytes.latest_network_bytes = 0;
+        assert_eq!(monitor.observe(no_new_bytes, policy).0, IdleDecision::None);
     }
 
     #[test]
-    fn established_connection_is_always_active() {
+    fn idle_flow_waits_between_all_three_strikes_and_shutdown() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let baseline = sample(origin, 0, 0);
-        let mut connected = sample(origin, 1, 0);
-        connected.established_tcp_connections = 1;
-        assert!(connected.activity_since(baseline, policy).active);
+        let mut monitor = Monitor::new(sample(origin, 0), policy);
+        let checkpoints = [
+            (299, IdleDecision::None),
+            (300, IdleDecision::Strike(1)),
+            (359, IdleDecision::None),
+            (360, IdleDecision::Strike(2)),
+            (419, IdleDecision::None),
+            (420, IdleDecision::Strike(3)),
+            (449, IdleDecision::None),
+            (450, IdleDecision::Shutdown),
+        ];
+
+        for (at, expected) in checkpoints {
+            let observation = monitor.observation(sample(origin, at), policy);
+            assert_eq!(observation.decision, expected, "decision at {at}s");
+            assert_eq!(observation.last_activity, origin);
+        }
     }
 
     #[test]
-    fn counter_regression_resets_the_baseline() {
+    fn every_configured_activity_signal_resets_strikes_and_last_activity() {
         let origin = Instant::now();
         let policy = IdlePolicy::default();
-        let activity = sample(origin, 1, 0).activity_since(sample(origin, 0, 10), policy);
-        assert!(activity.active);
-        assert!(activity.counters_regressed);
+        let signals: [SampleCase; 5] = [
+            ("CPU above threshold", |sample| {
+                sample.cpu_usage_usec = 20_000;
+            }),
+            ("network traffic", |sample| sample.network_bytes = 1),
+            ("disk traffic", |sample| sample.disk_bytes = 1),
+            ("process-count change", |sample| sample.process_count = 2),
+            ("established TCP connection", |sample| {
+                sample.established_tcp_connections = 1;
+            }),
+        ];
+
+        for (name, signal) in signals {
+            let mut monitor = Monitor::new(sample(origin, 0), policy);
+            assert_eq!(
+                monitor.observe(sample(origin, 300), policy).0,
+                IdleDecision::Strike(1)
+            );
+            let mut active = sample(origin, 301);
+            signal(&mut active);
+
+            let (decision, activity) = monitor.observe(active, policy);
+
+            assert!(activity.active, "{name} was not classified as activity");
+            assert_eq!(decision, IdleDecision::ActivityReset, "{name}");
+            assert_eq!(monitor.strikes, 0, "{name}");
+            assert_eq!(monitor.last_activity, active.sampled_at, "{name}");
+        }
+    }
+
+    #[test]
+    fn health_metrics_without_activity_do_not_reset_the_idle_flow() {
+        let origin = Instant::now();
+        let policy = IdlePolicy::default();
+        let mut monitor = Monitor::new(sample(origin, 0), policy);
+        assert_eq!(
+            monitor.observe(sample(origin, 300), policy).0,
+            IdleDecision::Strike(1)
+        );
+        let mut health_only = sample(origin, 301);
+        health_only.memory_bytes = 200;
+        health_only.total_connections = 1;
+
+        let (decision, activity) = monitor.observe(health_only, policy);
+
+        assert!(!activity.active);
+        assert_eq!(decision, IdleDecision::None);
+        assert_eq!(monitor.strikes, 1);
+        assert_eq!(monitor.last_activity, origin);
+    }
+
+    #[test]
+    fn a_new_instance_or_regressed_counter_establishes_a_fresh_baseline() {
+        let origin = Instant::now();
+        let policy = IdlePolicy::default();
+        let regressions: [SampleCase; 4] = [
+            ("instance PID", |sample| sample.instance_pid = 11),
+            ("CPU counter", |sample| sample.cpu_usage_usec = 9),
+            ("network counter", |sample| sample.network_bytes = 9),
+            ("disk counter", |sample| sample.disk_bytes = 9),
+        ];
+
+        for (name, regress) in regressions {
+            let mut baseline = sample(origin, 0);
+            baseline.cpu_usage_usec = 10;
+            baseline.network_bytes = 10;
+            baseline.disk_bytes = 10;
+            let mut monitor = Monitor::new(baseline, policy);
+            let mut regressed = baseline;
+            regressed.sampled_at = origin + Duration::from_secs(1);
+            regress(&mut regressed);
+
+            let (decision, activity) = monitor.observe(regressed, policy);
+
+            assert!(activity.active, "{name} did not establish a baseline");
+            assert!(activity.counters_regressed, "{name}");
+            assert_eq!(decision, IdleDecision::ActivityReset, "{name}");
+            assert_eq!(monitor.last_sample, regressed, "{name}");
+
+            let mut stable = regressed;
+            stable.sampled_at = origin + Duration::from_secs(2);
+            let (decision, activity) = monitor.observe(stable, policy);
+            assert!(!activity.active, "{name} was not accepted as the baseline");
+            assert!(!activity.counters_regressed, "{name}");
+            assert_eq!(decision, IdleDecision::None, "{name}");
+        }
     }
 }

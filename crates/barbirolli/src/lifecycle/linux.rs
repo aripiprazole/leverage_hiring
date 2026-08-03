@@ -1,5 +1,6 @@
 use super::{
-    BalloonConfig, BalloonStatistics, LifecycleError, Result, VmStatus, VmSummary, WarmupFailure,
+    BalloonConfig, BalloonStatistics, LifecycleError, Result, VmStats, VmStatus, VmSummary,
+    WarmupFailure,
 };
 
 use std::{
@@ -120,6 +121,12 @@ impl Barbirolli {
         self.vms
             .get_mut(&vm_id)
             .ok_or(LifecycleError::NotFound(vm_id))
+    }
+
+    /// Returns the latest health sample, optionally forcing a fresh Firecracker metrics emission.
+    pub async fn stats(&self, vm_id: VmId, force: bool) -> Result<VmStats> {
+        let mut vm = self.vm_mut(vm_id)?;
+        vm.stats(self, force).await
     }
 
     /// Prune resources at the host machine by stopping idle vms, and by
@@ -428,12 +435,34 @@ impl BarbirolliVm {
             barbirolli.is_app_alive()?;
             let statistics = self
                 .managed_for("read balloon statistics")?
-                .balloon_statistics()
+                .balloon_stats()
                 .await?;
             Ok(BalloonStatistics {
                 target_mib: statistics.target_mib,
                 actual_mib: statistics.actual_mib,
             })
+        }
+        .boxed()
+    }
+
+    pub fn stats<'a>(
+        &'a mut self,
+        barbirolli: &'a Barbirolli,
+        force: bool,
+    ) -> BoxFuture<'a, Result<VmStats>> {
+        async move {
+            barbirolli.is_app_alive()?;
+            let stats = self
+                .managed_for("read VM stats")?
+                .stats(force, barbirolli.firecracker.api_socket_timeout)
+                .await;
+            match stats {
+                Ok(stats) => Ok(stats),
+                Err(ManagedLifecycleError::StatsUnavailable(reason)) => {
+                    Err(LifecycleError::StatsUnavailable(reason))
+                }
+                Err(error) => Err(error.into()),
+            }
         }
         .boxed()
     }

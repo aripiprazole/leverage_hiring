@@ -1,6 +1,8 @@
 use futures::{FutureExt, future::BoxFuture};
 
-use super::{BalloonConfig, BalloonStatistics, DaemonConfig, LifecycleError, Result, VmSummary};
+use super::{
+    BalloonConfig, BalloonStatistics, DaemonConfig, LifecycleError, Result, VmStats, VmSummary,
+};
 use crate::{MemoryMib, VmId, VmInput, VmSpec, VmStore};
 
 pub struct BarbirolliVm;
@@ -50,6 +52,14 @@ impl BarbirolliVm {
     ) -> BoxFuture<'_, Result<BalloonStatistics>> {
         async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
     }
+
+    pub fn stats(
+        &mut self,
+        _barbirolli: &Barbirolli,
+        _force: bool,
+    ) -> BoxFuture<'_, Result<VmStats>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +76,14 @@ impl Barbirolli {
 
     pub async fn autoscale(&self) {
         std::future::pending::<()>().await;
+    }
+
+    /// # Errors
+    ///
+    /// Always returns [`LifecycleError::UnsupportedPlatform`].
+    #[allow(clippy::unused_async)]
+    pub async fn stats(&self, _vm_id: VmId, _force: bool) -> Result<VmStats, LifecycleError> {
+        Err(LifecycleError::UnsupportedPlatform)
     }
 
     /// # Errors

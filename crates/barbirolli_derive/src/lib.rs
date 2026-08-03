@@ -44,6 +44,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
     quote! {
         #(#attributes)*
         #test_attribute
+        #[tracing_test::traced_test]
         #[ignore = "requires Linux, KVM, Firecracker, and VM artifacts"]
         #[allow(clippy::await_holding_lock)]
         #visibility #signature {
@@ -83,6 +84,7 @@ pub fn firecracker_test(_attribute: TokenStream, item: TokenStream) -> TokenStre
                             #function_name,
                             "--",
                             "--ignored",
+                            "--nocapture",
                         ])
                         .status()
                         .expect("failed to launch the privileged test through Lima");

@@ -1,6 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, Rootfs, VmId, VmStore, VmSummary};
+use barbirolli::{
+    Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, Rootfs, VmId, VmStore, VmSummary,
+};
 use futures::future::try_join_all;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -31,7 +33,7 @@ pub struct FirecrackerVmFixture {
 }
 
 impl FirecrackerFixture {
-    pub async fn new(provisioning: ProvisioningConfig) -> Self {
+    pub async fn new(provisioning: ProvisioningConfig, idle_policy: Option<IdlePolicy>) -> Self {
         let temp = tempfile::Builder::new()
             .prefix("barbirolli-firecracker-")
             .tempdir_in("/var/tmp")
@@ -61,7 +63,7 @@ impl FirecrackerFixture {
                 provisioning,
                 firecracker: firecracker.clone(),
                 entrypoint: entrypoint.clone(),
-                idle_policy: None,
+                idle_policy,
             },
         )
         .await

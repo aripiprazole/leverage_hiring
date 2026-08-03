@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use validated::Validated;
 
 use crate::{MemoryMib, NetworkSpec, PortBinding, StorageError, VmId, idle::IdlePolicy};
@@ -101,6 +101,25 @@ pub struct VmSummary {
     pub network: NetworkSpec,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteStats {
+    pub latest: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmStats {
+    pub id: VmId,
+    pub sample_age_ms: u64,
+    pub cpu_percent: Option<f64>,
+    pub memory_bytes: u64,
+    pub process_count: u64,
+    pub network_bytes: ByteStats,
+    pub disk_bytes: ByteStats,
+    pub established_tcp_connections: u64,
+    pub total_connections: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WarmupFailure {
     #[cfg(target_os = "linux")]
@@ -136,6 +155,8 @@ pub enum LifecycleError {
     Warmup(Validated<(), WarmupFailure>),
     #[error("application shutdown failed: {0:?}")]
     Shutdown(Validated<(), Box<LifecycleError>>),
+    #[error("VM stats are unavailable: {0}")]
+    StatsUnavailable(String),
     #[cfg(not(target_os = "linux"))]
     #[error("Firecracker lifecycle operations require Linux")]
     UnsupportedPlatform,
@@ -143,8 +164,10 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use barbirolli::support;
-    use barbirolli::{BalloonConfig, LifecycleError, ProvisioningConfig, VmStatus};
+    use barbirolli::{BalloonConfig, IdlePolicy, LifecycleError, ProvisioningConfig, VmStatus};
     use barbirolli_derive::firecracker_test;
 
     use support::{config::TestVmConfig, firecracker::FirecrackerFixture};
@@ -166,7 +189,7 @@ mod tests {
             count: 1,
             ..ProvisioningConfig::default()
         };
-        let fixture = FirecrackerFixture::new(provisioning).await;
+        let fixture = FirecrackerFixture::new(provisioning, None).await;
         let vm = fixture.create_vm(TestVmConfig::new(1)).await;
         vm.lifecycle.start(|_| {}).await;
 
@@ -184,7 +207,7 @@ mod tests {
 
     #[firecracker_test]
     async fn guest_balloon_inflates_and_deflates() {
-        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
         let vm = fixture.create_vm(TestVmConfig::new(1)).await;
 
         vm.lifecycle.start(|_| {}).await;
@@ -206,8 +229,156 @@ mod tests {
     }
 
     #[firecracker_test]
+    async fn healthchecker_samples_the_real_firecracker_boundary() {
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+        vm.lifecycle.start(|_| {}).await;
+
+        let sample = vm.lifecycle.health_sample().await;
+
+        assert!(sample.instance_pid > 0);
+        assert!(sample.cpu_usage_usec > 0);
+        assert!(sample.memory_bytes > 0);
+        assert!(sample.process_count > 0);
+        assert_eq!(sample.vcpu_count, 1);
+        assert!(sample.total_connections >= sample.established_tcp_connections);
+        fixture.finish().await;
+    }
+
+    #[firecracker_test]
+    async fn vm_stats_use_cached_and_forced_samples_without_mutating_idle_state() {
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
+        let stopped = fixture.create_vm(TestVmConfig::new(1)).await;
+        let stopped_error = fixture
+            .manager
+            .stats(stopped.id, false)
+            .await
+            .expect_err("stopped VMs must not expose stats");
+        assert!(matches!(
+            stopped_error,
+            LifecycleError::InvalidTransition {
+                vm_id,
+                operation: "read VM stats",
+                status: VmStatus::Discovered,
+            } if vm_id == stopped.id
+        ));
+
+        stopped.lifecycle.start(|_| {}).await;
+        let unavailable = fixture
+            .manager
+            .stats(stopped.id, false)
+            .await
+            .expect_err("cached stats must wait for the first heartbeat");
+        assert!(matches!(
+            unavailable,
+            LifecycleError::StatsUnavailable(message)
+                if message == "no cached health sample is available"
+        ));
+
+        let manager = fixture.manager.clone();
+        let autoscale = tokio::spawn(async move { manager.autoscale().await });
+        let baseline = stopped.lifecycle.wait_for_health_monitor().await;
+        tracing::info!(
+            strikes = baseline.strikes,
+            "stats integration test observed the idle baseline"
+        );
+        autoscale.abort();
+        let _ = autoscale.await;
+
+        let cached = fixture
+            .manager
+            .stats(stopped.id, false)
+            .await
+            .expect("cached stats should map the monitor sample");
+        tracing::info!(?cached, "stats integration test received cached stats");
+        assert_eq!(cached.id, stopped.id);
+        assert!(cached.sample_age_ms < 2_000);
+        assert!(cached.network_bytes.total >= cached.network_bytes.latest);
+        assert!(cached.disk_bytes.total >= cached.disk_bytes.latest);
+
+        let before = stopped
+            .lifecycle
+            .health_monitor()
+            .expect("the monitor baseline should still exist");
+        let forced = fixture
+            .manager
+            .stats(stopped.id, true)
+            .await
+            .expect("forced stats should flush and await a new metrics generation");
+        tracing::info!(?forced, "stats integration test received forced stats");
+        let after = stopped
+            .lifecycle
+            .health_monitor()
+            .expect("the forced read must not remove the monitor");
+
+        assert_eq!(forced.id, stopped.id);
+        assert!(forced.sample_age_ms < 2_000);
+        assert_eq!(before.last_activity, after.last_activity);
+        assert_eq!(before.strikes, after.strikes);
+        assert_eq!(before.next_check, after.next_check);
+        assert!(forced.network_bytes.total >= cached.network_bytes.total);
+        assert!(forced.disk_bytes.total >= cached.disk_bytes.total);
+
+        fixture.finish().await;
+    }
+
+    #[firecracker_test]
+    async fn healthchecker_resets_for_activity_then_completes_the_idle_shutdown_flow() {
+        let idle_policy = IdlePolicy {
+            initial_interval: Duration::from_secs(2),
+            strike_interval: Duration::from_secs(2),
+            final_interval: Duration::from_secs(2),
+            cpu_idle_high_percent: 50.0,
+            cpu_active_low_percent: 50.0,
+        };
+        let fixture =
+            FirecrackerFixture::new(ProvisioningConfig::default(), Some(idle_policy)).await;
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+        vm.lifecycle.start(|_| {}).await;
+        vm.ssh.command("true", |_| {}).await;
+        vm.lifecycle.health_sample().await;
+
+        let manager = fixture.manager.clone();
+        let autoscale = tokio::spawn(async move { manager.autoscale().await });
+        let baseline = vm.lifecycle.wait_for_health_monitor().await;
+        assert_eq!(baseline.strikes, 0);
+        assert_eq!(
+            baseline.next_check.duration_since(baseline.last_activity),
+            idle_policy.initial_interval
+        );
+
+        let ssh = vm.ssh.clone();
+        let activity = tokio::spawn(async move {
+            ssh.command("timeout 5s yes > /dev/null; test $? -eq 124", |_| {})
+                .await;
+        });
+        let reset = vm
+            .lifecycle
+            .wait_for_health_activity_after(baseline.last_activity)
+            .await;
+        assert_eq!(reset.strikes, 0);
+        assert_eq!(
+            reset.next_check.duration_since(reset.last_activity),
+            idle_policy.initial_interval
+        );
+        activity.await.expect("the guest CPU workload panicked");
+
+        for expected_strikes in 1..=3 {
+            let monitor = vm.lifecycle.wait_for_health_strikes(expected_strikes).await;
+            assert_eq!(monitor.strikes, expected_strikes);
+            assert!(monitor.next_check > monitor.last_activity);
+        }
+
+        vm.lifecycle.wait_for_status(VmStatus::Discovered).await;
+        assert!(!vm.api_socket.exists());
+
+        fixture.finish().await;
+        autoscale.await.expect("the healthchecker task panicked");
+    }
+
+    #[firecracker_test]
     async fn per_vm_api_sockets_support_concurrent_vms_and_repeated_lifecycle_calls() {
-        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
 
         let first = fixture.create_vm(TestVmConfig::new(1)).await;
         assert_eq!(
@@ -260,7 +431,7 @@ mod tests {
 
     #[firecracker_test]
     async fn concurrent_vms_keep_private_disks_across_manager_restart_and_delete_together() {
-        let mut fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let mut fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
         let mut vms = fixture
             .create_vms_concurrently::<2>([TestVmConfig::new(1), TestVmConfig::new(1)], |vms| {
                 assert_eq!(vms.len(), 2);
