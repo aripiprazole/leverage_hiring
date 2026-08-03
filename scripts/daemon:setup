@@ -145,6 +145,8 @@ prepare_rootfs() {
             "$ROOTFS_SQUASHFS"
     fi
 
+    local apt_name apt_uid apt_gid
+
     ROOTFS_WORK="$(mktemp -d "$BARBIROLLI_RUNTIME_DIR/.rootfs.XXXXXX")"
     ROOTFS_TEMP="$IMAGE_ROOT/.ubuntu-$ROOTFS_VERSION.ext4.$$"
     trap 'cleanup_rootfs' EXIT
@@ -158,9 +160,20 @@ prepare_rootfs() {
     sudo install -D -m 0644 \
         "$DEFAULT_PROCESS_SPEC" \
         "$ROOTFS_WORK/rootfs/etc/barbirolli/process.json"
+    sudo chmod 1777 "$ROOTFS_WORK/rootfs/tmp"
     printf 'nameserver 1.1.1.1\n' |
         sudo tee "$ROOTFS_WORK/rootfs/etc/resolv.conf" >/dev/null
+    IFS=: read -r apt_name _ apt_uid apt_gid _ < <(
+        grep -m1 '^_apt:' "$ROOTFS_WORK/rootfs/etc/passwd"
+    )
+    [[ "$apt_name" == "_apt" && -n "$apt_uid" && -n "$apt_gid" ]] ||
+        die "guest rootfs is missing the _apt user"
     sudo chown -R root:root "$ROOTFS_WORK/rootfs"
+    sudo install -d -m 0755 "$ROOTFS_WORK/rootfs/var/cache/apt/archives"
+    sudo install -d -m 0700 "$ROOTFS_WORK/rootfs/var/cache/apt/archives/partial"
+    sudo chown "$apt_uid:$apt_gid" "$ROOTFS_WORK/rootfs/var/cache/apt/archives/partial"
+    sudo install -d -m 0755 "$ROOTFS_WORK/rootfs/var/log/apt"
+    sudo install -m 0644 /dev/null "$ROOTFS_WORK/rootfs/var/log/dpkg.log"
 
     truncate -s 1G "$ROOTFS_TEMP"
     sudo mkfs.ext4 -F -d "$ROOTFS_WORK/rootfs" "$ROOTFS_TEMP"
