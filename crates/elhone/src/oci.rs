@@ -2195,11 +2195,11 @@ mod tests {
 
         fn start_oci_vm(&self, vm_id: VmId) -> BoxFuture<'_, Result<(), LifecycleError>> {
             async move {
-                let mut states = self
+                let mut registry = self
                     .states
                     .lock()
                     .expect("fixture states should not be poisoned");
-                let status = states
+                let status = registry
                     .get_mut(&vm_id)
                     .ok_or(LifecycleError::NotFound(vm_id))?;
                 *status = VmStatus::Running;
