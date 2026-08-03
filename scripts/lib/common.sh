@@ -33,7 +33,7 @@ ROOTFS_SQUASHFS="$DOWNLOAD_DIR/ubuntu-$ROOTFS_VERSION.squashfs"
 ROOTFS_KEY_MARKER="$ROOTFS_IMAGE.authorized_key"
 ROOTFS_RESOLVER_MARKER="$ROOTFS_IMAGE.resolver"
 ROOTFS_LAYOUT_MARKER="$ROOTFS_IMAGE.layout"
-ROOTFS_LAYOUT_VERSION="daemon-entrypoint-v1"
+ROOTFS_LAYOUT_VERSION="package-manager-runtime-v4"
 DEFAULT_PROCESS_SPEC="$REPO_ROOT/crates/barbirolli_entrypoint/default-process.json"
 ROOTFS_PROCESS_SPEC_MARKER="$ROOTFS_IMAGE.process.json"
 

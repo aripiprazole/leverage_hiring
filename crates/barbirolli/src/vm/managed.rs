@@ -135,7 +135,7 @@ impl SerialConsole {
             vm_id,
             path: path.clone(),
             stdin: Some(pipes.stdin),
-            stdout_task: Some(Self::spawn_stdout_reader(pipes.stdout, file, vm_id, path)),
+            stdout_task: Some(Self::spawn_stdout_reader(pipes.stdout, file, vm_id, &path)),
             stderr_task: Some(Self::spawn_stderr_reader(pipes.stderr, vm_id)),
         };
         tracing::debug!(
@@ -211,7 +211,7 @@ impl SerialConsole {
         mut stdout: FirecrackerStdout,
         mut file: tokio::fs::File,
         vm_id: VmId,
-        path: PathBuf,
+        path: &Path,
     ) -> JoinHandle<()> {
         let span = info_span!("serial_reader", %vm_id, stream = "stdout", path = %path.display());
         tokio::spawn(
@@ -423,7 +423,7 @@ impl VmSpec {
         let effective = firecracker.effective_api_socket(self);
         self.api_socket.remove()?;
         if effective != logical {
-            firecracker.remove_file_if_present(&effective)?;
+            crate::lifecycle::Firecracker::remove_file_if_present(&effective)?;
         }
         Ok(())
     }
@@ -440,13 +440,13 @@ impl VmSpec {
         let effective_metrics = firecracker.effective_path(self, &metrics);
         io_error!(
             HealthError,
-            firecracker.remove_file_if_present(&metrics),
+            crate::lifecycle::Firecracker::remove_file_if_present(&metrics),
             metrics.clone()
         )?;
         if effective_metrics != metrics {
             io_error!(
                 HealthError,
-                firecracker.remove_file_if_present(&effective_metrics),
+                crate::lifecycle::Firecracker::remove_file_if_present(&effective_metrics),
                 effective_metrics
             )?;
         }
@@ -1149,7 +1149,7 @@ mod tests {
         let stdout = child.take_stdout().expect("missing stdout pipe");
         let stderr = child.take_stderr().expect("missing stderr pipe");
         let vm_id = VmId::try_from(0).expect("valid test VM ID");
-        let stdout_task = SerialConsole::spawn_stdout_reader(stdout, file, vm_id, path.clone());
+        let stdout_task = SerialConsole::spawn_stdout_reader(stdout, file, vm_id, &path);
         let stderr_task = SerialConsole::spawn_stderr_reader(stderr, vm_id);
 
         assert!(
@@ -1190,7 +1190,7 @@ mod tests {
                 child.take_stdout().expect("missing stdout pipe"),
                 file,
                 vm_id,
-                path.clone(),
+                &path,
             )),
             stderr_task: Some(SerialConsole::spawn_stderr_reader(
                 child.take_stderr().expect("missing stderr pipe"),

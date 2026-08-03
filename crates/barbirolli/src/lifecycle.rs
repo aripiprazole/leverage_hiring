@@ -116,10 +116,14 @@ impl JailerConfig {
         })
     }
 
-    /// Parses and validates the identity bases supplied by configuration.
+    /// Parses the identity bases supplied by configuration.
     ///
     /// Parsing is kept separate from the typed constructor so callers cannot
     /// accidentally treat an unparsed configuration value as a valid UID/GID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a value is not a valid identity base.
     pub fn parse(
         jailer: impl Into<PathBuf>,
         chroot_base: impl Into<PathBuf>,

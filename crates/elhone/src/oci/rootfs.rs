@@ -94,7 +94,7 @@ impl ArtifactStore {
         })??;
 
         Ok(FileSystem {
-            _artifact: Arc::new(workspace.temp),
+            artifact: Arc::new(workspace.temp),
             path: result_path,
             size: built.size,
             digest: built.digest,
@@ -175,7 +175,8 @@ pub struct AppliedLayer {
 
 #[derive(Debug, Clone)]
 pub struct FileSystem {
-    _artifact: Arc<TempDir>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub artifact: Arc<TempDir>,
     pub path: PathBuf,
     pub size: u64,
     pub digest: digest::Sha256Digest,
@@ -184,7 +185,7 @@ pub struct FileSystem {
 impl FileSystem {
     #[cfg(test)]
     pub fn artifact_dir(&self) -> &Path {
-        self._artifact.path()
+        self.artifact.path()
     }
 }
 

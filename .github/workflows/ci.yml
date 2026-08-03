@@ -1,0 +1,99 @@
+name: Linting and Testing
+
+on:
+  push:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: "-C linker=clang -C link-arg=--ld-path=mold"
+
+jobs:
+  dependencies:
+    name: cargo chef
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Setup shared Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang build-essential pkg-config libc6-dev mold
+
+      - name: Install Cargo Chef
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-chef@0.1.77
+
+      - name: Prepare dependency recipe
+        run: cargo chef prepare --recipe-path recipe.json
+
+      - name: Cook dependencies
+        run: cargo chef cook --locked --workspace --all-targets --recipe-path recipe.json
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    needs: dependencies
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Restore shared Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: false
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang build-essential pkg-config libc6-dev mold
+
+      - name: Run tests (ignored VM tests stay skipped)
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --locked --workspace --color=always --all-targets
+
+  clippy:
+    name: clippy pedantic
+    runs-on: ubuntu-latest
+    needs: dependencies
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          components: clippy
+          override: true
+
+      - name: Restore shared Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: false
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang build-essential pkg-config libc6-dev mold
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --locked --workspace --color=always --tests --all-targets -- -D warnings -W clippy::pedantic

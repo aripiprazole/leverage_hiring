@@ -831,7 +831,7 @@ impl Firecracker {
         }
     }
 
-    pub(crate) fn remove_file_if_present(&self, path: &Path) -> std::io::Result<()> {
+    pub(crate) fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
         match std::fs::remove_file(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             result => result,
