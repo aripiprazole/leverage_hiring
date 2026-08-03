@@ -2,7 +2,7 @@ use std::{
     fs,
     io::ErrorKind,
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -128,7 +128,7 @@ impl SerialConsole {
             vm_id,
             path: path.clone(),
             stdin: Some(pipes.stdin),
-            stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, path)),
+            stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, &path)),
             stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
         };
         tracing::debug!(
@@ -203,7 +203,7 @@ fn spawn_serial_stdout_reader(
     mut stdout: FirecrackerStdout,
     mut file: tokio::fs::File,
     vm_id: VmId,
-    path: PathBuf,
+    path: &Path,
 ) -> JoinHandle<()> {
     let span = info_span!("serial_reader", %vm_id, stream = "stdout", path = %path.display());
     tokio::spawn(
@@ -955,7 +955,7 @@ mod tests {
         let stdout = child.take_stdout().expect("missing stdout pipe");
         let stderr = child.take_stderr().expect("missing stderr pipe");
         let vm_id = VmId::try_from(0).expect("valid test VM ID");
-        let stdout_task = spawn_serial_stdout_reader(stdout, file, vm_id, path.clone());
+        let stdout_task = spawn_serial_stdout_reader(stdout, file, vm_id, &path);
         let stderr_task = spawn_serial_stderr_reader(stderr, vm_id);
 
         assert!(
@@ -996,7 +996,7 @@ mod tests {
                 child.take_stdout().expect("missing stdout pipe"),
                 file,
                 vm_id,
-                path.clone(),
+                &path,
             )),
             stderr_task: Some(spawn_serial_stderr_reader(
                 child.take_stderr().expect("missing stderr pipe"),

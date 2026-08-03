@@ -14,6 +14,7 @@ use std::{
 use nonempty_collections::NEVec;
 use rustix::mount;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, MutexGuard};
 use validated::Validated;
 
 use crate::{ApiSocket, MemoryMib, NetworkSpec, Rootfs, VmId, VmInput, VmSpec};
@@ -24,7 +25,7 @@ const CONFIG_VERSION: u16 = 4;
 pub struct VmStore {
     pub vm_root: VmRootFolder,
     pub image_root: PathBuf,
-    _creation_lock: tokio::sync::Mutex<()>,
+    creation_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -33,7 +34,8 @@ pub struct PartialVm<'store> {
     pub persisted: PersistedVmSpec,
     tmp: tempfile::TempDir,
     final_dir: PathBuf,
-    _creation_guard: tokio::sync::MutexGuard<'store, ()>,
+    #[allow(dead_code)]
+    creation_guard: MutexGuard<'store, ()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +68,7 @@ impl VmStore {
             vm_root: VmRootFolder::new(vm_root)?,
             image_root: canonicalize(&image_root)
                 .map_err(|error| StorageError::io(&image_root, error))?,
-            _creation_lock: tokio::sync::Mutex::new(()),
+            creation_lock: Mutex::new(()),
         })
     }
 
@@ -82,7 +84,7 @@ impl VmStore {
         input: VmInput,
         memory_mib: MemoryMib,
     ) -> Result<PartialVm<'_>, StorageError> {
-        let _creation_guard = self._creation_lock.lock().await;
+        let creation_guard = self.creation_lock.lock().await;
         let source_kernel = self.image_root.join("vmlinux");
         let source_rootfs = input.rootfs;
         let id = self.vm_root.next_id()?;
@@ -118,7 +120,7 @@ impl VmStore {
             rootfs: Rootfs::from(rootfs),
             tmp,
             final_dir,
-            _creation_guard,
+            creation_guard,
         })
     }
 
@@ -530,7 +532,7 @@ impl VmRootFolderItem {
             (spec.rootfs.as_ref(), directory.join("rootfs.ext4")),
         ];
         for (actual, expected) in expected {
-            if actual != &expected {
+            if actual != expected {
                 return Err(StorageError::InvalidConfig {
                     path: desc.config.clone(),
                     message: format!(
