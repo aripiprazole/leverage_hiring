@@ -15,15 +15,26 @@ mod linux;
 mod unsupported;
 
 #[cfg(target_os = "linux")]
-pub use linux::{OciChild, mount_userspace_filesystems, power_off, sync_filesystems};
+pub use linux::{
+    OciChild, mount_proc_filesystem, mount_userspace_filesystems, power_off,
+    run_oci_process_if_requested, sync_filesystems,
+};
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::{OciChild, mount_userspace_filesystems, power_off, sync_filesystems};
+pub use unsupported::{
+    OciChild, mount_proc_filesystem, mount_userspace_filesystems, power_off,
+    run_oci_process_if_requested, sync_filesystems,
+};
+
+const RUN_PROCESS_SPEC_ENV: &str = "BARBIROLLI_ENTRYPOINT_RUN_PROCESS_SPEC";
+#[cfg(target_os = "linux")]
+const RUN_PROCESS_SIGNAL_MASK_ENV: &str = "BARBIROLLI_ENTRYPOINT_RUN_PROCESS_SIGNAL_MASK";
 
 pub type Result<T, E = EntrypointError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct ProcessSpec {
+    source_path: Option<PathBuf>,
     program: String,
     arguments: Vec<String>,
     environment: Vec<EnvironmentVariable>,
@@ -55,10 +66,13 @@ impl ProcessSpec {
                 source,
             }
         })?;
-        ProcessSpec::try_from(process).map_err(|source| EntrypointError::ParseProcessSpec {
-            path: path.to_owned(),
-            source,
-        })
+        let mut process =
+            ProcessSpec::try_from(process).map_err(|source| EntrypointError::ParseProcessSpec {
+                path: path.to_owned(),
+                source,
+            })?;
+        process.source_path = Some(path.to_owned());
+        Ok(process)
     }
 }
 
@@ -172,6 +186,7 @@ impl TryFrom<Process> for ProcessSpec {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            source_path: None,
             program: program.clone(),
             arguments: arguments.to_vec(),
             environment,
@@ -212,6 +227,9 @@ pub enum ParseProcessSpecError {
 
 #[derive(Debug, Error)]
 pub enum EntrypointError {
+    #[error("failed to initialize PID 1 supervision: {0}")]
+    Pid1(#[from] pid1::Error),
+
     #[error("barbirolli_entrypoint only runs on Linux")]
     UnsupportedPlatform,
 
@@ -251,11 +269,30 @@ pub enum EntrypointError {
         filesystem: &'static str,
         target: &'static str,
         #[source]
-        source: std::io::Error,
+        source: nix::errno::Errno,
     },
 
-    #[error("failed to configure PID 1 signal supervision: {0}")]
-    SignalSupervision(#[source] std::io::Error),
+    #[error("failed to configure entrypoint signal supervision: {0}")]
+    SignalSupervision(#[source] nix::errno::Errno),
+
+    #[error("OCI process ID {0} does not fit in pid_t")]
+    InvalidProcessId(u32),
+
+    #[error("OCI process specifications created in memory cannot be spawned")]
+    InMemoryProcessSpec,
+
+    #[error("failed to locate the current entrypoint executable: {0}")]
+    CurrentExecutable(#[source] std::io::Error),
+
+    #[error("invalid internal OCI process runner state")]
+    InvalidProcessRunnerState,
+
+    #[error("failed to configure OCI process {operation}: {source}")]
+    ConfigureProcess {
+        operation: &'static str,
+        #[source]
+        source: nix::errno::Errno,
+    },
 
     #[error("failed to spawn OCI process {program:?}: {source}")]
     SpawnProcess {
@@ -264,21 +301,21 @@ pub enum EntrypointError {
         source: std::io::Error,
     },
 
-    #[error("failed while waiting for OCI process descendants: {0}")]
+    #[error("failed while waiting for the OCI process: {0}")]
     WaitForProcess(#[source] std::io::Error),
 
     #[error("failed to forward signal {signal} to OCI process group: {source}")]
     ForwardSignal {
-        signal: i32,
+        signal: nix::sys::signal::Signal,
         #[source]
-        source: std::io::Error,
+        source: nix::errno::Errno,
     },
 
     #[error("failed to power off after OCI process exited with {exit}: {source}")]
     PowerOff {
         exit: ExitStatus,
         #[source]
-        source: std::io::Error,
+        source: nix::errno::Errno,
     },
 }
 
