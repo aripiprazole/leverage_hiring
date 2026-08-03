@@ -925,7 +925,10 @@ mod client {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(Command::new("ssh").args(args))
+            let _ = config;
+            let mut command = Command::new("ssh");
+            command.args(args);
+            Ok(command)
         }
     }
 
@@ -1282,6 +1285,7 @@ mod error {
 mod lima {
     use std::process::Stdio;
 
+    #[cfg(target_os = "macos")]
     use serde_json::Value;
     use tokio::process::Command;
 
@@ -1291,6 +1295,7 @@ mod lima {
         std::env::var("LIMACTL").unwrap_or_else(|_| "limactl".to_owned())
     }
 
+    #[cfg(target_os = "macos")]
     pub async fn ensure_running(instance: &str) -> Result<()> {
         tracing::debug!(%instance, "checking Lima instance state");
         let output = Command::new(limactl())
@@ -1325,6 +1330,7 @@ mod lima {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
     fn find_status(value: &Value) -> Option<&str> {
         match value {
             Value::Array(values) => values.iter().find_map(find_status),
@@ -1375,6 +1381,7 @@ mod lima {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub async fn guest_home(instance: &str) -> Result<String> {
         let output = capture(
             instance,

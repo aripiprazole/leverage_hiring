@@ -22,13 +22,17 @@ use tokio::{
     sync::{Mutex, oneshot},
 };
 
+type RequestResult = Result<RequestSnapshot, String>;
+type RequestSender = oneshot::Sender<RequestResult>;
+type SharedRequestSender = Arc<Mutex<Option<RequestSender>>>;
+
 #[derive(Clone)]
 struct Fixture {
     expected_method: String,
     expected_path: String,
     check_create: bool,
     response_body: String,
-    result: Arc<Mutex<Option<oneshot::Sender<Result<RequestSnapshot, String>>>>>,
+    result: SharedRequestSender,
 }
 
 #[derive(Debug)]
@@ -107,11 +111,13 @@ async fn maps_vm_and_oci_operations_to_elhone_requests() {
         let app = Router::new()
             .fallback(any(receive_request))
             .with_state(fixture.clone());
-        let server = tokio::spawn(axum::serve(listener, app));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-        let mut config = Config::default();
-        config.client = ClientConfig {
-            url: format!("http://{address}"),
+        let config = Config {
+            client: ClientConfig {
+                url: format!("http://{address}"),
+            },
+            ..Config::default()
         };
         let cli = Cli {
             config: None,
