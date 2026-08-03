@@ -1,8 +1,13 @@
 use barbirolli_entrypoint::{
-    ProcessSpec, Result, mount_userspace_filesystems, power_off, sync_filesystems,
+    ProcessSpec, Result, mount_proc_filesystem, mount_userspace_filesystems, power_off,
+    run_oci_process_if_requested, sync_filesystems,
 };
 
 fn main() -> Result<()> {
+    mount_proc_filesystem()?;
+    pid1::relaunch_if_pid1()?;
+    run_oci_process_if_requested()?;
+
     mount_userspace_filesystems()?;
     eprintln!("barbirolli_entrypoint: userspace filesystems are ready");
 
