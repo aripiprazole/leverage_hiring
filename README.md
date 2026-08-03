@@ -56,6 +56,37 @@ In the Lima VM, run these commands:
 ./x daemon:run
 ```
 
+## Meier CLI
+
+`meier` is the publishable CLI surface. Initialize its private configuration
+once on the machine where the command is installed:
+
+```bash
+meier config init
+```
+
+On Linux, `meier daemon setup` and `meier daemon run` execute locally. On macOS
+the same commands, together with every VM and OCI operation, execute inside
+the already-running configured Lima instance. The client checks
+`limactl list --format json` and never starts or creates Lima automatically.
+The guest runs the same `meier` executable in its hidden, feature-gated
+`__daemon` mode; it never invokes the public client command from inside the
+guest.
+
+```bash
+meier daemon setup
+meier daemon run                    # foreground; use another terminal
+meier vm create --publish 2222:22
+meier vm ps
+meier vm logs 0 --pull
+meier vm ssh 0 -- cat /etc/os-release
+```
+
+The existing `x` and `scripts/` commands remain supported for compatibility.
+Successful API operations print pretty JSON (or `null` for an empty response),
+while failures are JSON on stderr. Help, version, SSH, and log streams remain
+raw.
+
 ## Example commands
 
 ```sh

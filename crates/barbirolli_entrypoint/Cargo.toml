@@ -2,7 +2,14 @@
 name = "barbirolli_entrypoint"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+description = "A minimal Linux PID 1 entrypoint for Barbirolli microVM guests"
+repository.workspace = true
+readme = "README.md"
+categories = ["virtualization"]
+keywords = ["firecracker", "microvm", "linux"]
+rust-version.workspace = true
 
 [dependencies]
 libc.workspace = true

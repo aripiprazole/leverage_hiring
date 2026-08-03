@@ -2,7 +2,14 @@
 name = "barbirolli_derive"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+description = "Support derive macros for Barbirolli test fixtures"
+repository.workspace = true
+readme = "README.md"
+categories = ["development-tools::procedural-macro-helpers"]
+keywords = ["firecracker", "proc-macro"]
+rust-version.workspace = true
 
 [lib]
 proc-macro = true

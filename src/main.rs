@@ -1,8 +1,7 @@
 use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 
-use barbirolli::{Barbirolli, DaemonConfig, IdlePolicy, ProvisioningConfig, Rootfs, VmStore};
+use meier::daemon::{DaemonSettings, run_with_settings};
 use serde::Deserialize;
-use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Deserialize)]
@@ -57,44 +56,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = envy::from_env::<Config>()?;
-    let standard_rootfs = Rootfs::from(config.image_root.join("ubuntu-24.04.ext4"));
-    let daemon = Barbirolli::new(
-        VmStore::new(config.vm_root, config.image_root)?,
-        DaemonConfig {
-            firecracker: config.firecracker,
-            entrypoint: config.barbirolli_entrypoint,
-            provisioning: ProvisioningConfig::default(),
-            idle_policy: Some(IdlePolicy {
-                initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
-                strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),
-                final_interval: Duration::from_secs(config.idle_final_interval_seconds),
-                cpu_idle_high_percent: config.idle_cpu_high_percent,
-                cpu_active_low_percent: config.idle_cpu_low_percent,
-            }),
-        },
-    )
+    run_with_settings(DaemonSettings {
+        vm_root: config.vm_root,
+        image_root: config.image_root,
+        firecracker: config.firecracker,
+        barbirolli_entrypoint: config.barbirolli_entrypoint,
+        listen: config.elhone_addr,
+        idle_initial_interval: Duration::from_secs(config.idle_initial_interval_seconds),
+        idle_strike_interval: Duration::from_secs(config.idle_strike_interval_seconds),
+        idle_final_interval: Duration::from_secs(config.idle_final_interval_seconds),
+        idle_cpu_high_percent: config.idle_cpu_high_percent,
+        idle_cpu_low_percent: config.idle_cpu_low_percent,
+    })
     .await?;
-
-    let listener = TcpListener::bind(config.elhone_addr).await?;
-    let elhone = axum::serve(listener, elhone::router(daemon.clone(), standard_rootfs));
-
-    tracing::info!(addr = %config.elhone_addr, "http service started");
-    let service = tokio::select! {
-        result = elhone => result.map_err(|error| error.to_string()),
-        result = tokio::signal::ctrl_c() => result.map_err(|error| error.to_string()),
-        () = daemon.autoscale() => Ok(()),
-    };
-    let shutdown = daemon.shutdown().await.map_err(|error| error.to_string());
-
-    match (service, shutdown) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(service), Ok(())) => Err(std::io::Error::other(service).into()),
-        (Ok(()), Err(shutdown)) => Err(std::io::Error::other(shutdown).into()),
-        (Err(service), Err(shutdown)) => Err(std::io::Error::other(format!(
-            "service failed: {service}; shutdown failed: {shutdown}"
-        ))
-        .into()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
