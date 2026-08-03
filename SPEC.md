@@ -2,19 +2,21 @@
 
 ## Architecture
 
-Elhone is the HTTP service and Barbirolli is the owner of VM state.
+Elhone is the HTTP service. Barbirolli owns the VM state.
 
 # Elhone: HTTP boundary
 
-Named after [Harry MacElhone](https://en.wikipedia.org/wiki/Harry_MacElhone), a bartender in
-early-twentieth-century New York.
+The name comes from [Harry MacElhone](https://en.wikipedia.org/wiki/Harry_MacElhone). He was a
+bartender in early-twentieth-century New York.
 
-- Built with `axum` around an `Arc<Barbirolli>`.
-- Binds to `ELHONE_ADDR`, defaulting to `127.0.0.1:3000`.
-- JSON responses, including `{"error": "..."}` for errors, except for the raw VM log stream.
-- Unknown VMs return `404`, invalid state transitions and exhausted VM capacity return `409`,
-  invalid input returns `422`, and internal lifecycle failures return `500`.
-- Mutating operations on the same VM are serialized.
+- `axum` with an `Arc<Barbirolli>`.
+- `ELHONE_ADDR`. The default address is `127.0.0.1:3000`.
+- Returns JSON for all responses except the raw VM log stream. Error responses use
+  `{"error": "..."}`.
+- VMs cause a `404` response. Invalid state changes and full VM capacity cause a `409`
+  response. Invalid input causes a `422` response. Internal lifecycle failures cause a `500`
+  response.
+- serializes operations that change the same VM.
 
 ## OCI image lifecycle
 
@@ -28,22 +30,22 @@ struct AppState {
 }
 ```
 
-`OciStore` contains one lifecycle for each composite `(name, tag)` key. An entry contains the
-pulled rootfs artifact and, while that image is running, the ID of its single Barbirolli VM.
-Elhone owns the mapping from an OCI image reference to its artifact and VM lifecycle; Barbirolli
-continues to own VM state and runtime resources.
+`OciStore` contains one lifecycle for each composite `(name, tag)` key. Each entry contains the
+pulled rootfs artifact. While the image runs, the entry also contains the ID of its single
+Barbirolli VM. Elhone maps each OCI image reference to its artifact and VM lifecycle. Barbirolli
+owns the VM state and runtime resources.
 
-The colon is part of each OCI command name; these names are CLI namespacing, not authorization
-scopes or Cargo features:
+Each OCI command name contains a colon. The colon defines a CLI namespace. It does not define an
+authorization scope or a Cargo feature:
 
-- `x oci:pull alpine:latest` ensures the image is pulled and stored.
-- `x oci:run alpine:latest` automatically pulls an absent entry, then creates and starts its VM.
-- `x oci:stop alpine:latest` stops the associated VM while retaining the pulled artifact.
-- `x oci:rm alpine:latest` rejects a running entry; once stopped, it removes the entry and its
-  artifacts.
+- `x oci:pull alpine:latest` pulls the image and stores it.
+- `x oci:run alpine:latest` pulls a missing image. Then it creates and starts the VM.
+- `x oci:stop alpine:latest` stops the applicable VM and keeps the pulled artifact.
+- `x oci:rm alpine:latest` rejects a running entry. After the VM stops, the command removes the
+  entry and its artifacts.
 
-Each `name:tag` therefore follows `absent → pulled → running → pulled → absent`.
-HTTP routes and JSON wire shapes for these operations are not specified here.
+Thus, each `name:tag` uses this sequence: `absent -> pulled -> running -> pulled -> absent`.
+This specification does not define HTTP routes or JSON wire formats for these operations.
 
 ## DELETE `/vms/:id`
 
@@ -51,9 +53,9 @@ HTTP routes and JSON wire shapes for these operations are not specified here.
 DELETE /vms/:id
 ```
 
-Shuts down the VM, cleans its runtime resources, persists the deletion marker, and returns
-`204 No Content`. The deletion marker and deregistration occur after successful shutdown and
-cleanup.
+The route shuts down the VM and cleans its runtime resources. It then saves the deletion marker
+and returns `204 No Content`. Elhone deregisters the VM only after shutdown and cleanup are
+successful.
 
 ## GET `/vms`
 
@@ -79,15 +81,15 @@ GET /vms
 ]
 ```
 
-Returns the state, port bindings, and allocated network of every registered VM. Status and list
-responses expose these stable states:
+The route returns the state, port bindings, and allocated network of each registered VM. Status
+and list responses show these stable states:
 
-- `discovered`: the VM is persisted and stopped.
-- `running`: the VM is actively managed by Firecracker.
-- `failed`: VM startup, shutdown, or runtime cleanup failed.
+- `discovered`: The VM is stored and stopped.
+- `running`: Firecracker actively manages the VM.
+- `failed`: The VM startup, shutdown, or runtime cleanup failed.
 
-`starting` and `shutting_down` are transition events emitted in daemon logs. Mutating operations
-on the same VM are serialized, so API readers observe the resulting stable state.
+The daemon logs contain the `starting` and `shutting_down` transition events. Elhone serializes
+operations that change the same VM. Thus, API readers see the resultant stable state.
 
 ## GET `/vms/:id`
 
@@ -95,7 +97,7 @@ on the same VM are serialized, so API readers observe the resulting stable state
 GET /vms/:id
 ```
 
-Returns the state, port bindings, and allocated network of one registered VM.
+The route returns the state, port bindings, and allocated network of one registered VM.
 
 ## GET `/vms/:id/logs`
 
@@ -103,11 +105,9 @@ Returns the state, port bindings, and allocated network of one registered VM.
 GET /vms/:id/logs?follow=false
 ```
 
-Returns the VM's append-only serial stdout as `application/octet-stream`. With the default
-`follow=false`, the response ends at the file length observed when the request starts. With
-`follow=true`, it first returns all retained output and then waits for new bytes until the client
-disconnects or the daemon stops. Following continues while the VM is stopped and across later
-starts. Every client owns an independent file offset.
+The route returns the append-only serial stdout as `application/octet-stream`.
+
+With the default `follow=false`, not following the serial console.
 
 ## GET `/vms/:id/status`
 
@@ -125,16 +125,11 @@ GET /vms/:id/status
 POST /vms/:id/start
 ```
 
-Starts a discovered VM. The operation is idempotent for a running VM.
-
 ## POST `/vms/:id/shutdown`
 
 ```http
 POST /vms/:id/shutdown
 ```
-
-Gracefully shuts down a managed VM and cleans its runtime resources. The operation is idempotent
-for a discovered VM.
 
 ## POST `/vms`
 
@@ -148,38 +143,42 @@ POST /vms
 }
 ```
 
-Creates a stopped VM and returns `201 Created` with its ID. The request contains `vcpu_count`,
-`authorized_keys`, and `bindings`; the service copies the kernel and rootfs artifacts from
-`IMAGE_ROOT`. The daemon's provisioning configuration selects memory (256 MiB by default), which
-is persisted in `VmSpec`. Ports are `u16` values in the range `1..=65535`. A binding
-`{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` as guest port `22`.
+The route creates a stopped/discovered VM.
 
-Every new VM is assigned the daemon's `default_vm_mem` (256 MiB), and that value is persisted in
-the VM specification. Provisioning uses integer division for these calculations:
+- Returns `201 Created` with the VM ID.
+- Service copies the kernel and rootfs artifacts from `IMAGE_ROOT`.
+- Daemon selects the memory size. The default size
+  is 256 MiB.
+- Service stores this value in `VmSpec`. Ports are `u16` values in the range
+  `1..=65535`.
+- Binding `{ "internal": 22, "external": 2222 }` publishes host TCP port `2222` to
+  guest port `22`.
+
+The daemon assigns `default_vm_mem` (256 MiB) to each new VM. It stores this value in the VM
+specification. Provisioning uses integer division for these calculations:
 
 - `mem_mib` (1,706 MiB) = `max_daemon_mem` (2,048 MiB) * 100 / (100 + `extra_percentage` (20)).
 - `count` (6) = `mem_mib` (1,706 MiB) / `default_vm_mem` (256 MiB).
 - `initial_balloon_mem` (57 MiB) = (`max_daemon_mem` (2,048 MiB) - `mem_mib` (1,706 MiB)) /
   `count` (6).
 
-Firecracker deflates the balloon on guest out-of-memory conditions and collects balloon
-statistics every 10 seconds.
+Firecracker deflates the balloon on OOM. It collects balloon statistics every 10 seconds.
 
-Before creating a VM, Barbirolli counts the currently running VMs. It admits creation while that
-total is below the configured `count`.
+Before Barbirolli creates a VM, it counts the running VMs. It permits creation while this total is
+less than the configured `count`.
 
 # Barbirolli: VM and host-resource boundary
 
-Named after [Sir John Barbirolli](https://en.wikipedia.org/wiki/John_Barbirolli), the British
-conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The_Hall%C3%A9).
+The name comes from [Sir John Barbirolli](https://en.wikipedia.org/wiki/John_Barbirolli). He was a
+British conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The_Hall%C3%A9).
 
-- `fctools`
-- `nlink`
-- `validated`
-- Barbirolli owns persistence, the Firecracker lifecycle, and VM networking.
-- Barbirolli supports Firecracker 1.13 on x86_64 and aarch64 Linux; `FIRECRACKER` names its
-  executable.
-- Firecracker runs through `UnrestrictedVmmExecutor`.
+- `fctools`.
+- `nlink`.
+- `validated`.
+- Persistence, the Firecracker lifecycle, and VM networking.
+- Supports Firecracker 1.13 on x86_64 Linux and aarch64 Linux. `FIRECRACKER` specifies
+  the executable.
+- Firecracker uses `UnrestrictedVmmExecutor`.
 - Each running VM has one cgroup v2 directory for health and idle sampling.
 
 ```rust
@@ -298,22 +297,22 @@ enum LifecycleError {
 
 Each `$VM_ROOT/<vm_id>` contains:
 
-- `vmlinux`: copied from `IMAGE_ROOT/vmlinux`.
-- `rootfs.ext4`: private writable copy of `VmInput.rootfs`; the daemon injects
+- `vmlinux`: The daemon copies this file from `IMAGE_ROOT/vmlinux`.
+- `rootfs.ext4`: This file is a private writable copy of `VmInput.rootfs`. The daemon uses
   `IMAGE_ROOT/ubuntu-24.04.ext4` for `POST /vms`.
-- `config.json`: versioned `VmSpec`.
-- `serial.log`: append-only Firecracker stdout retained across every start of the VM; it is never
-  truncated or rotated.
+- `config.json`: This file contains the versioned `VmSpec`.
+- `serial.log`: This file contains append-only Firecracker stdout from each VM start. The daemon
+  does not truncate or rotate it.
+- `firecracker.socket`: This transient Firecracker API socket is present only while the VM runs.
 
-- `VM_ROOT` holds VM directories and `IMAGE_ROOT` holds the fixed source artifacts.
-- Every persisted `VmSpec` owns its unique Firecracker API socket path under
-  `$VM_ROOT/.sockets`; runtime cleanup removes the socket file and retains that path in `VmSpec`.
-- A VM gets the `VmId` equal to the number of persisted VM directories, starting at `0`. Deleted
-  VM directories remain in that count, so IDs increase monotonically and stay assigned to their
+- `VM_ROOT` contains the VM directories. `IMAGE_ROOT` contains the fixed source artifacts.
+- Each stored `VmSpec` owns `$VM_ROOT/<vm_id>/firecracker.socket`. Runtime cleanup removes the
+  socket file. `VmSpec` keeps the socket path.
+- A VM gets a `VmId` equal to the number of stored VM directories. The first ID is `0`. Deleted VM
+  directories stay in this count. Thus, IDs always increase and stay assigned to their
   directories.
-- Supplied `authorized_keys` are written directly to
-  `/root/.ssh/authorized_keys` inside the private ext4, with `0700` on `.ssh` and `0600` on the
-  file.
+- The daemon writes the supplied `authorized_keys` directly to `/root/.ssh/authorized_keys` in the
+  private ext4 filesystem. It sets `0700` on `.ssh` and `0600` on the file.
 - An empty `authorized_keys` request preserves the default key embedded in the source image.
 - `scripts/daemon:setup` installs that default key while preparing
   `IMAGE_ROOT/ubuntu-24.04.ext4`.
@@ -381,22 +380,23 @@ impl TryFrom<&str> for InterfaceName {
 }
 ```
 
-- The `172.16.0.0/16` pool provides 2^14 `/30` networks. Each contains a network address, host
+- The `172.16.0.0/16` pool supplies 2^14 `/30` networks. Each network has a network address, host
   address, guest address, and broadcast address.
-- The address pool must be disjoint from existing host routes.
-- The lowest-metric IPv4 default route in the main routing table supplies the external interface.
-- Every binding publishes TCP from the selected external interface to the VM guest address and
-  permits peer VMs to reach the same internal TCP port directly.
-- Inbound forwarding to a VM's TAP is limited to established replies and published ports from the
-  host or a peer VM.
-- Each VM owns an independent table whose base-chain policy is `accept`. A final
-  output-TAP-specific rule enforces that VM's inbound allowlist while preserving evaluation of the
-  other VM tables.
-- DNAT applies to packets sourced outside `172.16.0.0/16`. The source-pool condition ensures each
-  packet is translated by at most one VM table.
-- Peer VMs reach published ports, and internet egress packets are allowed.
-- IPv4 forwarding is shared host state and remains enabled after per-VM cleanup.
-- Guest static IP, gateway, and DNS configuration are present before boot.
+- The address pool must not overlap the existing host routes.
+- The service selects the external interface from the lowest-metric IPv4 default route in the main
+  routing table.
+- Each binding publishes TCP from the selected external interface to the VM guest address. It lets
+  peer VMs connect directly to the same internal TCP port.
+- The firewall permits only established replies and published ports from the host or a peer VM to
+  enter a VM TAP.
+- Each VM owns an independent table with an `accept` base-chain policy. A final rule for the output
+  TAP applies the VM inbound allowlist. The rule also lets the firewall evaluate the other VM
+  tables.
+- DNAT applies to packets from outside `172.16.0.0/16`. The source-pool condition prevents more
+  than one VM table from translating a packet.
+- Peer VMs can connect to published ports. The firewall also permits internet egress packets.
+- IPv4 forwarding is shared host state. Per-VM cleanup does not disable it.
+- The service adds the guest static IP, gateway, and DNS configuration before boot.
 
 ```rust
 impl VmNetworkSpec {
@@ -425,7 +425,7 @@ impl VmNetworkSpec {
 
 ### Creation
 
-Creation provisions a stopped VM.
+The creation operation provisions a stopped VM.
 
 ```rust
 async fn create(&self, input: VmInput) -> Result<VmId> {
@@ -453,8 +453,8 @@ async fn create(&self, input: VmInput) -> Result<VmId> {
 
 ### Starting a VM
 
-Starting follows `Discovered -> (Managed | Failed)`. Retrying a `Failed` VM first reconciles its
-stale resources and then attempts the same transition again.
+A start operation uses the `Discovered -> (Managed | Failed)` transition. For a `Failed` VM,
+Barbirolli first reconciles stale resources. Then it tries the same transition again.
 
 ```rust
 async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
@@ -487,7 +487,8 @@ The start sequence is:
 1. Prepares the TAP, routes, addresses, forwarding, and nftables table.
 2. Builds the Firecracker resources and configuration.
 3. Firecracker starts and opens its API socket.
-4. Takes the Firecracker pipes, appends stdout to `serial.log`, drains stderr, and retains stdin.
+4. Takes the Firecracker pipes. It appends stdout to `serial.log`, drains stderr, and
+   keeps stdin.
 5. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
 6. The metrics reader starts.
 7. `ManagedVm` takes ownership of the live resources.
@@ -527,13 +528,13 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
 }
 ```
 
-The cgroup is created after Firecracker starts because it needs the spawned PID. Failures after
-network preparation trigger rollback of every acquired resource. The returned error includes both
-the startup failure and any rollback failures.
+- Barbirolli creates the cgroup after Firecracker starts because it needs the Firecracker PID.
+- If a failure occurs after network preparation, startup rollback releases all acquired resources. The
+  returned error contains all failures.
 
 ### Shutting down a VM
 
-Shutdown releases runtime resources but keeps the persisted VM. A successful shutdown always ends
+Shutdown releases the runtime resources but keeps the stored VM. A successful shutdown always ends
 in `Discovered(VmSpec)`.
 
 ```rust
@@ -564,15 +565,16 @@ async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 }
 ```
 
-`ManagedVm::shutdown` sends Ctrl-Alt-Del on x86_64 or writes `reboot\n` through the retained serial
-stdin on aarch64. On timeout it falls back to pause-and-kill, then kill. Cleanup flushes the serial
-stdout writer, stops the metrics reader, and removes the Firecracker resources, network, and
-cgroup. Cleanup attempts every resource and aggregates errors.
+- On x86_64, `ManagedVm::shutdown` sends Ctrl-Alt-Del.
+- On aarch64, it writes `reboot\n` through the stored serial stdin.
+- After a timeout, it first uses pause-and-kill and then kill.
+- Removes the Firecracker resources, network, and cgroup.
+- Cleanup flushes the serial stdout writer and stops the metrics reader and tries each resource and combines the errors.
 
 ### Deletion
 
-Deletion runs the normal shutdown path, writes `deleted: true` to `config.json`, and removes the VM
-from the in-memory map. The VM directory remains on disk and retains its ID.
+Deletion uses the normal shutdown path. It writes `deleted: true` to `config.json`. Then it removes
+the VM from the in-memory map. The VM directory stays on disk and keeps its ID.
 
 ```rust
 async fn delete(&self, vm_id: VmId) -> Result<()> {
@@ -589,13 +591,16 @@ async fn delete(&self, vm_id: VmId) -> Result<()> {
 
 ### Warmup and recovery
 
-At startup Barbirolli reads every versioned config. Each active VM is registered as `Discovered`
-after successful reconciliation; reconciliation is a startup requirement. Deleted VMs contribute
-to ID allocation. Warmup leaves every registered VM in `Discovered`.
+At startup, Barbirolli reads each versioned configuration. After a successful reconciliation, it
+registers each active VM as `Discovered`.
+
+- Reconciliation is required at startup.
+- Deleted VMs are part of ID allocation.
+- Warmup leaves each registered VM in `Discovered`.
 
 ```rust
-/// kills all processe stale processes on the application startup, stale
-/// nftables, cgroup, etc, to be read into a
+/// At application startup, remove stale processes and resources.
+/// This includes stale nftables rules and cgroups.
 async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<()> {
     Validated::from(self.kill_stale_processes(barbirolli).await)
         .map4(
@@ -610,24 +615,26 @@ async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<()> {
 
 ### Application shutdown
 
-Application shutdown sets `draining`, shuts down every registered VM, and returns aggregated
-failures after all shutdown attempts complete.
+Application shutdown sets `draining`. It then shuts down each registered VM.
+
+- After all shutdown attempts, it returns the combined possible failures.
 
 ## Idle detection and automatic shutdown
 
-Each running VM is sampled at the Firecracker boundary.
+Barbirolli samples each running VM at the Firecracker boundary.
 
-- CPU, memory, and process usage come from the VM's cgroup; network and disk byte counters come from Firecracker's metrics FIFO.
-- Connection state comes from conntrack entries involving the guest IP.
-- Memory remains a reported health metric.
+- The VM cgroup supplies CPU, memory, and process use. The Firecracker metrics FIFO supplies the
+  network and disk byte counters.
+- Conntrack entries for the guest IP supply the connection state.
+- Barbirolli reports memory as a health metric.
 
-Activity consists of:
+These conditions show activity:
 
-- CPU above its configured threshold
-- network or disk traffic, a process-count change
-- any established TCP connection
+- CPU use above its configured threshold
+- network traffic, disk traffic, or a process-count change
+- an established TCP connection
 
-Each resets the idle timer.
+Each condition resets the idle timer.
 
 ```text
 cpu_percent =
@@ -638,7 +645,8 @@ cpu_threshold =
     idle_high + 0.2 * (active_low - idle_high)
 ```
 
-The default `idle_high` is `0.5%` and `active_low` is `3.0%`, producing a `1.0%` threshold.
+The default `idle_high` is `0.5%`, and the default `active_low` is `3.0%`. With these values, the
+threshold is `1.0%`.
 
 ```mermaid
 flowchart TD
@@ -658,20 +666,21 @@ flowchart TD
     J -- "Still idle" --> K["Graceful VM shutdown"]
 ```
 
-The timing and CPU bands are configurable with `IDLE_INITIAL_INTERVAL_SECONDS`,
-`IDLE_STRIKE_INTERVAL_SECONDS`, `IDLE_FINAL_INTERVAL_SECONDS`, `IDLE_CPU_HIGH_PERCENT`, and
-`IDLE_CPU_LOW_PERCENT`. The first sample and any regressed counter establish a new baseline.
+- `IDLE_INITIAL_INTERVAL_SECONDS`,
+  `IDLE_STRIKE_INTERVAL_SECONDS`, `IDLE_FINAL_INTERVAL_SECONDS`, `IDLE_CPU_HIGH_PERCENT`, and
+  `IDLE_CPU_LOW_PERCENT` sets up the config.
+- The first sample sets a new baseline. A lower counter also sets a new
+  baseline.
 
 ## Testing
 
-- `cargo-mutants` + unit tests for agents + integration tests
-- Test suite covers concurrent operations, restart discovery, cleanup, address allocation,
-  network isolation, and one complete privileged Firecracker lifecycle.
+The test system uses `cargo-mutants`, unit tests for agents, and integration tests.
 
 ```rust
 #[firecracker_test]
 fn bla_test() {}
 ```
 
-Every test that queries the Firecracker API uses this macro from `barbirolli_derive`.
-`RUN_ON_LIMA` handles the complete test environment and reruns the selected test inside Lima.
+Each test that queries the Firecracker API uses this macro from `barbirolli_derive`.
+`RUN_ON_LIMA` prepares the complete test environment. Then it runs the selected test again inside
+Lima.

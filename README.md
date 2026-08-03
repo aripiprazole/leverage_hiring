@@ -2,15 +2,16 @@
 
 ## Limitations/Known problems
 
-- Unrestricted firecracker vmm: It's only running trusted binary / root fs, and it's not running in production.
-- Secret Management using Firecracker MDS: not implemented
-- UDP port bindings: not implemented
+- Unrestricted Firecracker VMM: The VMM runs only trusted binaries and root filesystems. The
+  project does not use it in production.
+- Secret management with Firecracker MDS: The service does not implement this function.
+- UDP port bindings: The service does not implement this function.
 
 ## Lima
 
-The projects should run inside of a Linux machine with KVM support.
+Run the projects in a Linux VM that has KVM support.
 
-> Only tested using Lima on MacOS with Nested Virtualization.
+> Tested the projects only with Lima on macOS and nested virtualization.
 
 ```bash
 limactl start --set '.nestedVirtualization=true' --name=provisioning template://default
@@ -41,16 +42,16 @@ cargo --version
 
 ## Booting
 
-From the macOS host, open a shell in the repository inside Lima:
+On the macOS host, open a shell in the repository inside Lima:
 
 ```bash
 limactl shell --workdir "$PWD" provisioning
 ```
 
-Then, inside Lima:
+In the Lima VM, run these commands:
 
 ```bash
-# dependency install etc
+# Install the dependencies
 ./x daemon:setup
 ./x daemon:run
 ```
@@ -62,30 +63,27 @@ Then, inside Lima:
 ./x vm:create --publish 2222:22 # Create a VM
 ./x vm:start 0 # Start a VM
 ./x vm:shutdown 0 # Stop a VM
-./x vm:status 0 # Check status
+./x vm:status 0 # Check the VM status
 ./x vm:logs 0 # Print retained serial output and follow new output
 ./x vm:delete 0 # Delete a VM
 ```
 
-New VMs use the daemon provisioning default of 256 MiB. The `vm:create` command does not accept a memory option.
+The daemon gives each new VM the default memory size of 256 MiB. The `vm:create` command has no
+memory option.
 
 ## CLI helpers
 
 ```sh
 ./x vm:ps
-./x vm:show 0 # Inspect the current state
-./x vm:ssh 0 # Open SSH using the VM's default key
-./x vm:logs 0 --pull # Print the current retained serial output and exit
-./x vm:logs 0 --attach # Explicit form of the default follow mode
-./x vm:ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use a custom key if you passed --authorized-key-file to vm:create
+./x vm:show 0 # Show the current VM state
+./x vm:ssh 0 # Open SSH with the VM's default key
+./x vm:logs 0 --pull # Print the stored serial output and exit
+./x vm:logs 0 --attach # Use the full form of the default follow mode
+./x vm:ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use the private key that matches --authorized-key-file
 ./x help vm:create # Help for a specific command
 ```
 
-Each VM's raw Firecracker stdout is retained in `$VM_ROOT/<id>/serial.log`. The file is append-only
-across starts and is never truncated or rotated. The same bytes are available from
-`GET /vms/{id}/logs?follow=false`; use `follow=true` to keep waiting for appended output.
-
-If you use the provided Nix shell, `x` is also available in `PATH`:
+When you use the Nix shell, `x` is also in `PATH`:
 
 ```bash
 nix develop --command x help
@@ -93,13 +91,14 @@ nix develop --command x help
 
 ## Examples
 
-Run these from the repository root inside the Linux/Lima guest. Keep
-`./x daemon:run` running in another Linux/Lima terminal.
+Run these commands from the repository root in the Linux/Lima VM. Run `./x daemon:run` in another
+Linux/Lima terminal.
 
 ### OCI image lifecycle
 
-The OCI store is keyed by image name and tag. This pulls Alpine, starts its single VM, stops the
-VM while retaining the pulled image, then removes the stopped lifecycle and its artifacts:
+The OCI store uses the image name and tag as its key. This example pulls Alpine and starts its
+single VM. It then stops the VM and keeps the image. Finally, it removes the stopped lifecycle and
+its artifacts:
 
 ```sh
 ./x oci:pull alpine:latest
@@ -108,8 +107,8 @@ VM while retaining the pulled image, then removes the stopped lifecycle and its 
 ./x oci:rm alpine:latest
 ```
 
-`oci:run` can be used directly when the image is absent; it pulls the image automatically.
-`oci:rm` rejects the request until the VM has been stopped.
+You can use `oci:run` when the image is not in the store. The command pulls the image automatically.
+Stop the VM before you use `oci:rm`.
 
 ### SQLite
 
@@ -148,14 +147,14 @@ VM_ID=$(./x vm:create --publish 8080:80 | jq -r .id)
    python3 -m http.server 80 --directory /srv/hello"
 ```
 
-From another terminal inside the same Linux/Lima guest:
+Run this command in another terminal in the same Linux/Lima VM:
 
 ```sh
 HOST_IP=$(ip -j route get 1.1.1.1 | jq -r '.[0].prefsrc')
 curl --fail "http://$HOST_IP:8080"
 ```
 
-Press `Ctrl-C` in the HTTP server terminal, then run:
+Press `Ctrl-C` in the HTTP server terminal. Then run:
 
 ```sh
 ./x vm:shutdown "$VM_ID"

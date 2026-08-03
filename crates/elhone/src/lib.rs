@@ -380,8 +380,7 @@ impl From<LifecycleError> for ApiError {
             | LifecycleError::CapacityReached { .. }
             | LifecycleError::InvalidTransition { .. } => Self::Conflict(message),
             LifecycleError::Storage(
-                StorageError::SocketDirectory
-                | StorageError::CreatingDirectory
+                StorageError::CreatingDirectory
                 | StorageError::Io { .. }
                 | StorageError::InvalidConfig { .. },
             )

@@ -210,6 +210,10 @@ mod tests {
         let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
 
         let first = fixture.create_vm(TestVmConfig::new(1)).await;
+        assert_eq!(
+            first.api_socket,
+            first.storage.artifact_dir.join("firecracker.socket")
+        );
         first
             .lifecycle
             .start_concurrently(|lifecycle| {
@@ -220,6 +224,10 @@ mod tests {
 
         let second = fixture.create_vm(TestVmConfig::new(2)).await;
         assert_ne!(first.id, second.id);
+        assert_eq!(
+            second.api_socket,
+            second.storage.artifact_dir.join("firecracker.socket")
+        );
         second
             .lifecycle
             .start(|lifecycle| {

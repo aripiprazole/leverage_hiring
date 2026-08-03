@@ -3,8 +3,8 @@ use super::{Result, StorageError};
 use std::{
     collections::HashMap,
     fs::{
-        File, Permissions, canonicalize, copy, create_dir, create_dir_all, read_dir,
-        remove_dir_all, rename, set_permissions,
+        File, Permissions, canonicalize, copy, create_dir_all, read_dir, remove_dir_all, rename,
+        set_permissions,
     },
     future::Future,
     io,
@@ -19,7 +19,6 @@ use validated::Validated;
 use crate::{ApiSocket, MemoryMib, NetworkSpec, Rootfs, VmId, VmInput, VmSpec};
 
 const CONFIG_VERSION: u16 = 4;
-const SOCKET_DIRECTORY: &str = ".sockets";
 
 #[derive(Debug)]
 pub struct VmStore {
@@ -63,10 +62,6 @@ impl VmStore {
         tracing::info!("barbirolli creates the VM store");
         create_dir_all(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
         let vm_root = canonicalize(&vm_root).map_err(|error| StorageError::io(&vm_root, error))?;
-        let socket_dir = vm_root.join(SOCKET_DIRECTORY);
-        if !socket_dir.exists() {
-            create_dir(&socket_dir).map_err(|error| StorageError::io(&socket_dir, error))?;
-        }
         Ok(Self {
             vm_root: VmRootFolder::new(vm_root)?,
             image_root: canonicalize(&image_root)
@@ -114,12 +109,7 @@ impl VmStore {
                 kernel: final_dir.join("vmlinux"),
                 rootfs: Rootfs::from(final_dir.join("rootfs.ext4")),
                 vcpu_count: input.vcpu_count,
-                api_socket: ApiSocket::from(
-                    self.vm_root
-                        .dir
-                        .join(SOCKET_DIRECTORY)
-                        .join(format!("firecracker-{id}.socket")),
-                ),
+                api_socket: ApiSocket::from(final_dir.join("firecracker.socket")),
                 memory_mib,
                 bindings: input.bindings,
                 network: NetworkSpec::new(id)
@@ -501,9 +491,6 @@ impl PathDescriptor {
             .directory
             .file_name()
             .expect("a VM_ROOT directory entry always has a file name");
-        if name == SOCKET_DIRECTORY {
-            return Err(StorageError::SocketDirectory);
-        }
         if name.as_encoded_bytes().starts_with(".creating-".as_bytes()) {
             tracing::warn!(
                 path = %self.directory.display(),
@@ -554,13 +541,7 @@ impl VmRootFolderItem {
                 });
             }
         }
-        let expected_api_socket = ApiSocket::from(
-            directory
-                .parent()
-                .expect("a VM artifact directory always has a parent")
-                .join(SOCKET_DIRECTORY)
-                .join(format!("firecracker-{}.socket", spec.id)),
-        );
+        let expected_api_socket = ApiSocket::from(directory.join("firecracker.socket"));
         if spec.api_socket != expected_api_socket {
             return Err(StorageError::InvalidConfig {
                 path: desc.config.clone(),
@@ -626,7 +607,7 @@ impl VmRootFolder {
             };
             let name = match descriptor.vm_name() {
                 Ok(name) => name,
-                Err(StorageError::CreatingDirectory | StorageError::SocketDirectory) => continue,
+                Err(StorageError::CreatingDirectory) => continue,
                 Err(err) => return Err(err),
             };
             let config = descriptor.config()?;

@@ -18,8 +18,6 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("no VM IDs remain")]
     IdsExhausted,
-    #[error("socket directory")]
-    SocketDirectory,
     #[error("stale VM creation directory")]
     CreatingDirectory,
     #[error("storage operation failed for {path}: {source}")]
@@ -50,7 +48,7 @@ mod tests {
     use std::{fs, io};
 
     use barbirolli::support::{behavior::BehaviorFixture, config::TestVmConfig};
-    use barbirolli::{Port, PortBinding, Rootfs};
+    use barbirolli::{ApiSocket, Port, PortBinding, Rootfs};
     use barbirolli_derive::firecracker_test;
     use serde_json::json;
 
@@ -117,6 +115,11 @@ mod tests {
         assert_eq!(u16::from(alice.spec.id), 0);
         assert!(!alice.spec.deleted);
         assert_eq!(alice.spec.artifact_dir, fixture.storage.vm_root.join("0"));
+        assert_eq!(
+            alice.spec.api_socket,
+            ApiSocket::from(alice.storage.artifact_dir.join("firecracker.socket"))
+        );
+        assert!(!fixture.storage.vm_root.join(".sockets").exists());
         assert_eq!(
             fs::read(alice.storage.kernel()).expect("failed to read copied kernel"),
             b"kernel"
@@ -205,12 +208,25 @@ mod tests {
             .expect("Alice's persisted VM was not discovered");
         assert!(!reopened_alice.spec.deleted);
         assert_eq!(reopened_alice.spec.api_socket, alice.spec.api_socket);
+        assert_eq!(
+            reopened_alice.spec.api_socket,
+            ApiSocket::from(
+                reopened_alice
+                    .storage
+                    .artifact_dir
+                    .join("firecracker.socket")
+            )
+        );
         let reopened_bob = discovered
             .iter()
             .find(|vm| vm.spec.id == bob.spec.id)
             .expect("Bob's persisted VM was not discovered");
         assert!(!reopened_bob.spec.deleted);
         assert_eq!(reopened_bob.spec.api_socket, bob.spec.api_socket);
+        assert_eq!(
+            reopened_bob.spec.api_socket,
+            ApiSocket::from(reopened_bob.storage.artifact_dir.join("firecracker.socket"))
+        );
         assert_eq!(
             reopened_bob.spec.bindings,
             vec![PortBinding {
