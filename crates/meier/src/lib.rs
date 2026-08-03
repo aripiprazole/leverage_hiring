@@ -1,4 +1,4 @@
-#![doc = "Cross-platform command-line access to the Barbirolli VM service."]
+//! Cross-platform command-line access to the Barbirolli VM service.
 
 pub mod cli {
     use std::{
@@ -12,7 +12,7 @@ pub mod cli {
 
     use crate::{
         MeierError, Result,
-        client::{ApiClient, connect},
+        client::ApiClient,
         config::{self, Config},
         setup,
     };
@@ -107,7 +107,7 @@ pub mod cli {
     impl FromStr for PortMapping {
         type Err = String;
 
-        fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
             let (external, internal) = value
                 .split_once(':')
                 .filter(|(external, internal)| {
@@ -147,7 +147,7 @@ pub mod cli {
     impl FromStr for VmId {
         type Err = String;
 
-        fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
             let id = value
                 .parse::<u16>()
                 .map_err(|_| "VM ID must be an integer from 0 to 16383".to_owned())?;
@@ -203,7 +203,7 @@ pub mod cli {
     impl FromStr for ImageReference {
         type Err = String;
 
-        fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
             let (name, tag) = value.rsplit_once(':').ok_or_else(|| {
                 format!("expected a Docker image like alpine:latest, got {value:?}")
             })?;
@@ -244,6 +244,11 @@ pub mod cli {
             })
     }
 
+    /// Parse the process arguments, printing help or version output directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the arguments do not form a valid command.
     pub fn parse_args() -> Result<Cli> {
         match Cli::try_parse() {
             Ok(cli) => Ok(cli),
@@ -266,6 +271,17 @@ pub mod cli {
             matches!(self.command, Command::Config(ConfigCommand::Init))
         }
 
+        #[must_use]
+        pub(crate) fn has_json_output(&self) -> bool {
+            match &self.command {
+                Command::Daemon(DaemonCommand::Run)
+                | Command::Vm(VmCommand::Ssh(_) | VmCommand::Logs(_)) => false,
+                #[cfg(feature = "daemon")]
+                Command::InternalDaemon(_) => false,
+                _ => true,
+            }
+        }
+
         #[cfg(feature = "daemon")]
         #[must_use]
         pub fn internal_daemon_args(&self) -> Option<&DaemonInternalArgs> {
@@ -277,12 +293,17 @@ pub mod cli {
     }
 
     impl Cli {
-        pub async fn dispatch(&self, config_path: &Path) -> Result<()> {
+        /// Dispatch a command that does not require an existing configuration.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when configuration initialization fails or when the
+        /// selected command requires an existing configuration.
+        pub fn dispatch(&self, config_path: &Path) -> Result<Value> {
             match &self.command {
                 Command::Config(ConfigCommand::Init) => {
                     let config = config::init(config_path)?;
-                    println!("{}", serde_json::to_string_pretty(&config)?);
-                    Ok(())
+                    serde_json::to_value(config).map_err(MeierError::from)
                 }
                 _ => Err(MeierError::ConfigRead {
                     path: config_path.to_path_buf(),
@@ -294,11 +315,17 @@ pub mod cli {
             }
         }
 
+        /// Dispatch a command using an existing configuration.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the command is invalid or its setup, transport,
+        /// or daemon operation fails.
         pub async fn dispatch_with_config(
             &self,
             config_path: &Path,
             config: &Config,
-        ) -> Result<()> {
+        ) -> Result<Value> {
             // Do not record the parsed command: it can contain authorized-key
             // paths and, for `vm ssh`, arbitrary remote command arguments.
             tracing::info!("dispatching Meier command");
@@ -309,13 +336,12 @@ pub mod cli {
                 )),
                 Command::Daemon(DaemonCommand::Setup) => {
                     setup::setup(config).await?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json!({"status": "ready"}))?
-                    );
-                    Ok(())
+                    Ok(json!({"status": "ready"}))
                 }
-                Command::Daemon(DaemonCommand::Run) => setup::run_daemon(config, config_path).await,
+                Command::Daemon(DaemonCommand::Run) => {
+                    setup::run_daemon(config, config_path).await?;
+                    Ok(Value::Null)
+                }
                 Command::Vm(command) => command.dispatch(config).await,
                 Command::Oci(command) => command.dispatch(config).await,
                 #[cfg(feature = "daemon")]
@@ -328,66 +354,62 @@ pub mod cli {
     }
 
     impl VmCommand {
-        async fn dispatch(&self, config: &Config) -> Result<()> {
+        async fn dispatch(&self, config: &Config) -> Result<Value> {
             match self {
                 Self::Create(args) => {
                     let body = args.payload()?;
-                    let value = connect(config).await?.post("/vms", Some(body)).await?;
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    Ok(())
+                    config.connect().await?.post("/vms", Some(body)).await
                 }
-                Self::Ps => {
-                    let value = connect(config).await?.get("/vms").await?;
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    Ok(())
-                }
+                Self::Ps => config.connect().await?.get("/vms").await,
                 Self::Show(args) => args.show_status(config, "").await,
                 Self::Status(args) => args.show_status(config, "/status").await,
                 Self::Start(args) => args.mutate(config, "start").await,
                 Self::Shutdown(args) => args.mutate(config, "shutdown").await,
                 Self::Delete(args) => {
-                    let value = connect(config)
+                    config
+                        .connect()
                         .await?
                         .delete(&format!("/vms/{}", args.id))
-                        .await?;
-                    println!("{}", serde_json::to_string_pretty(&value)?);
-                    Ok(())
+                        .await
                 }
                 Self::Logs(args) => {
                     let follow = args.attach || !args.pull;
-                    connect(config)
+                    config
+                        .connect()
                         .await?
                         .stream_logs(args.id.get(), follow)
-                        .await
+                        .await?;
+                    Ok(Value::Null)
                 }
-                Self::Ssh(args) => connect(config).await?.ssh(args).await,
+                Self::Ssh(args) => {
+                    config.connect().await?.ssh(args).await?;
+                    Ok(Value::Null)
+                }
             }
         }
     }
 
     impl IdArgs {
-        async fn show_status(&self, config: &Config, suffix: &str) -> Result<()> {
-            let value = connect(config)
+        async fn show_status(&self, config: &Config, suffix: &str) -> Result<Value> {
+            config
+                .connect()
                 .await?
                 .get(&format!("/vms/{}{suffix}", self.id))
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
+                .await
         }
 
-        async fn mutate(&self, config: &Config, operation: &str) -> Result<()> {
-            let value = connect(config)
+        async fn mutate(&self, config: &Config, operation: &str) -> Result<Value> {
+            config
+                .connect()
                 .await?
                 .post(&format!("/vms/{}/{}", self.id, operation), None)
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
+                .await
         }
     }
 
     impl OciCommand {
-        async fn dispatch(&self, config: &Config) -> Result<()> {
-            let client = connect(config).await?;
+        async fn dispatch(&self, config: &Config) -> Result<Value> {
+            let client = config.connect().await?;
             let value = match self {
                 Self::Pull(args) => {
                     let token = args.image.docker_token(&client).await?;
@@ -438,8 +460,7 @@ pub mod cli {
                         .await?
                 }
             };
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
+            Ok(value)
         }
     }
 
@@ -472,7 +493,7 @@ pub mod cli {
 
     impl CreateArgs {
         #[tracing::instrument(skip(self), fields(authorized_key_file_count = self.authorized_key_file.len()))]
-        fn payload(&self) -> Result<Value> {
+        pub(crate) fn payload(&self) -> Result<Value> {
             let bindings = self
                 .publish
                 .iter()
@@ -514,44 +535,6 @@ pub mod cli {
                 "authorized_keys": authorized_keys,
                 "bindings": bindings,
             }))
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn create_payload_uses_external_then_internal_mapping() {
-            let payload = CreateArgs {
-                vcpu_count: 2,
-                publish: vec!["2222:22".parse().expect("mapping")],
-                authorized_key_file: Vec::new(),
-            }
-            .payload()
-            .expect("payload should be valid");
-            assert_eq!(
-                payload["bindings"][0],
-                json!({"internal": 22, "external": 2222})
-            );
-        }
-
-        #[test]
-        fn image_parser_preserves_registry_name_and_tag() {
-            assert_eq!(
-                "library/alpine:latest".parse::<ImageReference>().unwrap(),
-                ImageReference {
-                    name: "library/alpine".to_owned(),
-                    tag: "latest".to_owned(),
-                }
-            );
-        }
-
-        #[test]
-        fn image_parser_rejects_invalid_docker_references() {
-            for value in ["Alpine:latest", "alpine:", "alpine:latest!", "alpine:."] {
-                assert!(value.parse::<ImageReference>().is_err(), "{value}");
-            }
         }
     }
 }
@@ -644,7 +627,7 @@ mod client {
                         path
                     ));
                     let output = lima::capture(instance, &args).await?;
-                    http_response_from_lima(output)?.json()
+                    http_response_from_lima(&output)?.json()
                 }
             }
         }
@@ -725,34 +708,36 @@ mod client {
         }
     }
 
-    pub(crate) async fn connect(config: &Config) -> Result<ApiClient> {
-        // `reqwest` is built with `rustls-no-provider` so the binary controls
-        // provider installation explicitly and does not panic on first use.
-        match rustls::crypto::ring::default_provider().install_default() {
-            Ok(()) => tracing::debug!("installed the rustls crypto provider"),
-            Err(error) => {
-                tracing::debug!(error = ?error, "using the existing rustls crypto provider")
+    impl Config {
+        pub(crate) async fn connect(&self) -> Result<ApiClient> {
+            // `reqwest` is built with `rustls-no-provider` so the binary controls
+            // provider installation explicitly and does not panic on first use.
+            match rustls::crypto::ring::default_provider().install_default() {
+                Ok(()) => tracing::debug!("installed the rustls crypto provider"),
+                Err(error) => {
+                    tracing::debug!(error = ?error, "using the existing rustls crypto provider");
+                }
             }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            lima::ensure_running(&config.lima.instance).await?;
-            Ok(ApiClient {
-                config: config.clone(),
-                transport: Transport::Lima {
-                    instance: config.lima.instance.clone(),
-                },
-            })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .build()?;
-            Ok(ApiClient {
-                config: config.clone(),
-                transport: Transport::Local(client),
-            })
+            #[cfg(target_os = "macos")]
+            {
+                lima::ensure_running(&self.lima.instance).await?;
+                Ok(ApiClient {
+                    config: self.clone(),
+                    transport: Transport::Lima {
+                        instance: self.lima.instance.clone(),
+                    },
+                })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let client = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .build()?;
+                Ok(ApiClient {
+                    config: self.clone(),
+                    transport: Transport::Local(client),
+                })
+            }
         }
     }
 
@@ -768,7 +753,7 @@ mod client {
         }
     }
 
-    fn http_response_from_lima(output: std::process::Output) -> Result<HttpResponse> {
+    fn http_response_from_lima(output: &std::process::Output) -> Result<HttpResponse> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let Some((body, status)) = stdout.rsplit_once(STATUS_MARKER) else {
             return Err(MeierError::Lima {
@@ -800,11 +785,10 @@ mod client {
 
         fn error(&self) -> MeierError {
             let message = match serde_json::from_slice::<Value>(&self.body) {
-                Ok(value) => value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| String::from_utf8_lossy(&self.body).trim().to_owned()),
+                Ok(value) => value.get("error").and_then(Value::as_str).map_or_else(
+                    || String::from_utf8_lossy(&self.body).trim().to_owned(),
+                    str::to_owned,
+                ),
                 Err(error) => {
                     tracing::debug!(%error, status = self.status, "HTTP error body was not JSON");
                     String::from_utf8_lossy(&self.body).trim().to_owned()
@@ -848,8 +832,7 @@ mod client {
                 )));
             }
             wait_for_ssh(&self.config, &identity, guest_ip).await?;
-            let mut command =
-                ssh_command(&self.config, &identity, guest_ip, &args.command, false).await?;
+            let mut command = ssh_command(&self.config, &identity, guest_ip, &args.command, false);
             tracing::info!(vm_id = %args.id, %guest_ip, "starting SSH session");
             command
                 .stdin(Stdio::inherit())
@@ -869,8 +852,7 @@ mod client {
 
     async fn wait_for_ssh(config: &Config, identity: &Path, guest_ip: &str) -> Result<()> {
         for _ in 0..30 {
-            let mut command =
-                ssh_command(config, identity, guest_ip, &["true".to_owned()], true).await?;
+            let mut command = ssh_command(config, identity, guest_ip, &["true".to_owned()], true);
             command
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -885,13 +867,13 @@ mod client {
         )))
     }
 
-    async fn ssh_command(
+    fn ssh_command(
         config: &Config,
         identity: &Path,
         guest_ip: &str,
         remote_command: &[String],
         batch_mode: bool,
-    ) -> Result<Command> {
+    ) -> Command {
         let mut args = vec![
             "-i".to_owned(),
             identity.display().to_string(),
@@ -921,14 +903,14 @@ mod client {
                 .arg("--")
                 .arg("ssh")
                 .args(args);
-            Ok(command)
+            command
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = config;
             let mut command = Command::new("ssh");
             command.args(args);
-            Ok(command)
+            command
         }
     }
 
@@ -1028,9 +1010,10 @@ pub mod config {
 
     #[must_use]
     pub fn default_path() -> PathBuf {
-        home_dir()
-            .map(|home| home.join(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE))
+        home_dir().map_or_else(
+            || PathBuf::from(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE),
+            |home| home.join(DEFAULT_CONFIG_DIR).join(DEFAULT_CONFIG_FILE),
+        )
     }
 
     #[must_use]
@@ -1038,6 +1021,12 @@ pub mod config {
         env::var_os("HOME").map(PathBuf::from)
     }
 
+    /// Load and decode a configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or does not contain a
+    /// valid Meier configuration.
     #[tracing::instrument(skip_all, fields(path = %path.display()), err)]
     pub fn load(path: &Path) -> Result<Config> {
         let bytes = fs::read(path).map_err(|source| MeierError::ConfigRead {
@@ -1050,6 +1039,12 @@ pub mod config {
         })
     }
 
+    /// Create a new configuration file with the documented defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent directory or file cannot be created,
+    /// the defaults cannot be serialized, or the file already exists.
     #[tracing::instrument(skip_all, fields(path = %path.display()), err)]
     pub fn init(path: &Path) -> Result<Config> {
         let parent = path
@@ -1118,6 +1113,12 @@ pub mod config {
     }
 
     impl Config {
+        /// Resolve the configured runtime directory into all managed paths.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when a home-relative runtime directory is configured
+        /// but `HOME` is not set.
         #[tracing::instrument(skip(self), err)]
         pub fn runtime_paths(&self) -> Result<RuntimePaths> {
             let root = self.daemon.expand_runtime_dir()?;
@@ -1138,19 +1139,6 @@ pub mod config {
                 vms,
                 ssh,
             })
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn defaults_match_the_documented_file() {
-            let encoded = serde_json::to_value(Config::default()).expect("config serializes");
-            assert_eq!(encoded["lima"]["instance"], "provisioning");
-            assert_eq!(encoded["client"]["url"], "http://127.0.0.1:3000");
-            assert_eq!(encoded["daemon"]["listen"], "127.0.0.1:3000");
         }
     }
 }
@@ -1427,12 +1415,12 @@ mod setup {
     const FIRECRACKER_CI_VERSION: &str = "v1.13";
     const KERNEL_VERSION: &str = "6.1.141";
     const ROOTFS_VERSION: &str = "24.04";
-    const ROOTFS_LAYOUT_VERSION: &str = "package-manager-runtime-v4";
-    const DEFAULT_PROCESS_SPEC: &str = include_str!("../default-process.json");
+    pub(crate) const ROOTFS_LAYOUT_VERSION: &str = "package-manager-runtime-v4";
+    pub(crate) const DEFAULT_PROCESS_SPEC: &str = include_str!("../default-process.json");
 
     #[allow(dead_code)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Target {
+    pub(crate) enum Target {
         Local,
         Lima,
     }
@@ -1606,20 +1594,20 @@ mod setup {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Architecture {
+    pub(crate) enum Architecture {
         Aarch64,
         X86_64,
     }
 
     impl Architecture {
-        fn target_triple(&self) -> &'static str {
+        pub(crate) fn target_triple(self) -> &'static str {
             match self {
                 Self::Aarch64 => "aarch64-unknown-linux-musl",
                 Self::X86_64 => "x86_64-unknown-linux-musl",
             }
         }
 
-        fn download_name(&self) -> &'static str {
+        pub(crate) fn download_name(self) -> &'static str {
             match self {
                 Self::Aarch64 => "aarch64",
                 Self::X86_64 => "x86_64",
@@ -1754,28 +1742,28 @@ mod setup {
     }
 
     #[derive(Debug, Clone)]
-    struct TargetPaths {
+    pub(crate) struct TargetPaths {
         root: String,
         downloads: String,
-        images: String,
+        pub(crate) images: String,
         vms: String,
-        ssh: String,
+        pub(crate) ssh: String,
         firecracker: String,
         entrypoint: String,
         daemon_binary: String,
         kernel: String,
-        rootfs: String,
+        pub(crate) rootfs: String,
         squashfs: String,
-        authorized_keys: String,
+        pub(crate) authorized_keys: String,
         private_key: String,
-        rootfs_key_marker: String,
-        rootfs_resolver_marker: String,
-        rootfs_layout_marker: String,
-        rootfs_process_marker: String,
+        pub(crate) rootfs_key_marker: String,
+        pub(crate) rootfs_resolver_marker: String,
+        pub(crate) rootfs_layout_marker: String,
+        pub(crate) rootfs_process_marker: String,
     }
 
     #[tracing::instrument(skip_all, err)]
-    fn target_paths(config: &Config) -> Result<TargetPaths> {
+    pub(crate) fn target_paths(config: &Config) -> Result<TargetPaths> {
         #[cfg(target_os = "macos")]
         let root = if config.daemon.runtime_dir == "~" {
             "$HOME".to_owned()
@@ -1863,50 +1851,40 @@ mod setup {
                     quote(&target_triple),
                     quote(&self.entrypoint),
                 ),
-                None => format!(
-                    "cargo install --locked --version ={} --root {} --target {} barbirolli_entrypoint",
-                    env!("CARGO_PKG_VERSION"),
-                    quote(&self.root),
-                    quote(&target_triple),
-                ),
+                None => packaged_entrypoint_install_command(&self.root, &target_triple),
             };
             target.shell(instance, &command).await.map(|_| ())
         }
 
         #[tracing::instrument(skip_all, fields(instance = %instance, runtime = %self.root), err)]
         async fn install_daemon_binary(&self, target: &Target, instance: &str) -> Result<()> {
-            let daemon_exists = target
-            .output(
-                instance,
-                &[
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    format!(
-                        "test -x {} && {} --version 2>/dev/null | grep -q '^meier {}$' && {} __daemon --help >/dev/null 2>&1",
-                        quote(&self.daemon_binary),
-                        quote(&self.daemon_binary),
-                        env!("CARGO_PKG_VERSION"),
-                        quote(&self.daemon_binary),
-                    ),
-                ],
-            )
-            .await?
-            .status
-            .success();
-            if daemon_exists {
+            let workspace = workspace_root()?;
+            let daemon_exists = if workspace.is_none() {
+                target
+                    .output(
+                        instance,
+                        &[
+                            "sh".to_owned(),
+                            "-c".to_owned(),
+                            format!(
+                                "test -x {} && {} --version 2>/dev/null | grep -q '^meier {}$' && {} __daemon --help >/dev/null 2>&1",
+                                quote(&self.daemon_binary),
+                                quote(&self.daemon_binary),
+                                env!("CARGO_PKG_VERSION"),
+                                quote(&self.daemon_binary),
+                            ),
+                        ],
+                    )
+                    .await?
+                    .status
+                    .success()
+            } else {
+                false
+            };
+            let Some(command) =
+                daemon_install_command(workspace.as_deref(), &self.root, daemon_exists)
+            else {
                 return Ok(());
-            }
-            let command = match workspace_root()? {
-                Some(workspace) => format!(
-                    "cargo install --locked --path {} --root {} --bin meier --features daemon --force",
-                    quote(&workspace.join("crates/meier").display().to_string()),
-                    quote(&self.root),
-                ),
-                None => format!(
-                    "cargo install --locked --version ={} --root {} --bin meier --features daemon meier",
-                    env!("CARGO_PKG_VERSION"),
-                    quote(&self.root),
-                ),
             };
             target.shell(instance, &command).await.map(|_| ())
         }
@@ -2072,23 +2050,34 @@ mod setup {
 
     impl TargetPaths {
         #[tracing::instrument(skip_all, fields(instance = %instance, runtime = %self.root), err)]
+        pub(crate) async fn rootfs_is_prepared(
+            &self,
+            target: &Target,
+            instance: &str,
+        ) -> Result<bool> {
+            let markers_match = target
+                .probe(
+                    instance,
+                    &format!(
+                        "test -s {} && cmp -s {} {} && grep -qx 'nameserver 1.1.1.1' {} && grep -qx {} {}",
+                        quote(&self.rootfs),
+                        quote(&self.authorized_keys),
+                        quote(&self.rootfs_key_marker),
+                        quote(&self.rootfs_resolver_marker),
+                        quote(ROOTFS_LAYOUT_VERSION),
+                        quote(&self.rootfs_layout_marker),
+                    ),
+                )
+                .await?;
+            if !markers_match {
+                return Ok(false);
+            }
+            self.process_spec_matches(*target, instance).await
+        }
+
+        #[tracing::instrument(skip_all, fields(instance = %instance, runtime = %self.root), err)]
         async fn prepare_rootfs(&self, target: &Target, instance: &str) -> Result<()> {
-            let ready = target
-            .probe(
-                instance,
-                &format!(
-                    "test -s {} && cmp -s {} {} && grep -qx 'nameserver 1.1.1.1' {} && grep -qx {} {} && test -s {}",
-                    quote(&self.rootfs),
-                    quote(&self.authorized_keys),
-                    quote(&self.rootfs_key_marker),
-                    quote(&self.rootfs_resolver_marker),
-                    quote(ROOTFS_LAYOUT_VERSION),
-                    quote(&self.rootfs_layout_marker),
-                    quote(&self.rootfs_process_marker),
-                ),
-            )
-            .await?;
-            if ready {
+            if self.rootfs_is_prepared(target, instance).await? {
                 return Ok(());
             }
             let squashfs_present = target
@@ -2119,11 +2108,7 @@ mod setup {
                 layout_marker = quote(&self.rootfs_layout_marker),
                 process_marker = quote(&self.rootfs_process_marker),
             );
-            let transfer = format!(
-                "cat > {} <<'MEIER_PROCESS_SPEC'\\n{}\\nMEIER_PROCESS_SPEC",
-                quote(&process),
-                DEFAULT_PROCESS_SPEC.trim_end(),
-            );
+            let transfer = process_spec_transfer(&process);
             if let Err(primary) = target.shell(instance, &transfer).await {
                 return match self.remove_process_spec(target, instance, &process).await {
                     Ok(()) => Err(primary),
@@ -2207,6 +2192,45 @@ mod setup {
                 .map(|_| ())
         }
     }
+
+    pub(crate) fn packaged_entrypoint_install_command(root: &str, target_triple: &str) -> String {
+        format!(
+            "set -eu; rustup target add {target}; cargo install --locked --version ={version} --root {root} --target {target} barbirolli_entrypoint",
+            target = quote(target_triple),
+            version = env!("CARGO_PKG_VERSION"),
+            root = quote(root),
+        )
+    }
+
+    pub(crate) fn daemon_install_command(
+        workspace: Option<&Path>,
+        root: &str,
+        installed_daemon_is_current: bool,
+    ) -> Option<String> {
+        if let Some(workspace) = workspace {
+            return Some(format!(
+                "cargo install --locked --path {} --root {} --bin meier --features daemon --force",
+                quote(&workspace.join("crates/meier").display().to_string()),
+                quote(root),
+            ));
+        }
+        (!installed_daemon_is_current).then(|| {
+            format!(
+                "cargo install --locked --version ={} --root {} --bin meier --features daemon meier",
+                env!("CARGO_PKG_VERSION"),
+                quote(root),
+            )
+        })
+    }
+
+    pub(crate) fn process_spec_transfer(destination: &str) -> String {
+        format!(
+            "cat > {} <<'MEIER_PROCESS_SPEC'\n{}\nMEIER_PROCESS_SPEC",
+            quote(destination),
+            DEFAULT_PROCESS_SPEC.trim_end(),
+        )
+    }
+
     #[tracing::instrument(skip_all, err)]
     fn workspace_root() -> Result<Option<PathBuf>> {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2239,7 +2263,7 @@ mod setup {
         }
     }
 
-    fn quote(value: &str) -> String {
+    pub(crate) fn quote(value: &str) -> String {
         if value == "$HOME" {
             return "\"$HOME\"".to_owned();
         }
@@ -2252,46 +2276,6 @@ mod setup {
             return format!("\"$HOME/{escaped}\"");
         }
         format!("'{}'", value.replace('\'', "'\\''"))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn architecture_aliases_parse_before_downloads() {
-            assert_eq!(
-                "aarch64".parse::<Architecture>().unwrap().download_name(),
-                "aarch64"
-            );
-            assert_eq!(
-                "arm64".parse::<Architecture>().unwrap().download_name(),
-                "aarch64"
-            );
-            assert_eq!(
-                "amd64".parse::<Architecture>().unwrap().download_name(),
-                "x86_64"
-            );
-            assert!("riscv64".parse::<Architecture>().is_err());
-            assert_eq!(
-                "aarch64".parse::<Architecture>().unwrap().target_triple(),
-                "aarch64-unknown-linux-musl"
-            );
-            assert_eq!(
-                "x86_64".parse::<Architecture>().unwrap().target_triple(),
-                "x86_64-unknown-linux-musl"
-            );
-        }
-
-        #[test]
-        fn shell_paths_keep_guest_home_expansion_but_quote_other_values() {
-            assert_eq!(quote("$HOME"), "\"$HOME\"");
-            assert_eq!(
-                quote("$HOME/.local/share/barbirolli"),
-                "\"$HOME/.local/share/barbirolli\""
-            );
-            assert_eq!(quote("/tmp/a path"), "'/tmp/a path'");
-        }
     }
 }
 
@@ -2327,6 +2311,11 @@ pub mod daemon {
     }
 
     impl Config {
+        /// Build daemon settings from the configured runtime paths.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the runtime directory cannot be resolved.
         #[tracing::instrument(skip(self), err)]
         pub fn daemon_settings(&self) -> Result<DaemonSettings> {
             let paths = self.runtime_paths()?;
@@ -2336,8 +2325,8 @@ pub mod daemon {
                 firecracker: paths.firecracker,
                 barbirolli_entrypoint: paths.entrypoint,
                 listen: self.daemon.listen,
-                idle_initial_interval: Duration::from_secs(300),
-                idle_strike_interval: Duration::from_secs(60),
+                idle_initial_interval: Duration::from_mins(5),
+                idle_strike_interval: Duration::from_mins(1),
                 idle_final_interval: Duration::from_secs(30),
                 idle_cpu_high_percent: 0.5,
                 idle_cpu_low_percent: 3.0,
@@ -2346,6 +2335,11 @@ pub mod daemon {
     }
 
     /// Run the daemon using a previously loaded configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when runtime paths cannot be resolved or the daemon
+    /// cannot start, serve, or shut down cleanly.
     #[cfg(target_os = "linux")]
     pub async fn run(config: Config) -> Result<()> {
         run_with_settings(config.daemon_settings()?).await
@@ -2353,6 +2347,10 @@ pub mod daemon {
 
     /// The daemon feature is available in the workspace compatibility binary,
     /// but the service itself has no native macOS implementation.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an unsupported-platform error outside Linux.
     #[cfg(not(target_os = "linux"))]
     #[tracing::instrument(skip(_config), err)]
     pub async fn run(_config: Config) -> Result<()> {
@@ -2364,6 +2362,11 @@ pub mod daemon {
 
     /// Run the daemon with settings supplied by a caller that retains a
     /// compatibility configuration format, such as the root `ssh` binary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot initialize, bind, serve, or shut
+    /// down cleanly.
     #[cfg(target_os = "linux")]
     #[tracing::instrument(skip(settings), fields(addr = %settings.listen), err)]
     pub async fn run_with_settings(settings: DaemonSettings) -> Result<()> {
@@ -2433,6 +2436,11 @@ pub mod daemon {
         }
     }
 
+    /// Reject a daemon launch on a platform without a native implementation.
+    ///
+    /// # Errors
+    ///
+    /// Always returns an unsupported-platform error outside Linux.
     #[cfg(not(target_os = "linux"))]
     #[tracing::instrument(skip(_settings), err)]
     pub async fn run_with_settings(_settings: DaemonSettings) -> Result<()> {
@@ -2445,6 +2453,11 @@ pub mod daemon {
     /// Load the launcher-selected configuration and run the daemon in the
     /// foreground. This is called by the hidden command in the same executable as
     /// the public client commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration cannot be loaded or the daemon
+    /// cannot run.
     #[tracing::instrument(skip(runtime_dir), fields(config_path = %config_path.display()), err)]
     pub async fn run_from_cli(config_path: PathBuf, runtime_dir: Option<PathBuf>) -> Result<()> {
         let mut config = config::load(&config_path)?;
@@ -2457,22 +2470,36 @@ pub mod daemon {
 
 pub use error::{MeierError, SetupError};
 
-pub type Result<T> = std::result::Result<T, MeierError>;
+pub type Result<T, E = MeierError> = std::result::Result<T, E>;
 
-/// Run the command-line application.
-pub async fn run() -> Result<()> {
+/// Build the structured error document emitted by the `meier` binary.
+#[must_use]
+pub fn error_body(error: &MeierError) -> serde_json::Value {
+    serde_json::json!({"error": error.to_string()})
+}
+
+fn tracing_filter(directives: Option<&str>) -> Result<tracing_subscriber::EnvFilter> {
+    match directives {
+        Some(directives) => tracing_subscriber::EnvFilter::try_new(directives)
+            .map_err(|error| MeierError::Validation(format!("invalid RUST_LOG filter: {error}"))),
+        None => Ok(tracing_subscriber::EnvFilter::new("off")),
+    }
+}
+
+/// Run the command-line application and return its structured output.
+///
+/// # Errors
+///
+/// Returns an error when tracing configuration, argument parsing, configuration
+/// loading, command validation, setup, transport, or daemon execution fails.
+pub async fn run() -> Result<Option<serde_json::Value>> {
     let filter = match std::env::var("RUST_LOG") {
-        Ok(directives) => match tracing_subscriber::EnvFilter::try_new(directives) {
-            Ok(filter) => filter,
-            Err(error) => {
-                eprintln!("invalid RUST_LOG filter: {error}; using info");
-                tracing_subscriber::EnvFilter::new("info")
-            }
-        },
-        Err(std::env::VarError::NotPresent) => tracing_subscriber::EnvFilter::new("info"),
+        Ok(directives) => tracing_filter(Some(&directives))?,
+        Err(std::env::VarError::NotPresent) => tracing_filter(None)?,
         Err(error) => {
-            eprintln!("could not read RUST_LOG: {error}; using info");
-            tracing_subscriber::EnvFilter::new("info")
+            return Err(MeierError::Validation(format!(
+                "could not read RUST_LOG: {error}"
+            )));
         }
     };
     let tracing_result = tracing_subscriber::fmt()
@@ -2488,13 +2515,635 @@ pub async fn run() -> Result<()> {
 
     #[cfg(feature = "daemon")]
     if let Some(args) = cli.internal_daemon_args() {
-        return daemon::run_from_cli(config_path, args.runtime_dir.clone()).await;
+        daemon::run_from_cli(config_path, args.runtime_dir.clone()).await?;
+        return Ok(None);
     }
 
-    if cli.is_bootstrap_command() {
-        return cli.dispatch(&config_path).await;
+    let has_json_output = cli.has_json_output();
+    let value = if cli.is_bootstrap_command() {
+        cli.dispatch(&config_path)?
+    } else {
+        let config = config::load(&config_path)?;
+        cli.dispatch_with_config(&config_path, &config).await?
+    };
+    Ok(has_json_output.then_some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use clap::Parser;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{error_body, tracing_filter};
+    use crate::{
+        cli::{Cli, Command, ConfigCommand, CreateArgs, DaemonCommand, ImageReference, OciCommand},
+        config::{self, Config},
+        setup,
+    };
+
+    #[cfg(target_os = "linux")]
+    use std::{str::FromStr, sync::Arc};
+
+    #[cfg(target_os = "linux")]
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        extract::State,
+        http::{Request, StatusCode},
+        response::Response,
+        routing::any,
+    };
+    #[cfg(target_os = "linux")]
+    use tokio::sync::{Mutex as TokioMutex, oneshot};
+
+    #[test]
+    fn create_payload_uses_external_then_internal_mapping() {
+        let payload = CreateArgs {
+            vcpu_count: 2,
+            publish: vec!["2222:22".parse().expect("mapping")],
+            authorized_key_file: Vec::new(),
+        }
+        .payload()
+        .expect("payload should be valid");
+        assert_eq!(
+            payload["bindings"][0],
+            json!({"internal": 22, "external": 2222})
+        );
     }
 
-    let config = config::load(&config_path)?;
-    cli.dispatch_with_config(&config_path, &config).await
+    #[test]
+    fn image_parser_preserves_registry_name_and_tag() {
+        assert_eq!(
+            "library/alpine:latest".parse::<ImageReference>().unwrap(),
+            ImageReference {
+                name: "library/alpine".to_owned(),
+                tag: "latest".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn image_parser_rejects_invalid_docker_references() {
+        for value in ["Alpine:latest", "alpine:", "alpine:latest!", "alpine:."] {
+            assert!(value.parse::<ImageReference>().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn defaults_match_the_documented_file() {
+        let encoded = serde_json::to_value(Config::default()).expect("config serializes");
+        assert_eq!(encoded["lima"]["instance"], "provisioning");
+        assert_eq!(encoded["client"]["url"], "http://127.0.0.1:3000");
+        assert_eq!(encoded["daemon"]["listen"], "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn architecture_aliases_parse_before_downloads() {
+        let aarch64 = "aarch64".parse::<setup::Architecture>().expect("aarch64");
+        assert_eq!(
+            (aarch64.download_name(), aarch64.target_triple()),
+            ("aarch64", "aarch64-unknown-linux-musl"),
+        );
+        let arm64 = "arm64".parse::<setup::Architecture>().expect("arm64");
+        assert_eq!(
+            (arm64.download_name(), arm64.target_triple()),
+            ("aarch64", "aarch64-unknown-linux-musl"),
+        );
+        let amd64 = "amd64".parse::<setup::Architecture>().expect("amd64");
+        assert_eq!(
+            (amd64.download_name(), amd64.target_triple()),
+            ("x86_64", "x86_64-unknown-linux-musl"),
+        );
+        assert!("riscv64".parse::<setup::Architecture>().is_err());
+    }
+
+    #[test]
+    fn shell_paths_keep_guest_home_expansion_but_quote_other_values() {
+        assert_eq!(setup::quote("$HOME"), "\"$HOME\"");
+        assert_eq!(
+            setup::quote("$HOME/.local/share/barbirolli"),
+            "\"$HOME/.local/share/barbirolli\""
+        );
+        assert_eq!(setup::quote("/tmp/a path"), "'/tmp/a path'");
+    }
+
+    #[test]
+    fn packaged_entrypoint_install_provisions_its_musl_target_first() {
+        let command = setup::packaged_entrypoint_install_command(
+            "/tmp/meier runtime",
+            "x86_64-unknown-linux-musl",
+        );
+        let rustup = command
+            .find("rustup target add 'x86_64-unknown-linux-musl'")
+            .expect("target provisioning command");
+        let install = command
+            .find("cargo install")
+            .expect("entrypoint installation command");
+        assert!(rustup < install);
+    }
+
+    #[test]
+    fn workspace_daemon_install_is_forced_even_when_the_version_matches() {
+        let workspace = Path::new("/tmp/meier-workspace");
+        let command = setup::daemon_install_command(Some(workspace), "/tmp/runtime", true)
+            .expect("workspace builds must refresh the daemon");
+        assert!(command.contains("--path '/tmp/meier-workspace/crates/meier'"));
+        assert!(command.contains("--force"));
+        assert!(
+            setup::daemon_install_command(None, "/tmp/runtime", true).is_none(),
+            "published binaries may reuse an immutable matching version"
+        );
+    }
+
+    #[test]
+    fn process_spec_transfer_writes_the_exact_json_document() {
+        let directory = tempdir().expect("temporary directory");
+        let destination = directory.path().join("process.json");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(setup::process_spec_transfer(
+                destination.to_str().expect("UTF-8 temporary path"),
+            ))
+            .output()
+            .expect("process specification transfer");
+        assert!(
+            output.status.success(),
+            "transfer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(destination).expect("transferred process specification"),
+            setup::DEFAULT_PROCESS_SPEC
+        );
+    }
+
+    #[tokio::test]
+    async fn rootfs_readiness_rejects_a_stale_process_marker() {
+        let directory = tempdir().expect("temporary directory");
+        let mut config = Config::default();
+        config.daemon.runtime_dir = directory.path().display().to_string();
+        let paths = setup::target_paths(&config).expect("runtime paths");
+        fs::create_dir_all(&paths.images).expect("image directory");
+        fs::create_dir_all(&paths.ssh).expect("SSH directory");
+        fs::write(&paths.rootfs, b"rootfs").expect("rootfs marker");
+        fs::write(&paths.authorized_keys, b"authorized key\n").expect("authorized key");
+        fs::write(&paths.rootfs_key_marker, b"authorized key\n").expect("authorized key marker");
+        fs::write(&paths.rootfs_resolver_marker, b"nameserver 1.1.1.1\n").expect("resolver marker");
+        fs::write(
+            &paths.rootfs_layout_marker,
+            format!("{}\n", setup::ROOTFS_LAYOUT_VERSION),
+        )
+        .expect("layout marker");
+        fs::write(&paths.rootfs_process_marker, b"stale\n").expect("process marker");
+        assert!(
+            !paths
+                .rootfs_is_prepared(&setup::Target::Local, "unused")
+                .await
+                .expect("stale rootfs readiness check")
+        );
+        fs::write(&paths.rootfs_process_marker, setup::DEFAULT_PROCESS_SPEC)
+            .expect("current process marker");
+        assert!(
+            paths
+                .rootfs_is_prepared(&setup::Target::Local, "unused")
+                .await
+                .expect("current rootfs readiness check")
+        );
+    }
+
+    #[test]
+    fn parses_the_complete_nested_command_surface() {
+        let cases = [
+            (vec!["meier", "config", "init"], "config"),
+            (vec!["meier", "daemon", "setup"], "daemon"),
+            (vec!["meier", "daemon", "run"], "daemon"),
+            (vec!["meier", "vm", "create", "--vcpu-count", "2"], "vm"),
+            (vec!["meier", "vm", "ps"], "vm"),
+            (vec!["meier", "vm", "show", "0"], "vm"),
+            (vec!["meier", "vm", "status", "0"], "vm"),
+            (vec!["meier", "vm", "start", "0"], "vm"),
+            (vec!["meier", "vm", "shutdown", "0"], "vm"),
+            (vec!["meier", "vm", "delete", "0"], "vm"),
+            (vec!["meier", "vm", "ssh", "0", "--", "uname", "-a"], "vm"),
+            (vec!["meier", "vm", "logs", "0", "--pull"], "vm"),
+            (vec!["meier", "vm", "logs", "0", "-p"], "vm"),
+            (vec!["meier", "oci", "pull", "alpine:latest"], "oci"),
+            (vec!["meier", "oci", "run", "alpine:latest"], "oci"),
+            (vec!["meier", "oci", "stop", "alpine:latest"], "oci"),
+            (vec!["meier", "oci", "rm", "alpine:latest"], "oci"),
+        ];
+
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(argv).expect("command should parse");
+            match (expected, cli.command) {
+                ("config", Command::Config(ConfigCommand::Init))
+                | ("daemon", Command::Daemon(DaemonCommand::Setup | DaemonCommand::Run))
+                | ("vm", Command::Vm(_))
+                | (
+                    "oci",
+                    Command::Oci(
+                        OciCommand::Pull(_)
+                        | OciCommand::Run(_)
+                        | OciCommand::Stop(_)
+                        | OciCommand::Rm(_),
+                    ),
+                ) => {}
+                _ => panic!("parsed command was routed to the wrong namespace"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_vm_ids_and_conflicting_log_modes() {
+        assert!(Cli::try_parse_from(["meier", "vm", "status", "16384"]).is_err());
+        assert!(Cli::try_parse_from(["meier", "vm", "logs", "0", "--attach", "--pull"]).is_err());
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn parses_the_hidden_daemon_mode_in_the_same_binary() {
+        let cli = Cli::try_parse_from([
+            "meier",
+            "--config",
+            "/etc/meier/config.json",
+            "__daemon",
+            "--runtime-dir",
+            "/var/lib/meier",
+        ])
+        .expect("daemon mode should parse when the feature is enabled");
+        let Command::InternalDaemon(args) = cli.command else {
+            panic!("expected the hidden daemon command");
+        };
+        assert_eq!(
+            args.runtime_dir.as_deref(),
+            Some(Path::new("/var/lib/meier"))
+        );
+    }
+
+    #[test]
+    fn init_writes_the_documented_config_and_refuses_overwrite() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("nested/meier/config.json");
+        let initialized = config::init(&path).expect("config should initialize");
+        assert_eq!(initialized, Config::default());
+        assert_eq!(
+            config::load(&path).expect("config should load"),
+            Config::default()
+        );
+        assert!(config::init(&path).is_err(), "init must use create_new");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("config.json");
+        fs::write(
+            &path,
+            br#"{"client":{"url":"http://127.0.0.1:3000"},"extra":true}"#,
+        )
+        .expect("config fixture");
+        let error = config::load(&path).expect_err("unknown field should fail");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn errors_are_json_on_stderr_while_help_remains_raw() {
+        let directory = tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.json");
+        let error = config::load(&config_path).expect_err("missing config should fail");
+        let encoded = serde_json::to_vec(&error_body(&error)).expect("JSON error");
+        let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("JSON error");
+        assert!(parsed["error"].as_str().is_some());
+
+        assert_eq!(
+            tracing_filter(None)
+                .expect("default tracing filter")
+                .to_string(),
+            "off"
+        );
+        let invalid_filter = tracing_filter(Some("[")).expect_err("invalid filter should fail");
+        let encoded =
+            serde_json::to_vec(&error_body(&invalid_filter)).expect("JSON tracing-filter error");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("JSON tracing-filter error");
+        assert!(
+            parsed["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("invalid RUST_LOG filter"))
+        );
+
+        let help = Cli::try_parse_from(["meier", "--help"]).expect_err("help should short-circuit");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().starts_with("Manage Barbirolli"));
+
+        let init = Cli::try_parse_from([
+            "meier",
+            "--config",
+            config_path.to_str().expect("config path"),
+            "config",
+            "init",
+        ])
+        .expect("config init command");
+        let value = init.dispatch(&config_path).expect("config init dispatch");
+        assert!(fs::metadata(config_path).is_ok());
+        assert!(value.is_object());
+    }
+
+    #[cfg(target_os = "macos")]
+    static LIMA_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(target_os = "macos")]
+    struct EnvironmentVariable {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl EnvironmentVariable {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: the Lima tests serialize all environment changes with
+            // `LIMA_ENV_LOCK` and restore each value before releasing it.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for EnvironmentVariable {
+        fn drop(&mut self) {
+            // SAFETY: the matching lock remains held while this guard drops.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn macos_routes_api_calls_through_running_lima_without_guest_meier() {
+        let _lock = LIMA_ENV_LOCK.lock().await;
+        let directory = tempdir().expect("temporary directory");
+        let script = fake_limactl(&directory.path().join("trace"));
+        let _limactl = EnvironmentVariable::set("LIMACTL", &script);
+
+        let value = Config::default()
+            .connect()
+            .await
+            .expect("Lima client")
+            .get("/vms")
+            .await
+            .expect("vm list");
+        assert_eq!(value, json!([]));
+        let trace = fs::read_to_string(directory.path().join("trace")).expect("limactl trace");
+        assert!(trace.contains("list --format json provisioning"));
+        assert!(trace.contains("shell provisioning -- curl"));
+        assert!(!trace.contains("meier "), "the guest must not invoke meier");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn macos_rejects_missing_or_stopped_lima_without_starting_it() {
+        let _lock = LIMA_ENV_LOCK.lock().await;
+        let directory = tempdir().expect("temporary directory");
+        let script = fake_limactl(&directory.path().join("trace"));
+        let _limactl = EnvironmentVariable::set("LIMACTL", &script);
+        let _stopped = EnvironmentVariable::set("FAKE_STOPPED", "1");
+
+        let Err(error) = Config::default().connect().await else {
+            panic!("stopped Lima should fail");
+        };
+        assert!(error.to_string().contains("not running"));
+        let trace = fs::read_to_string(directory.path().join("trace")).expect("limactl trace");
+        assert!(
+            !trace.contains("shell provisioning"),
+            "stopped Lima must not receive guest work"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_limactl(trace: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = trace.with_file_name("limactl");
+        let contents = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = list ]; then\n  if [ \"$FAKE_STOPPED\" = 1 ]; then printf '[{{\"status\":\"Stopped\"}}]'; else printf '[{{\"status\":\"Running\"}}]'; fi\n  exit 0\nfi\nif [ \"$1\" = shell ]; then\n  [ \"$4\" = meier ] && exit 99\n  printf '[]\\n__MEIER_HTTP_STATUS__200'\n  exit 0\nfi\nexit 64\n",
+            shell_literal(&trace.display().to_string())
+        );
+        fs::write(&script, contents).expect("fake limactl");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&script, permissions).expect("permissions");
+        script
+    }
+
+    #[cfg(target_os = "macos")]
+    fn shell_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[cfg(target_os = "linux")]
+    type RequestResult = std::result::Result<RequestSnapshot, String>;
+    #[cfg(target_os = "linux")]
+    type RequestSender = oneshot::Sender<RequestResult>;
+    #[cfg(target_os = "linux")]
+    type SharedRequestSender = Arc<TokioMutex<Option<RequestSender>>>;
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone)]
+    struct Fixture {
+        expected_method: String,
+        expected_path: String,
+        check_create: bool,
+        response_body: String,
+        result: SharedRequestSender,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct RequestSnapshot {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn maps_vm_and_oci_operations_to_elhone_requests() {
+        use crate::cli::{IdArgs, ImageArgs, PortMapping, VmCommand, VmId};
+        use crate::config::ClientConfig;
+        use tokio::net::TcpListener;
+
+        let cases = [
+            (
+                "POST",
+                "/vms",
+                r#"{"id":0}"#,
+                true,
+                Command::Vm(VmCommand::Create(CreateArgs {
+                    vcpu_count: 2,
+                    publish: vec![PortMapping {
+                        external: 2222,
+                        internal: 22,
+                    }],
+                    authorized_key_file: Vec::new(),
+                })),
+            ),
+            (
+                "GET",
+                "/vms/0/status",
+                r#"{"status":"running"}"#,
+                false,
+                Command::Vm(VmCommand::Status(IdArgs {
+                    id: VmId::from_str("0").expect("id"),
+                })),
+            ),
+            (
+                "POST",
+                "/vms/0/shutdown",
+                "",
+                false,
+                Command::Vm(VmCommand::Shutdown(IdArgs {
+                    id: VmId::from_str("0").expect("id"),
+                })),
+            ),
+            (
+                "DELETE",
+                "/vms/0",
+                "",
+                false,
+                Command::Vm(VmCommand::Delete(IdArgs {
+                    id: VmId::from_str("0").expect("id"),
+                })),
+            ),
+            (
+                "POST",
+                "/oci/rm",
+                "",
+                false,
+                Command::Oci(OciCommand::Rm(ImageArgs {
+                    image: "alpine:latest".parse::<ImageReference>().expect("image"),
+                })),
+            ),
+        ];
+
+        for (method, path, body, check_create, command) in cases {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("listener");
+            let address = listener.local_addr().expect("address");
+            let (seen_tx, seen_rx) = oneshot::channel();
+            let fixture = Fixture {
+                expected_method: method.to_owned(),
+                expected_path: path.to_owned(),
+                check_create,
+                response_body: body.to_owned(),
+                result: Arc::new(TokioMutex::new(Some(seen_tx))),
+            };
+            let app = Router::new()
+                .fallback(any(receive_request))
+                .with_state(fixture.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+            let config = Config {
+                client: ClientConfig {
+                    url: format!("http://{address}"),
+                },
+                ..Config::default()
+            };
+            let cli = Cli {
+                config: None,
+                command,
+            };
+            let value = cli
+                .dispatch_with_config(Path::new("unused.json"), &config)
+                .await
+                .expect("request should succeed");
+            let expected = if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body).expect("fixture response should be JSON")
+            };
+            assert_eq!(value, expected);
+
+            let snapshot = seen_rx
+                .await
+                .expect("request should be observed")
+                .expect("fixture should accept the request");
+            assert_eq!(snapshot.method, method);
+            assert_eq!(snapshot.path, path);
+            if check_create {
+                assert!(snapshot.body.contains("\"vcpu_count\":2"));
+                assert!(snapshot.body.contains("\"external\":2222"));
+            }
+            server.abort();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn receive_request(
+        State(fixture): State<Fixture>,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = match to_bytes(request.into_body(), usize::MAX).await {
+            Ok(body) => String::from_utf8_lossy(&body).into_owned(),
+            Err(error) => {
+                let mut sender = fixture.result.lock().await;
+                if let Some(sender) = sender.take() {
+                    sender
+                        .send(Err(format!("request body could not be read: {error}")))
+                        .expect("test should still be waiting");
+                }
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .expect("response should build");
+            }
+        };
+        let accepted = method == fixture.expected_method
+            && path == fixture.expected_path
+            && (!fixture.check_create
+                || (body.contains("\"vcpu_count\":2") && body.contains("\"external\":2222")));
+        let result = if accepted {
+            Ok(RequestSnapshot { method, path, body })
+        } else {
+            Err(format!(
+                "unexpected request: {method} {path} with body {body:?}"
+            ))
+        };
+        let response_body = fixture.response_body;
+        let response = if response_body.is_empty() {
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .expect("response should build")
+        } else {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(response_body))
+                .expect("response should build")
+        };
+        let mut sender = fixture.result.lock().await;
+        if let Some(sender) = sender.take() {
+            sender.send(result).expect("test should still be waiting");
+        }
+        response
+    }
 }
