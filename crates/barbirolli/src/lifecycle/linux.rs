@@ -124,6 +124,11 @@ impl Barbirolli {
     }
 
     /// Returns the latest health sample, optionally forcing a fresh Firecracker metrics emission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manager is draining, the VM is not registered or
+    /// running, no cached sample is available, or a forced metrics refresh fails.
     pub async fn stats(&self, vm_id: VmId, force: bool) -> Result<VmStats> {
         let mut vm = self.vm_mut(vm_id)?;
         vm.stats(self, force).await

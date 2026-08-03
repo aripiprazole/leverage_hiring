@@ -1016,12 +1016,11 @@ impl MetricsAccumulator {
 
 fn accumulate_counter(previous: Option<u64>, current: u64, total: u64) -> (u64, u64) {
     match previous {
-        None => (current, current),
         Some(previous) if current >= previous => {
             let latest = current - previous;
             (latest, total.saturating_add(latest))
         }
-        Some(_) => (current, current),
+        None | Some(_) => (current, current),
     }
 }
 
