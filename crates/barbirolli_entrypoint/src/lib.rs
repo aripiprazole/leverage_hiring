@@ -37,6 +37,12 @@ pub struct ProcessSpec {
 }
 
 impl ProcessSpec {
+    /// Loads and validates an OCI process specification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the specification cannot be opened or decoded, or
+    /// when it contains a process setting unsupported by the VM entrypoint.
     pub fn new(path: impl AsRef<Path>) -> Result<ProcessSpec> {
         let path = path.as_ref();
         let file = File::open(path).map_err(|source| EntrypointError::OpenProcessSpec {
