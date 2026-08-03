@@ -102,21 +102,14 @@ impl BehaviorFixture {
         }
     }
 
-    pub async fn manager(&self) -> BehaviorManagerFixture {
-        self.manager_with_provisioning(ProvisioningConfig::default())
-            .await
-    }
-
-    pub async fn manager_with_provisioning(
-        &self,
-        provisioning: ProvisioningConfig,
-    ) -> BehaviorManagerFixture {
+    pub async fn new_manager(&self, provisioning: ProvisioningConfig) -> BehaviorManagerFixture {
         let store = self.storage.open().store;
         let manager = Barbirolli::new(
             store,
             DaemonConfig {
                 provisioning,
                 firecracker: self.firecracker.clone(),
+                firecracker_executor: crate::FirecrackerExecutorConfig::Unrestricted,
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },

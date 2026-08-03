@@ -176,9 +176,11 @@ British conductor associated with [The Hallé](https://en.wikipedia.org/wiki/The
 - `nlink`.
 - `validated`.
 - Persistence, the Firecracker lifecycle, and VM networking.
-- Supports Firecracker 1.13 on x86_64 Linux and aarch64 Linux. `FIRECRACKER` specifies
-  the executable.
-- Firecracker uses `UnrestrictedVmmExecutor`.
+- Supports a matching Firecracker 1.13 and jailer toolchain on x86_64 Linux and aarch64 Linux.
+  In jailed mode, `FIRECRACKER` and `JAILER` specify root-owned, non-writable executables.
+- Firecracker uses an attached `JailedVmmExecutor` by default. The jailer chroots the VMM and
+  drops it to a stable per-VM UID/GID without daemonizing or creating PID/network namespaces.
+  `FIRECRACKER_EXECUTOR=unrestricted` is the explicit development fallback.
 - Each running VM has one cgroup v2 directory for health and idle sampling.
 
 ```rust
@@ -195,13 +197,28 @@ struct Barbirolli {
 
 struct Firecracker {
     bin: PathBuf,
+    executor: FirecrackerExecutorConfig,
     api_socket_timeout: Duration,
 }
 
 struct DaemonConfig {
     provisioning: ProvisioningConfig,
     firecracker: PathBuf,
+    firecracker_executor: FirecrackerExecutorConfig,
+    entrypoint: PathBuf,
     idle_policy: Option<IdlePolicy>,
+}
+
+enum FirecrackerExecutorConfig {
+    Jailed(JailerConfig),
+    Unrestricted,
+}
+
+struct JailerConfig {
+    jailer: PathBuf,
+    chroot_base: PathBuf,
+    uid_base: u32,
+    gid_base: u32,
 }
 
 struct ProvisioningConfig {
@@ -303,11 +320,13 @@ Each `$VM_ROOT/<vm_id>` contains:
 - `config.json`: This file contains the versioned `VmSpec`.
 - `serial.log`: This file contains append-only Firecracker stdout from each VM start. The daemon
   does not truncate or rotate it.
-- `firecracker.socket`: This transient Firecracker API socket is present only while the VM runs.
+- `firecracker.socket`: The logical API-socket path retained in `VmSpec`. In jailed mode, the
+  transient socket is created as `/run/firecracker.socket` inside the VM jail so its host-side
+  effective path stays below Unix's socket-path limit.
 
 - `VM_ROOT` contains the VM directories. `IMAGE_ROOT` contains the fixed source artifacts.
-- Each stored `VmSpec` owns `$VM_ROOT/<vm_id>/firecracker.socket`. Runtime cleanup removes the
-  socket file. `VmSpec` keeps the socket path.
+- Each stored `VmSpec` owns the logical `$VM_ROOT/<vm_id>/firecracker.socket` path. The executor
+  selects and resolves the runtime socket path; cleanup removes both logical and effective paths.
 - A VM gets a `VmId` equal to the number of stored VM directories. The first ID is `0`. Deleted VM
   directories stay in this count. Thus, IDs always increase and stay assigned to their
   directories.
@@ -484,32 +503,43 @@ async fn start(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 
 The start sequence is:
 
-1. Prepares the TAP, routes, addresses, forwarding, and nftables table.
-2. Builds the Firecracker resources and configuration.
-3. Firecracker starts and opens its API socket.
-4. Takes the Firecracker pipes. It appends stdout to `serial.log`, drains stderr, and
+1. Derives the stable UID/GID as the configured bases plus `VmId`.
+2. Prepares the TAP with the jailed UID as owner, plus routes, addresses, forwarding, and nftables.
+3. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and enables its controllers.
+4. Builds the Firecracker resources and attached jailer configuration. The jailer receives that
+   existing cgroup as `--parent-cgroup` and cgroup v2 as `--cgroup-version`.
+5. The jailer chroots Firecracker, drops UID/GID, joins the cgroup, and opens the effective API
+   socket while retaining the child pipes.
+6. Takes the Firecracker pipes. It appends stdout to `serial.log`, drains stderr, and
    keeps stdin.
-5. Creates `/sys/fs/cgroup/barbirolli/vm-<id>` and moves the PID into it.
-6. The metrics reader starts.
-7. `ManagedVm` takes ownership of the live resources.
+7. Reads the PID from `cgroup.procs`; Barbirolli does not move the jailed PID a second time. The
+   unrestricted fallback discovers the PID and performs the single explicit cgroup move.
+8. Starts the metrics reader at the executor's effective FIFO path.
+9. `ManagedVm` takes ownership of the live resources.
 
 ```rust
 async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
-    let network = spec.network.prepare(&spec.bindings).await?;
+    let identity = barbirolli.firecracker.identity(spec.id);
+    let network = spec.network.prepare(&spec.bindings, identity.map(|id| id.uid)).await?;
+    let cgroup = VmCgroup::create(spec.id)?;
     let mut vm = spec.prepare_vm(barbirolli).await
-        .map_err(|error| rollback_network(error, &network))?;
+        .map_err(|error| rollback_cgroup_and_network(error, &cgroup, &network))?;
+    let metrics_path = vm.resolve_effective_path(spec.metrics_path());
 
     vm.start(barbirolli.firecracker.api_socket_timeout).await
-        .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
+        .map_err(|error| rollback_all(error, &mut vm, &cgroup, &network))?;
 
     let serial_console = SerialConsole::new(&mut vm, spec.id, spec.serial_log()).await
-        .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
+        .map_err(|error| rollback_all(error, &mut vm, &cgroup, &network))?;
 
-    let pid = find_firecracker_pid(barbirolli, &spec).await
-        .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
-
-    let cgroup = VmCgroup::create(spec.id.to_string(), pid)
-        .map_err(|error| rollback_vm_and_network(error, &mut vm, &network))?;
+    let pid = match barbirolli.firecracker.executor {
+        FirecrackerExecutorConfig::Jailed(_) => cgroup.pid()?,
+        FirecrackerExecutorConfig::Unrestricted => {
+            let pid = find_firecracker_pid(barbirolli, &spec).await?;
+            cgroup.attach(pid)?;
+            pid
+        }
+    };
 
     let metrics = Arc::new(RwLock::new(None));
 
@@ -521,16 +551,17 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
         monitor: Mutex::new(None),
         network: Some(network),
         cgroup: Some(cgroup),
-        metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
+        metrics_task: spawn_metrics_reader(metrics_path, metrics.clone()),
         metrics,
         serial_console,
     })
 }
 ```
 
-- Barbirolli creates the cgroup after Firecracker starts because it needs the Firecracker PID.
-- If a failure occurs after network preparation, startup rollback releases all acquired resources. The
-  returned error contains all failures.
+- Barbirolli creates the cgroup leaf before invoking jailer. Jailer is the only component that places
+  a jailed process into it.
+- If a failure occurs after network preparation, startup rollback releases the VM/jail, network,
+  and cgroup. The returned error retains all rollback failures.
 
 ### Shutting down a VM
 
@@ -568,7 +599,7 @@ async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 - On x86_64, `ManagedVm::shutdown` sends Ctrl-Alt-Del.
 - On aarch64, it writes `reboot\n` through the stored serial stdin.
 - After a timeout, it first uses pause-and-kill and then kill.
-- Removes the Firecracker resources, network, and cgroup.
+- Removes the Firecracker resources and jail, network, and cgroup.
 - Cleanup flushes the serial stdout writer and stops the metrics reader and tries each resource and combines the errors.
 
 ### Deletion
@@ -599,14 +630,14 @@ registers each active VM as `Discovered`.
 - Warmup leaves each registered VM in `Discovered`.
 
 ```rust
-/// At application startup, remove stale processes and resources.
-/// This includes stale nftables rules and cgroups.
+/// At application startup, kill the stale cgroup and remove stale process resources.
+/// This includes the jail, effective socket/FIFO, nftables rules, and cgroup.
 async fn reconcile(&self, barbirolli: &Barbirolli) -> Result<()> {
-    Validated::from(self.kill_stale_processes(barbirolli).await)
+    Validated::from(self.cleanup_stale_cgroup_and_metrics(barbirolli))
         .map4(
             Validated::from(self.network.cleanup_stale().await),
-            Validated::from(self.remove_stale_api_socket()),
-            Validated::from(self.cleanup_stale_health()),
+            Validated::from(self.remove_stale_api_sockets(barbirolli)),
+            Validated::from(barbirolli.firecracker.cleanup_jail(self)),
             |(), (), (), ()| (),
         )
         .into_result()
@@ -669,6 +700,10 @@ flowchart TD
 - `IDLE_INITIAL_INTERVAL_SECONDS`,
   `IDLE_STRIKE_INTERVAL_SECONDS`, `IDLE_FINAL_INTERVAL_SECONDS`, `IDLE_CPU_HIGH_PERCENT`, and
   `IDLE_CPU_LOW_PERCENT` sets up the config.
+- `FIRECRACKER_EXECUTOR` defaults to `jailed`. Jailed mode requires `JAILER`,
+  `JAILER_UID_BASE`, and `JAILER_GID_BASE`; `JAILER_CHROOT_BASE` defaults to
+  `/srv/jailer/barbirolli`. Each base must be in `1..=4294950911` so every `VmId` has a non-root,
+  non-sentinel identity.
 - The first sample sets a new baseline. A lower counter also sets a new
   baseline.
 

@@ -9,6 +9,9 @@ REPO_ROOT="$(cd "$SCRIPTS_DIR/.." && pwd)"
 : "${ELHONE_ADDR:=127.0.0.1:3000}"
 : "${ELHONE_URL:=http://$ELHONE_ADDR}"
 : "${RUST_LOG:=info}"
+: "${FIRECRACKER_EXECUTOR:=jailed}"
+: "${FIRECRACKER_TOOLCHAIN_DIR:=/usr/local/libexec/barbirolli}"
+: "${JAILER_CHROOT_BASE:=/srv/jailer/barbirolli}"
 
 FIRECRACKER_VERSION="v1.13.2"
 FIRECRACKER_CI_VERSION="v1.13"
@@ -19,7 +22,8 @@ DOWNLOAD_DIR="$BARBIROLLI_RUNTIME_DIR/downloads"
 IMAGE_ROOT="$BARBIROLLI_RUNTIME_DIR/images"
 VM_ROOT="$BARBIROLLI_RUNTIME_DIR/vms"
 SSH_DIR="$BARBIROLLI_RUNTIME_DIR/ssh"
-FIRECRACKER="$BARBIROLLI_RUNTIME_DIR/bin/firecracker"
+: "${FIRECRACKER:=$FIRECRACKER_TOOLCHAIN_DIR/firecracker}"
+: "${JAILER:=$FIRECRACKER_TOOLCHAIN_DIR/jailer}"
 BARBIROLLI_ENTRYPOINT="$BARBIROLLI_RUNTIME_DIR/bin/barbirolli_entrypoint"
 DEFAULT_AUTHORIZED_KEYS="$SSH_DIR/id_ed25519.pub"
 SSH_PRIVATE_KEY="$SSH_DIR/id_ed25519"
@@ -39,6 +43,9 @@ export VM_ROOT
 export IMAGE_ROOT
 export DEFAULT_AUTHORIZED_KEYS
 export FIRECRACKER
+export FIRECRACKER_EXECUTOR
+export JAILER
+export JAILER_CHROOT_BASE
 export BARBIROLLI_ENTRYPOINT
 export ELHONE_URL
 export ELHONE_ADDR
@@ -95,7 +102,32 @@ require_commands() {
 
 firecracker_is_compatible() {
     [[ -x "$FIRECRACKER" ]] &&
-        "$FIRECRACKER" --version 2>/dev/null | grep -q '^Firecracker v1\.13\.'
+        "$FIRECRACKER" --version 2>/dev/null | grep -qx "Firecracker $FIRECRACKER_VERSION"
+}
+
+jailer_is_compatible() {
+    [[ -x "$JAILER" ]] &&
+        "$JAILER" --version 2>/dev/null | grep -qx "Jailer $FIRECRACKER_VERSION"
+}
+
+trusted_root_path() {
+    local path="$1"
+    local uid mode
+
+    [[ -e "$path" ]] || return 1
+    uid="$(stat -c '%u' "$path")"
+    mode="$(stat -c '%a' "$path")"
+    [[ "$uid" == 0 ]] || return 1
+    (((8#$mode & 8#022) == 0))
+}
+
+firecracker_toolchain_is_compatible() {
+    firecracker_is_compatible &&
+        jailer_is_compatible &&
+        trusted_root_path "$FIRECRACKER" &&
+        trusted_root_path "$JAILER" &&
+        [[ -d "$JAILER_CHROOT_BASE" ]] &&
+        trusted_root_path "$JAILER_CHROOT_BASE"
 }
 
 rootfs_key_matches() {
@@ -118,9 +150,8 @@ rootfs_process_spec_matches() {
         cmp -s "$DEFAULT_PROCESS_SPEC" "$ROOTFS_PROCESS_SPEC_MARKER"
 }
 
-runtime_is_prepared() {
-    firecracker_is_compatible &&
-        [[ -s "$KERNEL_IMAGE" ]] &&
+runtime_artifacts_are_prepared() {
+    [[ -s "$KERNEL_IMAGE" ]] &&
         [[ -s "$ROOTFS_IMAGE" ]] &&
         [[ -x "$BARBIROLLI_ENTRYPOINT" ]] &&
         [[ -s "$SSH_PRIVATE_KEY" ]] &&
@@ -129,6 +160,25 @@ runtime_is_prepared() {
         rootfs_resolver_matches &&
         rootfs_layout_matches &&
         rootfs_process_spec_matches
+}
+
+runtime_is_prepared() {
+    runtime_artifacts_are_prepared || return 1
+    case "$FIRECRACKER_EXECUTOR" in
+        jailed)
+            firecracker_toolchain_is_compatible
+            ;;
+        unrestricted)
+            firecracker_is_compatible
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+setup_is_prepared() {
+    firecracker_toolchain_is_compatible && runtime_artifacts_are_prepared
 }
 
 require_runtime_artifacts() {

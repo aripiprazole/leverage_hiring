@@ -1,8 +1,7 @@
 use std::{
     fs,
     io::ErrorKind,
-    net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -23,8 +22,15 @@ use fctools::{
         shutdown::{VmShutdownAction, VmShutdownError, VmShutdownMethod},
     },
     vmm::{
-        arguments::{VmmApiSocket, VmmArguments},
-        executor::unrestricted::UnrestrictedVmmExecutor,
+        arguments::{
+            VmmApiSocket, VmmArguments,
+            jailer::{JailerArguments, JailerCgroupVersion},
+        },
+        executor::{
+            either::EitherVmmExecutor,
+            jailed::{FlatVirtualPathResolver, JailedVmmExecutor},
+            unrestricted::UnrestrictedVmmExecutor,
+        },
         id::{VmmId, VmmIdError},
         installation::VmmInstallation,
         ownership::VmmOwnershipModel,
@@ -47,7 +53,7 @@ use tracing::{Instrument as _, info_span};
 use validated::Validated;
 
 use crate::{
-    Barbirolli, VmId, VmSpec,
+    Barbirolli, FirecrackerExecutorConfig, VmId, VmSpec,
     idle::{Monitor, Sample},
     io_error,
     lifecycle::PidError,
@@ -55,7 +61,8 @@ use crate::{
 };
 
 type FirecrackerResourceSystem = ResourceSystem<DirectProcessSpawner, TokioRuntime>;
-type FirecrackerVm = Vm<UnrestrictedVmmExecutor, DirectProcessSpawner, TokioRuntime>;
+type FirecrackerVm =
+    Vm<EitherVmmExecutor<FlatVirtualPathResolver>, DirectProcessSpawner, TokioRuntime>;
 type FirecrackerChild = <TokioRuntime as Runtime>::Child;
 type FirecrackerStdout = <FirecrackerChild as RuntimeChild>::Stdout;
 type FirecrackerStderr = <FirecrackerChild as RuntimeChild>::Stderr;
@@ -128,8 +135,8 @@ impl SerialConsole {
             vm_id,
             path: path.clone(),
             stdin: Some(pipes.stdin),
-            stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, path)),
-            stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
+            stdout_task: Some(Self::spawn_stdout_reader(pipes.stdout, file, vm_id, path)),
+            stderr_task: Some(Self::spawn_stderr_reader(pipes.stderr, vm_id)),
         };
         tracing::debug!(
             ?console,
@@ -164,8 +171,8 @@ impl SerialConsole {
     )]
     async fn finish(&mut self) {
         drop(self.stdin.take());
-        join_serial_task(&mut self.stdout_task, "stdout").await;
-        join_serial_task(&mut self.stderr_task, "stderr").await;
+        Self::join_task(&mut self.stdout_task, "stdout").await;
+        Self::join_task(&mut self.stderr_task, "stderr").await;
         tracing::debug!(console = ?self, "the Firecracker serial console stopped");
     }
 
@@ -199,14 +206,15 @@ enum SerialShutdownError {
     Timeout,
 }
 
-fn spawn_serial_stdout_reader(
-    mut stdout: FirecrackerStdout,
-    mut file: tokio::fs::File,
-    vm_id: VmId,
-    path: PathBuf,
-) -> JoinHandle<()> {
-    let span = info_span!("serial_reader", %vm_id, stream = "stdout", path = %path.display());
-    tokio::spawn(
+impl SerialConsole {
+    fn spawn_stdout_reader(
+        mut stdout: FirecrackerStdout,
+        mut file: tokio::fs::File,
+        vm_id: VmId,
+        path: PathBuf,
+    ) -> JoinHandle<()> {
+        let span = info_span!("serial_reader", %vm_id, stream = "stdout", path = %path.display());
+        tokio::spawn(
         async move {
             let mut buffer = vec![0_u8; 8 * 1024];
             let mut recording = true;
@@ -236,37 +244,85 @@ fn spawn_serial_stdout_reader(
         }
         .instrument(span),
     )
-}
+    }
 
-fn spawn_serial_stderr_reader(mut stderr: FirecrackerStderr, vm_id: VmId) -> JoinHandle<()> {
-    let span = info_span!("serial_reader", %vm_id, stream = "stderr");
-    tokio::spawn(
-        async move {
-            let mut buffer = vec![0_u8; 8 * 1024];
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(read) => tracing::warn!(
-                        byte_count = read,
-                        stderr = ?String::from_utf8_lossy(&buffer[..read]),
-                        "the Firecracker process wrote to stderr"
-                    ),
-                    Err(error) => {
-                        tracing::error!(%error, "the Firecracker stderr reader failed");
-                        break;
+    fn spawn_stderr_reader(mut stderr: FirecrackerStderr, vm_id: VmId) -> JoinHandle<()> {
+        let span = info_span!("serial_reader", %vm_id, stream = "stderr");
+        tokio::spawn(
+            async move {
+                let mut buffer = vec![0_u8; 8 * 1024];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(read) => tracing::warn!(
+                            byte_count = read,
+                            stderr = ?String::from_utf8_lossy(&buffer[..read]),
+                            "the Firecracker process wrote to stderr"
+                        ),
+                        Err(error) => {
+                            tracing::error!(%error, "the Firecracker stderr reader failed");
+                            break;
+                        }
                     }
                 }
             }
+            .instrument(span),
+        )
+    }
+
+    async fn join_task(task: &mut Option<JoinHandle<()>>, stream: &'static str) {
+        if let Some(task) = task.take()
+            && let Err(error) = task.await
+        {
+            tracing::error!(%error, stream, "the Firecracker serial-reader task failed");
         }
-        .instrument(span),
-    )
+    }
 }
 
-async fn join_serial_task(task: &mut Option<JoinHandle<()>>, stream: &'static str) {
-    if let Some(task) = task.take()
-        && let Err(error) = task.await
-    {
-        tracing::error!(%error, stream, "the Firecracker serial-reader task failed");
+impl FirecrackerExecutorConfig {
+    fn ownership_model(&self, vm_id: VmId) -> VmmOwnershipModel {
+        self.identity(vm_id)
+            .map_or(VmmOwnershipModel::Shared, |identity| {
+                VmmOwnershipModel::Downgraded {
+                    uid: identity.uid,
+                    gid: identity.gid,
+                }
+            })
+    }
+
+    fn executor(
+        &self,
+        arguments: VmmArguments,
+        id: VmmId,
+        vm_id: VmId,
+    ) -> EitherVmmExecutor<FlatVirtualPathResolver> {
+        match self {
+            Self::Unrestricted => {
+                EitherVmmExecutor::from(UnrestrictedVmmExecutor::new(arguments).id(id))
+            }
+            Self::Jailed(config) => {
+                let jailer_arguments = JailerArguments::new(id)
+                    .cgroup_version(JailerCgroupVersion::V2)
+                    .parent_cgroup(VmCgroup::relative_path(vm_id))
+                    .chroot_base_dir(&config.chroot_base);
+                EitherVmmExecutor::from(JailedVmmExecutor::new(
+                    arguments,
+                    jailer_arguments,
+                    FlatVirtualPathResolver,
+                ))
+            }
+        }
+    }
+
+    fn launcher(&self, firecracker: &Path) -> PathBuf {
+        match self {
+            Self::Jailed(config) => config.jailer.clone(),
+            Self::Unrestricted => firecracker.to_owned(),
+        }
+    }
+
+    fn is_unrestricted(&self) -> bool {
+        matches!(self, Self::Unrestricted)
     }
 }
 
@@ -275,16 +331,24 @@ impl VmSpec {
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
             TokioRuntime,
-            VmmOwnershipModel::Shared,
+            barbirolli.firecracker.executor.ownership_model(self.id),
             2,
         );
-        let configuration = vm_config(&mut resources, barbirolli, self)?;
-        let arguments = VmmArguments::new(VmmApiSocket::Enabled(self.api_socket.clone().into()));
-        let executor = UnrestrictedVmmExecutor::new(arguments)
-            .id(VmmId::new(format!("barbirolli-{}", self.id))?);
+        let configuration = self.configuration(&mut resources, barbirolli.balloon.mem)?;
+        let arguments = VmmArguments::new(VmmApiSocket::Enabled(
+            barbirolli.firecracker.vmm_api_socket(self),
+        ));
+        let id = VmmId::new(format!("barbirolli-{}", self.id))?;
+        let executor = barbirolli
+            .firecracker
+            .executor
+            .executor(arguments, id, self.id);
         let installation = VmmInstallation::new(
             barbirolli.firecracker.bin.clone(),
-            barbirolli.firecracker.bin.clone(),
+            barbirolli
+                .firecracker
+                .executor
+                .launcher(&barbirolli.firecracker.bin),
             barbirolli.firecracker.bin.clone(),
         );
 
@@ -296,17 +360,22 @@ impl VmSpec {
         let vm_id = self.id;
         async move {
             let mut errors = vec![];
-            if let Err(err) = self.kill_stale_processes(barbirolli).await {
+            if barbirolli.firecracker.executor.is_unrestricted()
+                && let Err(err) = self.kill_stale_processes(barbirolli).await
+            {
                 errors.push(ReconcileFailure::Processes(err));
             }
             if let Err(err) = self.network.cleanup_stale().await {
                 errors.push(ReconcileFailure::Network(err));
             }
-            if let Err(err) = self.api_socket.remove() {
+            if let Err(err) = self.cleanup_cgroup_and_metrics(&barbirolli.firecracker) {
+                errors.push(ReconcileFailure::Health(err));
+            }
+            if let Err(err) = self.cleanup_api_sockets(&barbirolli.firecracker) {
                 errors.push(ReconcileFailure::Socket(err));
             }
-            if let Err(err) = self.cleanup_cgroup_and_metrics() {
-                errors.push(ReconcileFailure::Health(err));
+            if let Err(err) = barbirolli.firecracker.cleanup_jail(self) {
+                errors.push(ReconcileFailure::Jail(err));
             }
             if let Err(err) = self.ensure_serial_log() {
                 errors.push(ReconcileFailure::SerialLog(err));
@@ -346,204 +415,271 @@ impl VmSpec {
         Ok(())
     }
 
-    #[tracing::instrument(err)]
-    fn cleanup_cgroup_and_metrics(&self) -> Result<(), HealthError> {
-        tracing::info!("barbirolli starts cgroup and metrics cleanup");
-        let metrics = self.metrics_path();
-        let metrics_cleanup = match fs::remove_file(&metrics) {
-            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-            result => result,
-        };
-        io_error!(HealthError, metrics_cleanup, metrics)?;
-
-        let cgroup = PathBuf::from(CGROUP_ROOT).join(format!("vm-{}", self.id));
-        if cgroup.exists() {
-            let kill = cgroup.join("cgroup.kill");
-            if kill.exists() {
-                io_error!(HealthError, fs::write(&kill, "1"), kill)?;
-            }
-            io_error!(HealthError, fs::remove_dir(&cgroup), cgroup)?;
+    fn cleanup_api_sockets(
+        &self,
+        firecracker: &crate::lifecycle::Firecracker,
+    ) -> std::io::Result<()> {
+        let logical: PathBuf = self.api_socket.clone().into();
+        let effective = firecracker.effective_api_socket(self);
+        self.api_socket.remove()?;
+        if effective != logical {
+            firecracker.remove_file_if_present(&effective)?;
         }
+        Ok(())
+    }
+
+    #[tracing::instrument(err)]
+    fn cleanup_cgroup_and_metrics(
+        &self,
+        firecracker: &crate::lifecycle::Firecracker,
+    ) -> Result<(), HealthError> {
+        tracing::info!("barbirolli starts cgroup and metrics cleanup");
+        VmCgroup::from_id(self.id).cleanup()?;
+
+        let metrics = self.metrics_path();
+        let effective_metrics = firecracker.effective_path(self, &metrics);
+        io_error!(
+            HealthError,
+            firecracker.remove_file_if_present(&metrics),
+            metrics.clone()
+        )?;
+        if effective_metrics != metrics {
+            io_error!(
+                HealthError,
+                firecracker.remove_file_if_present(&effective_metrics),
+                effective_metrics
+            )?;
+        }
+
         Ok(())
     }
 }
 
-fn vm_config(
-    resources: &mut FirecrackerResourceSystem,
-    daemon: &Barbirolli,
-    spec: &VmSpec,
-) -> Result<VmConfiguration> {
-    let kernel = resources.create_resource(
-        &spec.kernel,
-        ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
-    )?;
-    let rootfs = resources.create_resource(
-        spec.rootfs.as_ref(),
-        ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
-    )?;
-    let metrics = resources.create_resource(
-        spec.metrics_path(),
-        ResourceType::Created(CreatedResourceType::Fifo),
-    )?;
+impl VmSpec {
+    fn configuration(
+        &self,
+        resources: &mut FirecrackerResourceSystem,
+        balloon_mem: crate::MemoryMib,
+    ) -> Result<VmConfiguration> {
+        let kernel = resources.create_resource(
+            &self.kernel,
+            ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
+        )?;
+        let rootfs = resources.create_resource(
+            self.rootfs.as_ref(),
+            ResourceType::Moved(MovedResourceType::HardLinkedOrCopied),
+        )?;
+        let metrics = resources.create_resource(
+            self.metrics_path(),
+            ResourceType::Created(CreatedResourceType::Fifo),
+        )?;
 
-    Ok(VmConfiguration::New {
-        init_method: InitMethod::ViaApiCalls,
-        data: VmConfigurationData {
-            boot_source: BootSource {
-                kernel_image: kernel,
-                boot_args: Some(spec.network.kernel_boot_args()),
-                initrd: None,
+        Ok(VmConfiguration::New {
+            init_method: InitMethod::ViaApiCalls,
+            data: VmConfigurationData {
+                boot_source: BootSource {
+                    kernel_image: kernel,
+                    boot_args: Some(self.network.kernel_boot_args()),
+                    initrd: None,
+                },
+                drives: vec![Drive {
+                    drive_id: "rootfs".into(),
+                    is_root_device: true,
+                    cache_type: None,
+                    partuuid: None,
+                    is_read_only: Some(false),
+                    block: Some(rootfs),
+                    rate_limiter: None,
+                    io_engine: None,
+                    socket: None,
+                }],
+                machine_configuration: MachineConfiguration {
+                    vcpu_count: self.vcpu_count.into(),
+                    mem_size_mib: u16::from(self.memory_mib).into(),
+                    smt: None,
+                    track_dirty_pages: None,
+                    huge_pages: None,
+                },
+                cpu_template: None,
+                network_interfaces: vec![NetworkInterface {
+                    iface_id: "eth0".into(),
+                    host_dev_name: self.network.tap.as_ref().to_owned(),
+                    guest_mac: Some(self.network.guest_mac.clone()),
+                    rx_rate_limiter: None,
+                    tx_rate_limiter: None,
+                }],
+                balloon_device: Some(BalloonDevice {
+                    amount_mib: i32::from(u16::from(balloon_mem)),
+                    deflate_on_oom: true,
+                    stats_polling_interval_s: Some(10),
+                }),
+                vsock_device: None,
+                logger_system: None,
+                metrics_system: Some(MetricsSystem { metrics }),
+                mmds_configuration: None,
+                entropy_device: None,
             },
-            drives: vec![Drive {
-                drive_id: "rootfs".into(),
-                is_root_device: true,
-                cache_type: None,
-                partuuid: None,
-                is_read_only: Some(false),
-                block: Some(rootfs),
-                rate_limiter: None,
-                io_engine: None,
-                socket: None,
-            }],
-            machine_configuration: MachineConfiguration {
-                vcpu_count: spec.vcpu_count.into(),
-                mem_size_mib: u16::from(spec.memory_mib).into(),
-                smt: None,
-                track_dirty_pages: None,
-                huge_pages: None,
-            },
-            cpu_template: None,
-            network_interfaces: vec![NetworkInterface {
-                iface_id: "eth0".into(),
-                host_dev_name: spec.network.tap.as_ref().to_owned(),
-                guest_mac: Some(spec.network.guest_mac.clone()),
-                rx_rate_limiter: None,
-                tx_rate_limiter: None,
-            }],
-            balloon_device: Some(BalloonDevice {
-                amount_mib: i32::from(u16::from(daemon.balloon.mem)),
-                deflate_on_oom: true,
-                stats_polling_interval_s: Some(10),
+        })
+    }
+}
+
+impl ManagedVm {
+    async fn rollback_vm(vm: &mut FirecrackerVm, shutdown_timeout: Duration) -> Result<()> {
+        let shutdown = match vm.get_state() {
+            VmState::NotStarted | VmState::Exited | VmState::Crashed(_) => Ok(()),
+            VmState::Running | VmState::Paused => vm
+                .shutdown([VmShutdownAction {
+                    method: VmShutdownMethod::Kill,
+                    timeout: Some(shutdown_timeout),
+                    graceful: false,
+                }])
+                .await
+                .map(|_| ())
+                .map_err(LifecycleError::from),
+        };
+        let cleanup = vm.cleanup().await.map_err(LifecycleError::from);
+        match (shutdown, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(shutdown), Err(cleanup)) => Err(LifecycleError::ShutdownCleanup {
+                shutdown: Some(Box::new(shutdown)),
+                cleanup: Some(Box::new(cleanup)),
             }),
-            vsock_device: None,
-            logger_system: None,
-            metrics_system: Some(MetricsSystem { metrics }),
-            mmds_configuration: None,
-            entropy_device: None,
-        },
-    })
-}
-
-async fn rollback_vm(vm: &mut FirecrackerVm, shutdown_timeout: Duration) -> Result<()> {
-    let shutdown = match vm.get_state() {
-        VmState::NotStarted | VmState::Exited | VmState::Crashed(_) => Ok(()),
-        VmState::Running | VmState::Paused => vm
-            .shutdown([VmShutdownAction {
-                method: VmShutdownMethod::Kill,
-                timeout: Some(shutdown_timeout),
-                graceful: false,
-            }])
-            .await
-            .map(|_| ())
-            .map_err(LifecycleError::from),
-    };
-    let cleanup = vm.cleanup().await.map_err(LifecycleError::from);
-    match (shutdown, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(shutdown), Err(cleanup)) => Err(LifecycleError::ShutdownCleanup {
-            shutdown: Some(Box::new(shutdown)),
-            cleanup: Some(Box::new(cleanup)),
-        }),
+        }
     }
-}
 
-async fn rollback_vm_with_console(
-    vm: &mut FirecrackerVm,
-    console: &mut SerialConsole,
-    shutdown_timeout: Duration,
-) -> Result<()> {
-    let rollback = rollback_vm(vm, shutdown_timeout).await;
-    if matches!(vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
-        console.finish().await;
-    } else {
-        console.abort();
+    async fn rollback_vm_with_console(
+        vm: &mut FirecrackerVm,
+        console: &mut SerialConsole,
+        shutdown_timeout: Duration,
+    ) -> Result<()> {
+        let rollback = Self::rollback_vm(vm, shutdown_timeout).await;
+        if matches!(vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
+            console.finish().await;
+        } else {
+            console.abort();
+        }
+        rollback
     }
-    rollback
+
+    async fn rollback_startup(
+        startup_error: LifecycleError,
+        vm: Option<&mut FirecrackerVm>,
+        console: Option<&mut SerialConsole>,
+        network: ManagedNetwork,
+        cgroup: Option<VmCgroup>,
+        spec: &VmSpec,
+        barbirolli: &Barbirolli,
+    ) -> LifecycleError {
+        let vm_rollback = match (vm, console) {
+            (Some(vm), Some(console)) => {
+                Self::rollback_vm_with_console(vm, console, barbirolli.shutdown_timeout).await
+            }
+            (Some(vm), None) => Self::rollback_vm(vm, barbirolli.shutdown_timeout).await,
+            (None, _) => Ok(()),
+        };
+        let had_cgroup = cgroup.is_some();
+        let cgroup_rollback = cgroup.map_or(Ok(()), VmCgroup::cleanup);
+        let jail_rollback = if had_cgroup && cgroup_rollback.is_ok() {
+            barbirolli.firecracker.cleanup_jail(spec)
+        } else {
+            Ok(())
+        };
+        let network_rollback = network.cleanup().await;
+
+        LifecycleError::StartupRollback {
+            startup_error: Box::new(startup_error),
+            vm_rollback_error: vm_rollback.err().map(Box::new),
+            network_rollback_error: network_rollback.err().map(Box::new),
+            cgroup_rollback_error: cgroup_rollback.err().map(Box::new),
+            jail_rollback_error: jail_rollback.err().map(Box::new),
+        }
+    }
 }
 
 impl ManagedVm {
     #[tracing::instrument(skip(spec, barbirolli), fields(vm_id = %spec.id), err)]
     pub async fn start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self> {
-        let network = spec.network.prepare(&spec.bindings).await?;
+        let identity = barbirolli.firecracker.executor.identity(spec.id);
+        let network = spec
+            .network
+            .prepare(&spec.bindings, identity.map(|identity| identity.uid))
+            .await?;
+        let cgroup = match VmCgroup::create(spec.id) {
+            Ok(cgroup) => cgroup,
+            Err(startup) => {
+                return Err(Self::rollback_startup(
+                    LifecycleError::Health(startup),
+                    None,
+                    None,
+                    network,
+                    None,
+                    &spec,
+                    barbirolli,
+                )
+                .await);
+            }
+        };
         let mut vm = match spec.prepare_vm(barbirolli).await {
             Ok(vm) => vm,
             Err(startup) => {
-                return Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(startup),
-                    vm_rollback_error: None,
-                    network_rollback_error: network.cleanup().await.err().map(Box::new),
-                });
+                return Err(Self::rollback_startup(
+                    startup,
+                    None,
+                    None,
+                    network,
+                    Some(cgroup),
+                    &spec,
+                    barbirolli,
+                )
+                .await);
             }
         };
+        let metrics_path = vm.resolve_effective_path(spec.metrics_path());
 
         if let Err(error) = vm.start(barbirolli.firecracker.api_socket_timeout).await {
-            return Err(LifecycleError::StartupRollback {
-                startup_error: Box::new(error.into()),
-                vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
-                    .await
-                    .err()
-                    .map(Box::new),
-                network_rollback_error: network.cleanup().await.err().map(Box::new),
-            });
+            return Err(Self::rollback_startup(
+                error.into(),
+                Some(&mut vm),
+                None,
+                network,
+                Some(cgroup),
+                &spec,
+                barbirolli,
+            )
+            .await);
         }
 
         let mut console = match SerialConsole::new(&mut vm, spec.id, spec.serial_log()).await {
             Ok(serial_console) => serial_console,
             Err(startup) => {
-                return Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(startup),
-                    vm_rollback_error: rollback_vm(&mut vm, barbirolli.shutdown_timeout)
-                        .await
-                        .err()
-                        .map(Box::new),
-                    network_rollback_error: network.cleanup().await.err().map(Box::new),
-                });
+                return Err(Self::rollback_startup(
+                    startup,
+                    Some(&mut vm),
+                    None,
+                    network,
+                    Some(cgroup),
+                    &spec,
+                    barbirolli,
+                )
+                .await);
             }
         };
 
-        let pid = match barbirolli.firecracker.pid(&spec).await {
+        let pid = cgroup.pid_for(&barbirolli.firecracker, &spec).await;
+        let pid = match pid {
             Ok(pid) => pid,
             Err(error) => {
-                return Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(LifecycleError::Health(error.into())),
-                    vm_rollback_error: rollback_vm_with_console(
-                        &mut vm,
-                        &mut console,
-                        barbirolli.shutdown_timeout,
-                    )
-                    .await
-                    .err()
-                    .map(Box::new),
-                    network_rollback_error: network.cleanup().await.err().map(Box::new),
-                });
-            }
-        };
-        let cgroup = match VmCgroup::new(spec.id, pid) {
-            Ok(cgroup) => cgroup,
-            Err(error) => {
-                return Err(LifecycleError::StartupRollback {
-                    startup_error: Box::new(LifecycleError::Health(error)),
-                    vm_rollback_error: rollback_vm_with_console(
-                        &mut vm,
-                        &mut console,
-                        barbirolli.shutdown_timeout,
-                    )
-                    .await
-                    .err()
-                    .map(Box::new),
-                    network_rollback_error: network.cleanup().await.err().map(Box::new),
-                });
+                return Err(Self::rollback_startup(
+                    LifecycleError::Health(error),
+                    Some(&mut vm),
+                    Some(&mut console),
+                    network,
+                    Some(cgroup),
+                    &spec,
+                    barbirolli,
+                )
+                .await);
             }
         };
         let metrics = Arc::new(RwLock::new(None));
@@ -555,7 +691,7 @@ impl ManagedVm {
             pid,
             monitor: Mutex::new(None),
             cgroup: Some(cgroup),
-            metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
+            metrics_task: MetricsReader::spawn(metrics_path, metrics.clone()),
             metrics,
             console,
             spec,
@@ -694,7 +830,7 @@ impl ManagedVm {
             .map_err(|_| HealthError::MetricsLock)?
             .clone()
             .ok_or(HealthError::MissingMetrics)?;
-        let connections = connection_counts(self.spec.network.guest_ip);
+        let connections = self.connection_counts();
         Ok(Sample {
             instance_pid: self.pid.as_raw_pid(),
             sampled_at: Instant::now(),
@@ -716,30 +852,36 @@ impl ManagedVm {
     }
 }
 
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
+struct MetricsReader;
 
-fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = read_metrics(&path, &latest).await {
-            tracing::error!(%error, path = %path.display(), "the Firecracker metrics reader failed");
-        }
-    })
-}
-
-async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
-    let file = io_error!(HealthError, tokio::fs::File::open(path).await, path.clone())?;
-    let mut lines = BufReader::new(file).lines();
-    while let Some(line) = io_error!(HealthError, lines.next_line().await, path.clone())? {
-        let metrics = match serde_json::from_str(&line) {
-            Ok(metrics) => metrics,
-            Err(error) => {
-                tracing::warn!(%error, "barbirolli discarded invalid Firecracker metrics");
-                continue;
+impl MetricsReader {
+    fn spawn(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(error) = Self::read(&path, &latest).await {
+                tracing::error!(%error, path = %path.display(), "the Firecracker metrics reader failed");
             }
-        };
-        *latest.write().map_err(|_| HealthError::MetricsLock)? = Some(metrics);
+        })
     }
-    Ok(())
+
+    async fn read(path: &Path, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
+        let file = io_error!(
+            HealthError,
+            tokio::fs::File::open(path).await,
+            path.to_owned()
+        )?;
+        let mut lines = BufReader::new(file).lines();
+        while let Some(line) = io_error!(HealthError, lines.next_line().await, path.to_owned())? {
+            let metrics = match serde_json::from_str(&line) {
+                Ok(metrics) => metrics,
+                Err(error) => {
+                    tracing::warn!(%error, "barbirolli discarded invalid Firecracker metrics");
+                    continue;
+                }
+            };
+            *latest.write().map_err(|_| HealthError::MetricsLock)? = Some(metrics);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -748,8 +890,24 @@ struct VmCgroup {
 }
 
 impl VmCgroup {
-    fn new(id: VmId, pid: Pid) -> Result<Self, HealthError> {
-        let root = PathBuf::from(CGROUP_ROOT);
+    const ROOT: &'static str = "/sys/fs/cgroup/barbirolli";
+
+    fn path(id: VmId) -> PathBuf {
+        PathBuf::from(Self::ROOT).join(format!("vm-{id}"))
+    }
+
+    fn from_id(id: VmId) -> Self {
+        Self {
+            path: Self::path(id),
+        }
+    }
+
+    fn relative_path(id: VmId) -> String {
+        format!("barbirolli/vm-{id}")
+    }
+
+    fn create(id: VmId) -> Result<Self, HealthError> {
+        let root = PathBuf::from(Self::ROOT);
         io_error!(HealthError, fs::create_dir_all(&root), root.clone())?;
         let controllers = root.join("cgroup.subtree_control");
         io_error!(
@@ -757,23 +915,39 @@ impl VmCgroup {
             fs::write(&controllers, "+cpu +memory +pids"),
             controllers
         )?;
-        let path = root.join(format!("vm-{id}"));
+        let path = Self::path(id);
         io_error!(HealthError, fs::create_dir(&path), path.clone())?;
-        let procs = path.join("cgroup.procs");
-        if let Err(setup) = io_error!(
+        Ok(Self { path })
+    }
+
+    fn attach(&self, pid: Pid) -> Result<(), HealthError> {
+        let procs = self.path.join("cgroup.procs");
+        io_error!(
             HealthError,
             fs::write(&procs, pid.as_raw_pid().to_string()),
             procs
-        ) {
-            return match io_error!(HealthError, fs::remove_dir(&path), path) {
-                Ok(()) => Err(setup),
-                Err(rollback) => Err(HealthError::CgroupSetupRollback {
-                    setup: Box::new(setup),
-                    rollback: Box::new(rollback),
-                }),
-            };
+        )
+    }
+
+    fn pid(&self) -> Result<Pid, HealthError> {
+        let procs = self.path.join("cgroup.procs");
+        let contents = io_error!(HealthError, fs::read_to_string(&procs), procs.clone())?;
+        contents
+            .lines()
+            .find_map(|value| value.parse::<i32>().ok().and_then(Pid::from_raw))
+            .ok_or(HealthError::InvalidValue(procs))
+    }
+
+    async fn pid_for(
+        &self,
+        firecracker: &crate::lifecycle::Firecracker,
+        spec: &VmSpec,
+    ) -> Result<Pid, HealthError> {
+        if !firecracker.executor.is_unrestricted() {
+            return self.pid();
         }
-        Ok(Self { path })
+        let pid = firecracker.pid(spec).await.map_err(HealthError::from)?;
+        self.attach(pid).map(|()| pid)
     }
 
     fn read_value(&self, name: &str) -> Result<u64, HealthError> {
@@ -798,6 +972,10 @@ impl VmCgroup {
     }
 
     fn cleanup(self) -> Result<(), HealthError> {
+        let kill = self.path.join("cgroup.kill");
+        if kill.exists() {
+            io_error!(HealthError, fs::write(&kill, "1"), kill)?;
+        }
         let cleanup = match fs::remove_dir(&self.path) {
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
             result => result,
@@ -806,30 +984,37 @@ impl VmCgroup {
     }
 }
 
-fn connection_counts(guest_ip: Ipv4Addr) -> (u64, u64) {
-    let Some(contents) = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
-        .into_iter()
-        .find_map(|path| fs::read_to_string(path).ok())
-    else {
-        return (0, 0);
-    };
-    let address = guest_ip.to_string();
-    contents
-        .lines()
-        .filter(|line| {
-            line.split_ascii_whitespace().any(|field| {
-                field
-                    .strip_prefix("src=")
-                    .or_else(|| field.strip_prefix("dst="))
-                    .is_some_and(|ip| ip == address)
+impl ManagedVm {
+    fn connection_counts(&self) -> (u64, u64) {
+        let guest_ip = self.spec.network.guest_ip;
+        let Some(contents) = ["/proc/net/nf_conntrack", "/proc/net/ip_conntrack"]
+            .into_iter()
+            .find_map(|path| fs::read_to_string(path).ok())
+        else {
+            return (0, 0);
+        };
+        let address = guest_ip.to_string();
+        contents
+            .lines()
+            .filter(|line| {
+                line.split_ascii_whitespace().any(|field| {
+                    field
+                        .strip_prefix("src=")
+                        .or_else(|| field.strip_prefix("dst="))
+                        .is_some_and(|ip| ip == address)
+                })
             })
-        })
-        .fold((0, 0), |(total, established), line| {
-            (
-                total + 1,
-                established + u64::from(line.split_ascii_whitespace().any(|v| v == "ESTABLISHED")),
-            )
-        })
+            .fold((0, 0), |(total, established), line| {
+                (
+                    total + 1,
+                    established
+                        + u64::from(
+                            line.split_ascii_whitespace()
+                                .any(|value| value == "ESTABLISHED"),
+                        ),
+                )
+            })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -847,12 +1032,14 @@ pub enum LifecycleError {
     #[error(transparent)]
     Shutdown(#[from] VmShutdownError),
     #[error(
-        "startup failed: {startup_error}; rollback: {vm_rollback_error:?}; network rollback: {network_rollback_error:?}"
+        "startup failed: {startup_error}; VM rollback: {vm_rollback_error:?}; network rollback: {network_rollback_error:?}; cgroup rollback: {cgroup_rollback_error:?}; jail rollback: {jail_rollback_error:?}"
     )]
     StartupRollback {
         startup_error: Box<LifecycleError>,
         vm_rollback_error: Option<Box<LifecycleError>>,
         network_rollback_error: Option<Box<NetworkError>>,
+        cgroup_rollback_error: Option<Box<HealthError>>,
+        jail_rollback_error: Option<Box<std::io::Error>>,
     },
     #[error("VM cleanup failed (VM: {vm:?}, network: {network:?}, health: {health:?})")]
     Cleanup {
@@ -871,6 +1058,16 @@ pub enum LifecycleError {
     Health(#[from] HealthError),
     #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
     UnsupportedFirecracker(String),
+    #[error("JAILER must name a jailer executable matching Firecracker, got {0:?}")]
+    UnsupportedJailer(String),
+    #[error(
+        "Firecracker and jailer versions must match exactly (Firecracker {firecracker}, jailer {jailer})"
+    )]
+    MismatchedJailerVersion { firecracker: String, jailer: String },
+    #[error("untrusted jailer toolchain path {path}: {reason}")]
+    UntrustedJailerPath { path: PathBuf, reason: String },
+    #[error("the effective jailed API socket path exceeds Linux's Unix-socket limit: {0}")]
+    JailerSocketPathTooLong(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -893,11 +1090,6 @@ pub enum HealthError {
     MetricsLock,
     #[error("the VM monitor lock was poisoned")]
     MonitorLock,
-    #[error("cgroup setup failed: {setup}; rollback also failed: {rollback}")]
-    CgroupSetupRollback {
-        setup: Box<HealthError>,
-        rollback: Box<HealthError>,
-    },
 }
 
 impl crate::IoError for HealthError {
@@ -918,6 +1110,8 @@ pub enum ReconcileFailure {
     Health(#[source] HealthError),
     #[error("failed to prepare the VM serial log")]
     SerialLog(#[source] HealthError),
+    #[error("failed to remove the stale Firecracker jail")]
+    Jail(#[source] std::io::Error),
 }
 
 #[cfg(test)]
@@ -955,8 +1149,8 @@ mod tests {
         let stdout = child.take_stdout().expect("missing stdout pipe");
         let stderr = child.take_stderr().expect("missing stderr pipe");
         let vm_id = VmId::try_from(0).expect("valid test VM ID");
-        let stdout_task = spawn_serial_stdout_reader(stdout, file, vm_id, path.clone());
-        let stderr_task = spawn_serial_stderr_reader(stderr, vm_id);
+        let stdout_task = SerialConsole::spawn_stdout_reader(stdout, file, vm_id, path.clone());
+        let stderr_task = SerialConsole::spawn_stderr_reader(stderr, vm_id);
 
         assert!(
             child
@@ -992,13 +1186,13 @@ mod tests {
             vm_id,
             path: path.clone(),
             stdin: child.take_stdin(),
-            stdout_task: Some(spawn_serial_stdout_reader(
+            stdout_task: Some(SerialConsole::spawn_stdout_reader(
                 child.take_stdout().expect("missing stdout pipe"),
                 file,
                 vm_id,
                 path.clone(),
             )),
-            stderr_task: Some(spawn_serial_stderr_reader(
+            stderr_task: Some(SerialConsole::spawn_stderr_reader(
                 child.take_stderr().expect("missing stderr pipe"),
                 vm_id,
             )),

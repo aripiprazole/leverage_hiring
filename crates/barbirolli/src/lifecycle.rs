@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -75,10 +77,150 @@ impl Default for ProvisioningConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JailerConfig {
+    pub jailer: PathBuf,
+    pub chroot_base: PathBuf,
+    uid_base: u32,
+    gid_base: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JailerIdentity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+const MAX_VM_ID: u32 = 16_383;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const JAILED_API_SOCKET: &str = "/run/firecracker.socket";
+
+impl JailerConfig {
+    /// Creates a stable per-VM jailer identity range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either range includes UID/GID 0, overflows, or
+    /// reaches the reserved `u32::MAX` sentinel value.
+    pub fn new(
+        jailer: impl Into<PathBuf>,
+        chroot_base: impl Into<PathBuf>,
+        uid_base: u32,
+        gid_base: u32,
+    ) -> Result<Self, JailerConfigError> {
+        Ok(Self {
+            jailer: jailer.into(),
+            chroot_base: chroot_base.into(),
+            uid_base: Self::validate_identity_base("UID", uid_base)?,
+            gid_base: Self::validate_identity_base("GID", gid_base)?,
+        })
+    }
+
+    /// Parses and validates the identity bases supplied by configuration.
+    ///
+    /// Parsing is kept separate from the typed constructor so callers cannot
+    /// accidentally treat an unparsed configuration value as a valid UID/GID.
+    pub fn parse(
+        jailer: impl Into<PathBuf>,
+        chroot_base: impl Into<PathBuf>,
+        uid_base: impl AsRef<str>,
+        gid_base: impl AsRef<str>,
+    ) -> Result<Self, JailerConfigError> {
+        Self::new(
+            jailer,
+            chroot_base,
+            Self::parse_identity_base("UID", uid_base.as_ref())?,
+            Self::parse_identity_base("GID", gid_base.as_ref())?,
+        )
+    }
+
+    #[must_use]
+    pub fn identity(&self, vm_id: VmId) -> JailerIdentity {
+        let offset = u32::from(u16::from(vm_id));
+        JailerIdentity {
+            uid: self.uid_base + offset,
+            gid: self.gid_base + offset,
+        }
+    }
+
+    #[must_use]
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn jail_root(&self, firecracker: &Path, vm_id: VmId) -> PathBuf {
+        self.chroot_base
+            .join(
+                firecracker
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("firecracker"),
+            )
+            .join(format!("barbirolli-{vm_id}"))
+            .join("root")
+    }
+
+    fn parse_identity_base(kind: &'static str, value: &str) -> Result<u32, JailerConfigError> {
+        value
+            .parse()
+            .map_err(|_| JailerConfigError::InvalidIdentityBase {
+                kind,
+                value: value.to_owned(),
+            })
+    }
+
+    fn validate_identity_base(kind: &'static str, base: u32) -> Result<u32, JailerConfigError> {
+        if base == 0 {
+            return Err(JailerConfigError::RootIdentity { kind });
+        }
+        if base
+            .checked_add(MAX_VM_ID)
+            .is_none_or(|last| last == u32::MAX)
+        {
+            return Err(JailerConfigError::IdentityRangeOverflow { kind, base });
+        }
+        Ok(base)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum JailerConfigError {
+    #[error("the jailer {kind} base must be an unsigned integer, got {value:?}")]
+    InvalidIdentityBase { kind: &'static str, value: String },
+    #[error("the jailer {kind} range must not include root")]
+    RootIdentity { kind: &'static str },
+    #[error("the jailer {kind} base {base} cannot represent every VM identity")]
+    IdentityRangeOverflow { kind: &'static str, base: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirecrackerExecutorConfig {
+    Jailed(JailerConfig),
+    Unrestricted,
+}
+
+impl FirecrackerExecutorConfig {
+    #[must_use]
+    #[cfg(target_os = "linux")]
+    pub(crate) fn identity(&self, vm_id: VmId) -> Option<JailerIdentity> {
+        match self {
+            Self::Jailed(config) => Some(config.identity(vm_id)),
+            Self::Unrestricted => None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(target_os = "linux")]
+    pub(crate) fn jailer(&self) -> Option<&JailerConfig> {
+        match self {
+            Self::Jailed(config) => Some(config),
+            Self::Unrestricted => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DaemonConfig {
     pub provisioning: ProvisioningConfig,
     pub firecracker: PathBuf,
+    pub firecracker_executor: FirecrackerExecutorConfig,
     pub entrypoint: PathBuf,
     pub idle_policy: Option<IdlePolicy>,
 }
@@ -143,10 +285,16 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use barbirolli::FirecrackerExecutorConfig;
     use barbirolli::support;
-    use barbirolli::{BalloonConfig, LifecycleError, ProvisioningConfig, VmStatus};
+    use barbirolli::{
+        BalloonConfig, JailerConfig, JailerConfigError, JailerIdentity, LifecycleError,
+        ProvisioningConfig, VmId, VmStatus,
+    };
     use barbirolli_derive::firecracker_test;
 
+    use super::MAX_VM_ID;
     use support::{config::TestVmConfig, firecracker::FirecrackerFixture};
 
     #[test]
@@ -158,6 +306,50 @@ mod tests {
         assert_eq!(provisioning.extra_percentage, 20);
         assert_eq!(provisioning.count, 6);
         assert_eq!(u16::from(provisioning.initial_balloon_mem), 57);
+    }
+
+    #[test]
+    fn jailer_identity_is_stable_and_vm_specific() {
+        let config = JailerConfig::new("/jailer", "/srv/jailer/barbirolli", 100_000, 200_000)
+            .expect("valid jailer identity range");
+
+        assert_eq!(
+            config.identity(VmId::try_from(42).expect("valid VM ID")),
+            JailerIdentity {
+                uid: 100_042,
+                gid: 200_042,
+            }
+        );
+    }
+
+    #[test]
+    fn jailer_identity_range_rejects_root_and_reserved_values() {
+        assert_eq!(
+            JailerConfig::new("/jailer", "/srv/jailer/barbirolli", 0, 1),
+            Err(JailerConfigError::RootIdentity { kind: "UID" })
+        );
+        assert_eq!(
+            JailerConfig::new("/jailer", "/srv/jailer/barbirolli", 1, u32::MAX - MAX_VM_ID),
+            Err(JailerConfigError::IdentityRangeOverflow {
+                kind: "GID",
+                base: u32::MAX - MAX_VM_ID,
+            })
+        );
+    }
+
+    #[test]
+    fn jailer_identity_bases_parse_before_validation() {
+        assert_eq!(
+            JailerConfig::parse("/jailer", "/srv/jailer/barbirolli", "not-a-uid", "200000"),
+            Err(JailerConfigError::InvalidIdentityBase {
+                kind: "UID",
+                value: "not-a-uid".to_owned(),
+            })
+        );
+        assert_eq!(
+            JailerConfig::parse("/jailer", "/srv/jailer/barbirolli", "0", "200000"),
+            Err(JailerConfigError::RootIdentity { kind: "UID" })
+        );
     }
 
     #[firecracker_test]
@@ -211,7 +403,7 @@ mod tests {
 
         let first = fixture.create_vm(TestVmConfig::new(1)).await;
         assert_eq!(
-            first.api_socket,
+            first.logical_api_socket,
             first.storage.artifact_dir.join("firecracker.socket")
         );
         first
@@ -225,7 +417,7 @@ mod tests {
         let second = fixture.create_vm(TestVmConfig::new(2)).await;
         assert_ne!(first.id, second.id);
         assert_eq!(
-            second.api_socket,
+            second.logical_api_socket,
             second.storage.artifact_dir.join("firecracker.socket")
         );
         second
@@ -256,6 +448,101 @@ mod tests {
         assert!(second.api_socket.exists());
 
         fixture.finish().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[firecracker_test]
+    async fn jailed_executor_drops_identity_and_uses_the_precreated_cgroup() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let FirecrackerExecutorConfig::Jailed(config) = &fixture.firecracker_executor else {
+            return;
+        };
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+        let identity = config.identity(vm.id);
+
+        vm.lifecycle.start(|_| {}).await;
+        let pid = {
+            let state = fixture.manager.vm(vm.id).expect("missing running VM");
+            let super::BarbirolliVm::Managed(managed) = state.value() else {
+                panic!("expected a managed VM");
+            };
+            managed.pid.as_raw_pid()
+        };
+
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .expect("failed to read Firecracker process status");
+        assert_eq!(status_identities(&status, "Uid:"), [identity.uid; 4]);
+        assert_eq!(status_identities(&status, "Gid:"), [identity.gid; 4]);
+
+        let cgroup = format!("/sys/fs/cgroup/barbirolli/vm-{}/cgroup.procs", vm.id);
+        let cgroup_pids = std::fs::read_to_string(cgroup)
+            .expect("failed to read the VM cgroup")
+            .lines()
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("invalid cgroup PID");
+        assert_eq!(cgroup_pids, [pid]);
+        assert!(!vm.logical_api_socket.exists());
+        assert!(vm.api_socket.starts_with(&config.chroot_base));
+        assert_eq!(
+            std::fs::metadata(&vm.api_socket)
+                .expect("missing effective API socket")
+                .uid(),
+            identity.uid
+        );
+
+        fixture.finish().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[firecracker_test]
+    async fn jailed_prepare_failure_rolls_back_the_jail_cgroup_and_network() {
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let FirecrackerExecutorConfig::Jailed(config) = &fixture.firecracker_executor else {
+            return;
+        };
+        let vm = fixture.create_vm(TestVmConfig::new(1)).await;
+        let jail = config
+            .jail_root(&fixture.firecracker, vm.id)
+            .parent()
+            .expect("the jail root has an ID parent")
+            .to_owned();
+        let cgroup = std::path::PathBuf::from(format!("/sys/fs/cgroup/barbirolli/vm-{}", vm.id));
+        let tap = std::path::PathBuf::from("/sys/class/net").join(vm.network.spec.tap.as_ref());
+        std::fs::remove_file(vm.storage.kernel()).expect("failed to remove the fixture kernel");
+
+        {
+            let mut state = fixture.manager.vm_mut(vm.id).expect("missing fixture VM");
+            state
+                .start(&fixture.manager)
+                .await
+                .expect_err("the missing kernel should fail startup");
+        }
+
+        assert_eq!(vm.lifecycle.status(), VmStatus::Failed);
+        assert!(!cgroup.exists());
+        assert!(!jail.exists());
+        assert!(!tap.exists());
+        assert!(!vm.logical_api_socket.exists());
+        assert!(!vm.api_socket.exists());
+
+        fixture.finish().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn status_identities(status: &str, key: &str) -> [u32; 4] {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .expect("missing process identity status")
+            .split_ascii_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("invalid process identity status")
+            .try_into()
+            .expect("expected four process identities")
     }
 
     #[firecracker_test]
@@ -361,7 +648,7 @@ mod tests {
                 count: 0,
                 ..ProvisioningConfig::default()
             };
-            let manager = fixture.manager_with_provisioning(provisioning).await;
+            let manager = fixture.new_manager(provisioning).await;
 
             let result = manager.try_create_vm(TestVmConfig::new(1)).await;
 
@@ -380,7 +667,7 @@ mod tests {
         #[tokio::test]
         async fn serial_log_reconciliation_preserves_and_repairs_logs() {
             let fixture = BehaviorFixture::new();
-            let manager = fixture.manager().await;
+            let manager = fixture.new_manager(ProvisioningConfig::default()).await;
             let retained = manager
                 .try_create_vm(TestVmConfig::new(1))
                 .await
@@ -428,7 +715,7 @@ mod tests {
                 count: 1,
                 ..ProvisioningConfig::default()
             };
-            let manager = fixture.manager_with_provisioning(provisioning).await;
+            let manager = fixture.new_manager(provisioning).await;
 
             let discovered = manager
                 .try_create_vm(TestVmConfig::new(1))
@@ -462,7 +749,7 @@ mod tests {
         #[tokio::test]
         async fn manager_exposes_discovered_state_and_missing_vm_errors() {
             let fixture = BehaviorFixture::new();
-            let manager = fixture.manager().await;
+            let manager = fixture.new_manager(ProvisioningConfig::default()).await;
             let vm = manager
                 .try_create_vm(TestVmConfig::new(1))
                 .await
@@ -508,7 +795,7 @@ mod tests {
         async fn manager_deletion_is_deadlock_free_and_deleted_vms_stay_filtered() {
             let fixture = BehaviorFixture::new();
             assert!(fixture.temporary.path().is_dir());
-            let manager = fixture.manager().await;
+            let manager = fixture.new_manager(ProvisioningConfig::default()).await;
             let vm = manager
                 .try_create_vm(TestVmConfig::new(1))
                 .await
@@ -520,7 +807,7 @@ mod tests {
             assert!(vm.storage.rootfs().exists());
             assert_eq!(vm.storage.config()["spec"]["deleted"], true);
 
-            let reopened = fixture.manager().await;
+            let reopened = fixture.new_manager(ProvisioningConfig::default()).await;
             assert!(reopened.list().await.is_empty());
             assert!(matches!(
                 reopened.try_vm(vm.id),
@@ -534,7 +821,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn manager_concurrent_creation_deletion_and_reopen_are_persistent() {
             let fixture = BehaviorFixture::new();
-            let manager = fixture.manager().await;
+            let manager = fixture.new_manager(ProvisioningConfig::default()).await;
             let mut vms = manager
                 .create_vms_concurrently::<4>(
                     [
@@ -584,7 +871,7 @@ mod tests {
         #[tokio::test]
         async fn manager_draining_rejects_lifecycle_operations_but_keeps_reads_and_shutdown() {
             let fixture = BehaviorFixture::new();
-            let manager = fixture.manager().await;
+            let manager = fixture.new_manager(ProvisioningConfig::default()).await;
             let vm = manager
                 .try_create_vm(TestVmConfig::new(1))
                 .await

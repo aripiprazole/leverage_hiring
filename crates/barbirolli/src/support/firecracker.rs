@@ -1,6 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use barbirolli::{Barbirolli, DaemonConfig, ProvisioningConfig, Rootfs, VmId, VmStore, VmSummary};
+use barbirolli::{
+    Barbirolli, DaemonConfig, FirecrackerExecutorConfig, JailerConfig, ProvisioningConfig, Rootfs,
+    VmId, VmStore, VmSummary,
+};
 use futures::future::try_join_all;
 use tempfile::TempDir;
 use tokio::sync::Barrier;
@@ -16,6 +19,7 @@ pub struct FirecrackerFixture {
     pub vm_root: PathBuf,
     pub image_root: PathBuf,
     pub firecracker: PathBuf,
+    pub firecracker_executor: FirecrackerExecutorConfig,
     pub entrypoint: PathBuf,
     pub ssh_private_key: PathBuf,
 }
@@ -25,6 +29,7 @@ pub struct FirecrackerVmFixture {
     pub id: VmId,
     pub lifecycle: VmLifecycleFixture,
     pub api_socket: PathBuf,
+    pub logical_api_socket: PathBuf,
     pub network: VmNetworkFixture,
     pub ssh: SshFixture,
     pub storage: VmStorageFixture,
@@ -41,6 +46,7 @@ impl FirecrackerFixture {
             PathBuf::from(std::env::var_os("IMAGE_ROOT").expect("IMAGE_ROOT is required"));
         let firecracker =
             PathBuf::from(std::env::var_os("FIRECRACKER").expect("FIRECRACKER is required"));
+        let firecracker_executor = executor_config();
         let entrypoint = PathBuf::from(
             std::env::var_os("BARBIROLLI_ENTRYPOINT").expect("BARBIROLLI_ENTRYPOINT is required"),
         );
@@ -60,6 +66,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning,
                 firecracker: firecracker.clone(),
+                firecracker_executor: firecracker_executor.clone(),
                 entrypoint: entrypoint.clone(),
                 idle_policy: None,
             },
@@ -73,6 +80,7 @@ impl FirecrackerFixture {
             vm_root,
             image_root,
             firecracker,
+            firecracker_executor,
             entrypoint,
             ssh_private_key,
         }
@@ -134,14 +142,25 @@ impl FirecrackerFixture {
             .expect("missing fixture VM")
             .spec()
             .clone();
+        let logical_api_socket: PathBuf = spec.api_socket.clone().into();
         FirecrackerVmFixture {
             id,
             lifecycle: VmLifecycleFixture::new(self.manager.clone(), id),
-            api_socket: spec.api_socket.clone().into(),
+            api_socket: self.effective_api_socket(id, &logical_api_socket),
+            logical_api_socket,
             network: VmNetworkFixture::new(spec.network.clone()),
             ssh: SshFixture::new(spec.network.guest_ip, self.ssh_private_key.clone()),
             storage: VmStorageFixture::new(&spec),
         }
+    }
+
+    fn effective_api_socket(&self, id: VmId, local_path: &std::path::Path) -> PathBuf {
+        let FirecrackerExecutorConfig::Jailed(config) = &self.firecracker_executor else {
+            return local_path.to_owned();
+        };
+        config
+            .jail_root(&self.firecracker, id)
+            .join(crate::lifecycle::JAILED_API_SOCKET.trim_start_matches('/'))
     }
 
     pub async fn delete_vms_concurrently(
@@ -177,6 +196,7 @@ impl FirecrackerFixture {
             DaemonConfig {
                 provisioning: ProvisioningConfig::default(),
                 firecracker: self.firecracker.clone(),
+                firecracker_executor: self.firecracker_executor.clone(),
                 entrypoint: self.entrypoint.clone(),
                 idle_policy: None,
             },
@@ -203,4 +223,29 @@ impl FirecrackerFixture {
             .await
             .expect("failed to drain Barbirolli");
     }
+}
+
+fn executor_config() -> FirecrackerExecutorConfig {
+    match std::env::var("FIRECRACKER_EXECUTOR").as_deref() {
+        Ok("unrestricted") => return FirecrackerExecutorConfig::Unrestricted,
+        Ok("jailed") | Err(std::env::VarError::NotPresent) => {}
+        Ok(value) => panic!("invalid FIRECRACKER_EXECUTOR: {value}"),
+        Err(error) => panic!("invalid FIRECRACKER_EXECUTOR: {error}"),
+    }
+    let jailer = std::env::var_os("JAILER").expect("JAILER is required for jailed tests");
+    let chroot_base = std::env::var_os("JAILER_CHROOT_BASE")
+        .map_or_else(|| PathBuf::from("/srv/jailer/barbirolli"), PathBuf::from);
+    let uid_base = required_u32("JAILER_UID_BASE");
+    let gid_base = required_u32("JAILER_GID_BASE");
+    FirecrackerExecutorConfig::Jailed(
+        JailerConfig::new(jailer, chroot_base, uid_base, gid_base)
+            .expect("invalid jailer identity range"),
+    )
+}
+
+fn required_u32(name: &'static str) -> u32 {
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("{name} is required for jailed tests"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} must be an unsigned 32-bit integer"))
 }

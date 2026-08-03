@@ -1,4 +1,4 @@
-#![cfg_attr(test, recursion_limit = "512")]
+#![recursion_limit = "512"]
 
 mod idle;
 mod lifecycle;
@@ -22,8 +22,9 @@ use std::path::PathBuf;
 
 pub use idle::IdlePolicy;
 pub use lifecycle::{
-    BalloonConfig, BalloonStatistics, Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig,
-    VmStatus, VmSummary,
+    BalloonConfig, BalloonStatistics, Barbirolli, DaemonConfig, FirecrackerExecutorConfig,
+    JailerConfig, JailerConfigError, JailerIdentity, LifecycleError, ProvisioningConfig, VmStatus,
+    VmSummary,
 };
 pub use network::{InterfaceName, NetworkSpec};
 #[cfg(target_os = "linux")]
