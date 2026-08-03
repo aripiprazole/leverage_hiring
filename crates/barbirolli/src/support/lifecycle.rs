@@ -111,6 +111,10 @@ impl VmLifecycleFixture {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::unused_async,
+        reason = "keeps the fixture API uniform across target operating systems"
+    )]
     pub async fn health_sample(&self) -> crate::idle::Sample {
         panic!("VM health samples require Linux")
     }

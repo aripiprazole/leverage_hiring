@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(monitor.cpu_percent, None);
 
         let mut second = first;
-        second.sampled_at = origin + Duration::from_secs(60);
+        second.sampled_at = origin + Duration::from_mins(1);
         second.cpu_usage_usec = 600_000;
         let (_, activity) = monitor.observe(second, policy);
         assert_eq!(activity.cpu_percent, Some(1.0));
@@ -235,13 +235,13 @@ mod tests {
         );
 
         let mut next = first;
-        next.sampled_at = origin + Duration::from_secs(120);
+        next.sampled_at = origin + Duration::from_mins(2);
         next.latest_network_bytes = 1;
         next.network_bytes = 101;
         assert_eq!(monitor.observe(next, policy).0, IdleDecision::ActivityReset);
 
         let mut no_new_bytes = next;
-        no_new_bytes.sampled_at = origin + Duration::from_secs(180);
+        no_new_bytes.sampled_at = origin + Duration::from_mins(3);
         no_new_bytes.latest_network_bytes = 0;
         assert_eq!(monitor.observe(no_new_bytes, policy).0, IdleDecision::None);
     }

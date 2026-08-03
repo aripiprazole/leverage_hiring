@@ -131,6 +131,12 @@ impl MountSpec {
     ];
 }
 
+/// Mounts the filesystems required by the VM userspace.
+///
+/// # Errors
+///
+/// Returns an error when the current mounts cannot be inspected, a mountpoint
+/// cannot be created, or a required filesystem cannot be mounted.
 pub fn mount_userspace_filesystems() -> Result<()> {
     for filesystem in &MountSpec::USERSPACE {
         filesystem.mount()?;
@@ -179,7 +185,7 @@ impl ChildSettings {
                     rlim_cur: setting.soft,
                     rlim_max: setting.hard,
                 };
-                bail(libc::setrlimit(setting.resource as _, &limit))?;
+                bail(libc::setrlimit(setting.resource, &raw const limit))?;
             }
             bail(libc::setgroups(
                 self.additional_gids.len(),
@@ -200,24 +206,27 @@ impl ChildSettings {
 
 #[derive(Debug)]
 struct RlimitSetting {
-    resource: libc::c_int,
+    resource: RlimitResource,
     soft: libc::rlim_t,
     hard: libc::rlim_t,
 }
 
 pub struct OciChild {
     child: Child,
-    signal_mask: Option<SignalMask>,
+    signal_mask: SignalMask,
 }
 
 impl OciChild {
     fn restore_signal_mask(&mut self) -> io::Result<()> {
-        match self.signal_mask.as_mut() {
-            Some(mask) => mask.restore(),
-            None => Ok(()),
-        }
+        self.signal_mask.restore()
     }
 
+    /// Waits for the OCI process while forwarding signals and reaping descendants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when signal supervision cannot be configured, a signal
+    /// cannot be forwarded, or a descendant cannot be reaped.
     pub fn supervise_and_reap(mut self) -> Result<ExitStatus> {
         let process_group = i32::try_from(self.child.id()).map_err(|_| {
             EntrypointError::SignalSupervision(io::Error::new(
@@ -225,27 +234,25 @@ impl OciChild {
                 "OCI process ID does not fit in pid_t",
             ))
         })?;
-        let result = {
-            SignalFd::new(
-                self.signal_mask
-                    .as_ref()
-                    .expect("spawned OCI children always own a signal mask"),
-            )?
-            .supervise(process_group)
-        };
+        let result = SignalFd::new(&self.signal_mask)?.supervise(process_group);
         let restore = self
             .restore_signal_mask()
             .map_err(EntrypointError::SignalSupervision);
 
         match (result, restore) {
             (Ok(exit), Ok(())) => Ok(exit),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
 }
 
 impl ProcessSpec {
+    /// Spawns the configured OCI process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when signal supervision cannot be configured or the OCI
+    /// process cannot be spawned.
     pub fn spawn(self) -> Result<OciChild> {
         let ProcessSpec {
             program,
@@ -298,10 +305,7 @@ impl ProcessSpec {
             .spawn()
             .map_err(|source| EntrypointError::SpawnProcess { program, source })?;
 
-        Ok(OciChild {
-            child,
-            signal_mask: Some(signal_mask),
-        })
+        Ok(OciChild { child, signal_mask })
     }
 }
 
@@ -313,24 +317,29 @@ fn bail(result: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn rlimit_resource(resource: PosixRlimitType) -> libc::c_int {
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
+fn rlimit_resource(resource: PosixRlimitType) -> RlimitResource {
     match resource {
-        PosixRlimitType::RlimitCpu => libc::RLIMIT_CPU as libc::c_int,
-        PosixRlimitType::RlimitFsize => libc::RLIMIT_FSIZE as libc::c_int,
-        PosixRlimitType::RlimitData => libc::RLIMIT_DATA as libc::c_int,
-        PosixRlimitType::RlimitStack => libc::RLIMIT_STACK as libc::c_int,
-        PosixRlimitType::RlimitCore => libc::RLIMIT_CORE as libc::c_int,
-        PosixRlimitType::RlimitRss => libc::RLIMIT_RSS as libc::c_int,
-        PosixRlimitType::RlimitNproc => libc::RLIMIT_NPROC as libc::c_int,
-        PosixRlimitType::RlimitNofile => libc::RLIMIT_NOFILE as libc::c_int,
-        PosixRlimitType::RlimitMemlock => libc::RLIMIT_MEMLOCK as libc::c_int,
-        PosixRlimitType::RlimitAs => libc::RLIMIT_AS as libc::c_int,
-        PosixRlimitType::RlimitLocks => libc::RLIMIT_LOCKS as libc::c_int,
-        PosixRlimitType::RlimitSigpending => libc::RLIMIT_SIGPENDING as libc::c_int,
-        PosixRlimitType::RlimitMsgqueue => libc::RLIMIT_MSGQUEUE as libc::c_int,
-        PosixRlimitType::RlimitNice => libc::RLIMIT_NICE as libc::c_int,
-        PosixRlimitType::RlimitRtprio => libc::RLIMIT_RTPRIO as libc::c_int,
-        PosixRlimitType::RlimitRttime => libc::RLIMIT_RTTIME as libc::c_int,
+        PosixRlimitType::RlimitCpu => libc::RLIMIT_CPU,
+        PosixRlimitType::RlimitFsize => libc::RLIMIT_FSIZE,
+        PosixRlimitType::RlimitData => libc::RLIMIT_DATA,
+        PosixRlimitType::RlimitStack => libc::RLIMIT_STACK,
+        PosixRlimitType::RlimitCore => libc::RLIMIT_CORE,
+        PosixRlimitType::RlimitRss => libc::RLIMIT_RSS,
+        PosixRlimitType::RlimitNproc => libc::RLIMIT_NPROC,
+        PosixRlimitType::RlimitNofile => libc::RLIMIT_NOFILE,
+        PosixRlimitType::RlimitMemlock => libc::RLIMIT_MEMLOCK,
+        PosixRlimitType::RlimitAs => libc::RLIMIT_AS,
+        PosixRlimitType::RlimitLocks => libc::RLIMIT_LOCKS,
+        PosixRlimitType::RlimitSigpending => libc::RLIMIT_SIGPENDING,
+        PosixRlimitType::RlimitMsgqueue => libc::RLIMIT_MSGQUEUE,
+        PosixRlimitType::RlimitNice => libc::RLIMIT_NICE,
+        PosixRlimitType::RlimitRtprio => libc::RLIMIT_RTPRIO,
+        PosixRlimitType::RlimitRttime => libc::RLIMIT_RTTIME,
     }
 }
 
@@ -348,12 +357,13 @@ impl SignalMask {
                 .map_err(EntrypointError::SignalSupervision)?;
             let mut blocked = blocked.assume_init();
             for signal in SUPERVISED_SIGNALS {
-                bail(libc::sigaddset(&mut blocked, signal))
+                bail(libc::sigaddset(&raw mut blocked, signal))
                     .map_err(EntrypointError::SignalSupervision)?;
             }
 
             let mut original = MaybeUninit::<libc::sigset_t>::uninit();
-            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, original.as_mut_ptr());
+            let result =
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, original.as_mut_ptr());
             if result != 0 {
                 return Err(EntrypointError::SignalSupervision(
                     io::Error::from_raw_os_error(result),
@@ -376,8 +386,9 @@ impl SignalMask {
         if !self.active {
             return Ok(());
         }
-        let result =
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.original, ptr::null_mut()) };
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.original, ptr::null_mut())
+        };
         if result != 0 {
             return Err(io::Error::from_raw_os_error(result));
         }
@@ -404,7 +415,7 @@ struct SignalFd(OwnedFd);
 
 impl SignalFd {
     fn new(mask: &SignalMask) -> Result<Self> {
-        let fd = unsafe { libc::signalfd(-1, &mask.blocked, libc::SFD_CLOEXEC) };
+        let fd = unsafe { libc::signalfd(-1, &raw const mask.blocked, libc::SFD_CLOEXEC) };
         if fd == -1 {
             return Err(EntrypointError::SignalSupervision(
                 io::Error::last_os_error(),
@@ -423,15 +434,22 @@ impl SignalFd {
                     size_of::<libc::signalfd_siginfo>(),
                 )
             };
-            if bytes == size_of::<libc::signalfd_siginfo>() as isize {
-                return Ok(unsafe { info.assume_init() }.ssi_signo as libc::c_int);
-            }
             if bytes == -1 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(EntrypointError::SignalSupervision(error));
+            }
+            if usize::try_from(bytes) == Ok(size_of::<libc::signalfd_siginfo>()) {
+                let signal = libc::c_int::try_from(unsafe { info.assume_init() }.ssi_signo)
+                    .map_err(|_| {
+                        EntrypointError::SignalSupervision(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "signalfd returned a signal number that does not fit in c_int",
+                        ))
+                    })?;
+                return Ok(signal);
             }
             return Err(EntrypointError::SignalSupervision(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -464,7 +482,7 @@ fn reap_descendants(main_process: libc::pid_t) -> Result<Option<ExitStatus>> {
     let mut main_exit = None;
     loop {
         let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        let pid = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
         if pid > 0 {
             if pid == main_process {
                 main_exit = Some(ExitStatus::from_raw(status));
@@ -488,6 +506,12 @@ pub fn sync_filesystems() {
     }
 }
 
+/// Powers off the VM after the OCI process exits.
+///
+/// # Errors
+///
+/// Returns an error if the power-off system call returns instead of shutting
+/// down the VM.
 pub fn power_off(exit: ExitStatus) -> Result<()> {
     eprintln!("barbirolli_entrypoint: OCI process exited with {exit}");
     eprintln!("barbirolli_entrypoint: VM starts power-off");

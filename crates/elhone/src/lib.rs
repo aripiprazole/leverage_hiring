@@ -149,11 +149,11 @@ async fn vm_logs(
     };
     let file = tokio::fs::File::open(&path)
         .await
-        .map_err(|error| vm_log_io_error(id, "open", &path, error))?;
+        .map_err(|error| vm_log_io_error(id, "open", &path, &error))?;
     let len = file
         .metadata()
         .await
-        .map_err(|error| vm_log_io_error(id, "inspect", &path, error))?
+        .map_err(|error| vm_log_io_error(id, "inspect", &path, &error))?
         .len();
     tracing::info!(
         %id,
@@ -200,7 +200,9 @@ fn vm_log_stream(
         }
         loop {
             let read_size = state.remaining.map_or(LOG_READ_BUFFER_SIZE, |remaining| {
-                remaining.min(LOG_READ_BUFFER_SIZE as u64) as usize
+                usize::try_from(remaining)
+                    .unwrap_or(LOG_READ_BUFFER_SIZE)
+                    .min(LOG_READ_BUFFER_SIZE)
             });
             if read_size == 0 {
                 return None;
@@ -232,7 +234,7 @@ fn vm_log_io_error(
     id: VmId,
     operation: &'static str,
     path: &std::path::Path,
-    error: io::Error,
+    error: &io::Error,
 ) -> ApiError {
     tracing::error!(%error, %id, operation, path = %path.display(), "the VM log request failed");
     ApiError::InternalServerError(format!("failed to {operation} VM {id} serial log"))
@@ -281,13 +283,13 @@ async fn vm_stats(
     tracing::info!(vm_id = %id, "elhone starts to get VM stats");
     let id = parse_vm_id(&id)?;
     let Query(query) = query.map_err(|error| ApiError::UnprocessableEntity(error.body_text()))?;
-    let stats = state
+    let snapshot = state
         .manager
         .stats(id, query.force)
         .await
         .map_err(ApiError::from)?;
     tracing::info!(%id, force = query.force, "elhone read VM stats");
-    Ok(Json(stats))
+    Ok(Json(snapshot))
 }
 
 #[tracing::instrument(skip(state))]
@@ -548,7 +550,7 @@ mod tests {
                 "id": 0,
                 "sample_age_ms": 84,
                 "cpu_percent": 0.42,
-                "memory_bytes": 67108864,
+                "memory_bytes": 67_108_864,
                 "process_count": 5,
                 "network_bytes": { "latest": 1024, "total": 4096 },
                 "disk_bytes": { "latest": 2048, "total": 8192 },
