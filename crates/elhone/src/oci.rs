@@ -1,9 +1,6 @@
 mod rootfs;
 
-use std::{
-    path::Path,
-    sync::{Arc, Once},
-};
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Json,
@@ -25,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::{ApiError, AppState};
+use super::{ApiError, AppState, install_ring_crypto_provider};
 
 #[derive(Debug, Clone, Copy)]
 enum TransportPolicy {
@@ -538,16 +535,6 @@ impl OciFetcher {
         let filesystem = self.artifacts.finish(workspace, process_spec).await?;
         Ok((layers, filesystem))
     }
-}
-
-fn install_ring_crypto_provider() {
-    static INSTALL_RING_CRYPTO_PROVIDER: Once = Once::new();
-
-    INSTALL_RING_CRYPTO_PROVIDER.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("ring should be the only installed rustls crypto provider");
-    });
 }
 
 #[tracing::instrument(skip(state, input), err)]
@@ -2148,6 +2135,13 @@ mod tests {
     };
 
     const TOKEN: &str = "fixture-token";
+
+    #[test]
+    fn ring_crypto_provider_installation_is_idempotent() {
+        crate::install_ring_crypto_provider();
+        crate::install_ring_crypto_provider();
+        let _fetcher = OciFetcher::default();
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum InitialDocument {

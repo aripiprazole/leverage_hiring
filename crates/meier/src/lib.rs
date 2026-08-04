@@ -2457,12 +2457,6 @@ pub use error::{MeierError, SetupError};
 
 pub type Result<T, E = MeierError> = std::result::Result<T, E>;
 
-/// Build the structured error document emitted by the `meier` binary.
-#[must_use]
-pub fn error_body(error: &MeierError) -> serde_json::Value {
-    serde_json::json!({"error": error.to_string()})
-}
-
 fn tracing_filter(directives: Option<&str>) -> Result<tracing_subscriber::EnvFilter> {
     match directives {
         Some(directives) => tracing_subscriber::EnvFilter::try_new(directives)
@@ -2522,7 +2516,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{error_body, tracing_filter};
+    use super::tracing_filter;
     use crate::{
         cli::{Cli, Command, ConfigCommand, CreateArgs, DaemonCommand, ImageReference, OciCommand},
         config::{self, Config},
@@ -2808,7 +2802,7 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let config_path = directory.path().join("config.json");
         let error = config::load(&config_path).expect_err("missing config should fail");
-        let encoded = serde_json::to_vec(&error_body(&error)).expect("JSON error");
+        let encoded = serde_json::to_vec(&json!({"error": error.to_string()})).expect("JSON error");
         let parsed: serde_json::Value = serde_json::from_slice(&encoded).expect("JSON error");
         assert!(parsed["error"].as_str().is_some());
 
@@ -2819,8 +2813,8 @@ mod tests {
             "off"
         );
         let invalid_filter = tracing_filter(Some("[")).expect_err("invalid filter should fail");
-        let encoded =
-            serde_json::to_vec(&error_body(&invalid_filter)).expect("JSON tracing-filter error");
+        let encoded = serde_json::to_vec(&json!({"error": invalid_filter.to_string()}))
+            .expect("JSON tracing-filter error");
         let parsed: serde_json::Value =
             serde_json::from_slice(&encoded).expect("JSON tracing-filter error");
         assert!(
