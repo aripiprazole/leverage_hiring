@@ -2501,7 +2501,7 @@ mod tests {
 
     impl RegistryFixture {
         async fn start(documents: RegistryDocuments) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0")
+            let listener = TcpListener::bind("127.0.0.1:8000")
                 .await
                 .expect("fixture registry should bind");
             let address = listener

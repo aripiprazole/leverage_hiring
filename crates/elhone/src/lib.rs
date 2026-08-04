@@ -1,6 +1,6 @@
 mod oci;
 
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf, sync::Once, time::Duration};
 
 use axum::{
     Json, Router,
@@ -26,17 +26,14 @@ const LOG_READ_BUFFER_SIZE: usize = 8 * 1024;
 const LOG_FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Installs the ring Rustls crypto provider when no process-wide provider exists.
-///
-/// # Panics
-///
-/// Panics if another caller installs a process-wide crypto provider after the
-/// initial check but before ring is installed.
 pub fn install_ring_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let () = rustls::crypto::ring::default_provider()
-            .install_default()
-            .unwrap();
-    }
+    static INSTALL_RING_CRYPTO_PROVIDER: Once = Once::new();
+
+    INSTALL_RING_CRYPTO_PROVIDER.call_once(|| {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+    });
 }
 
 #[derive(Clone)]
