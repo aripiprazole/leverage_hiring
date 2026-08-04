@@ -1,9 +1,6 @@
 mod rootfs;
 
-use std::{
-    path::Path,
-    sync::{Arc, Once},
-};
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Json,
@@ -25,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use super::{ApiError, AppState};
+use super::{ApiError, AppState, install_ring_crypto_provider};
 
 #[derive(Debug, Clone, Copy)]
 enum TransportPolicy {
@@ -538,16 +535,6 @@ impl OciFetcher {
         let filesystem = self.artifacts.finish(workspace, process_spec).await?;
         Ok((layers, filesystem))
     }
-}
-
-fn install_ring_crypto_provider() {
-    static INSTALL_RING_CRYPTO_PROVIDER: Once = Once::new();
-
-    INSTALL_RING_CRYPTO_PROVIDER.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("ring should be the only installed rustls crypto provider");
-    });
 }
 
 #[tracing::instrument(skip(state, input), err)]
@@ -2116,11 +2103,11 @@ impl ParseValueError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
-        io::Write,
+        collections::{HashMap, HashSet},
+        io::{ErrorKind, Write},
         path::Path,
         sync::{
-            Arc, Mutex,
+            Arc, Mutex, OnceLock,
             atomic::{AtomicU16, Ordering},
         },
     };
@@ -2148,6 +2135,13 @@ mod tests {
     };
 
     const TOKEN: &str = "fixture-token";
+
+    #[test]
+    fn ring_crypto_provider_installation_is_idempotent() {
+        crate::install_ring_crypto_provider();
+        crate::install_ring_crypto_provider();
+        let _fetcher = OciFetcher::default();
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum InitialDocument {
@@ -2505,12 +2499,93 @@ mod tests {
         task: JoinHandle<()>,
     }
 
+    const TEST_PORT_START: u16 = 8000;
+    const TEST_PORT_END: u16 = 8099;
+
+    #[derive(Default)]
+    struct TestPortAllocator {
+        next_port: u16,
+        reserved_ports: HashSet<u16>,
+    }
+
+    static TEST_PORT_ALLOCATOR: OnceLock<Mutex<TestPortAllocator>> = OnceLock::new();
+
+    fn test_port_allocator() -> &'static Mutex<TestPortAllocator> {
+        TEST_PORT_ALLOCATOR.get_or_init(|| {
+            Mutex::new(TestPortAllocator {
+                next_port: TEST_PORT_START,
+                reserved_ports: HashSet::new(),
+            })
+        })
+    }
+
+    // The listener is the lock: it keeps the allocated port reserved for this fixture.
+    struct TestPortLock {
+        port: u16,
+        listener: Option<TcpListener>,
+    }
+
+    impl TestPortLock {
+        async fn acquire() -> Self {
+            loop {
+                let port = {
+                    let mut allocator = test_port_allocator()
+                        .lock()
+                        .expect("test port allocator should not be poisoned");
+                    let port = allocator.next_port;
+                    allocator.next_port = if port == TEST_PORT_END {
+                        TEST_PORT_START
+                    } else {
+                        port + 1
+                    };
+                    allocator.reserved_ports.insert(port).then_some(port)
+                };
+
+                let Some(port) = port else {
+                    tokio::task::yield_now().await;
+                    continue;
+                };
+
+                match TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => {
+                        return Self {
+                            port,
+                            listener: Some(listener),
+                        };
+                    }
+                    Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                        Self::release(port);
+                    }
+                    Err(error) => {
+                        Self::release(port);
+                        panic!("fixture registry should bind to test port {port}: {error}");
+                    }
+                }
+            }
+        }
+
+        fn release(port: u16) {
+            test_port_allocator()
+                .lock()
+                .expect("test port allocator should not be poisoned")
+                .reserved_ports
+                .remove(&port);
+        }
+    }
+
+    impl Drop for TestPortLock {
+        fn drop(&mut self) {
+            Self::release(self.port);
+        }
+    }
+
     impl RegistryFixture {
         async fn start(documents: RegistryDocuments) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("fixture registry should bind");
-            let address = listener
+            let port = TestPortLock::acquire().await;
+            let address = port
+                .listener
+                .as_ref()
+                .expect("fixture registry listener should be available")
                 .local_addr()
                 .expect("fixture registry should have an address");
             let base_url = format!("http://{address}");
@@ -2523,6 +2598,11 @@ mod tests {
                 .route("/v2/{*path}", get(registry))
                 .with_state(state);
             let task = tokio::spawn(async move {
+                let mut port = port;
+                let listener = port
+                    .listener
+                    .take()
+                    .expect("fixture registry listener should be available");
                 axum::serve(listener, app)
                     .await
                     .expect("fixture registry should serve");

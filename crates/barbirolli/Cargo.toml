@@ -2,7 +2,14 @@
 name = "barbirolli"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+description = "Firecracker microVM lifecycle, storage, and networking primitives"
+repository.workspace = true
+readme = "README.md"
+categories = ["virtualization"]
+keywords = ["firecracker", "microvm", "virtualization"]
+rust-version.workspace = true
 
 [dependencies]
 derive_more.workspace = true
@@ -11,6 +18,7 @@ nonempty-collections.workspace = true
 serde.workspace = true
 ssh-key.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 validated.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

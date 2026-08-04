@@ -83,13 +83,20 @@ impl LimaHttpFixture {
                 let body = body.clone();
                 tokio::spawn(async move {
                     let mut request = [0; 1024];
-                    let _ = connection.read(&mut request).await;
+                    if let Err(error) = connection.read(&mut request).await {
+                        tracing::debug!(%error, "HTTP fixture could not read the request");
+                        return;
+                    }
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
-                    if connection.write_all(headers.as_bytes()).await.is_ok() {
-                        let _ = connection.write_all(&body).await;
+                    if let Err(error) = connection.write_all(headers.as_bytes()).await {
+                        tracing::debug!(%error, "HTTP fixture could not write headers");
+                        return;
+                    }
+                    if let Err(error) = connection.write_all(&body).await {
+                        tracing::debug!(%error, "HTTP fixture could not write the body");
                     }
                 });
             }

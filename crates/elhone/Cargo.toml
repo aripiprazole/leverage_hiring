@@ -2,7 +2,14 @@
 name = "elhone"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+description = "The HTTP API for Barbirolli-managed microVMs and OCI images"
+repository.workspace = true
+readme = "README.md"
+categories = ["web-programming::http-server"]
+keywords = ["firecracker", "microvm", "axum", "oci"]
+rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true

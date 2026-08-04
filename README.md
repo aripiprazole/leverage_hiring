@@ -56,6 +56,27 @@ In the Lima VM, run these commands:
 ./x daemon:run
 ```
 
+## Meier CLI
+
+Initialize the Meier config once:
+
+```bash
+meier config init
+meier daemon setup
+meier daemon run
+meier vm create --publish 2222:22
+meier vm ps
+meier vm logs 0 --pull
+meier vm ssh 0 -- cat /etc/os-release
+```
+
+Linux uses the local daemon. macOS uses the configured, running Lima guest.
+Meier does not start or create Lima. The guest runs the same binary in its
+private `__daemon` mode. It does not run the public client command.
+
+Results are JSON on stdout. Errors are JSON on stderr. Help, version, SSH, and
+log output stay raw. The existing `x` and `scripts/` commands stay supported.
+
 ## Example commands
 
 ```sh
