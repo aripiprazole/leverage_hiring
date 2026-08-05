@@ -50,6 +50,8 @@ pub fn router(manager: Barbirolli, standard_rootfs: Rootfs) -> Router {
         .route("/vms/{id}/logs", get(vm_logs))
         .route("/vms/{id}/status", get(vm_status))
         .route("/vms/{id}/start", post(start_vm))
+        .route("/vms/{id}/pause", post(pause_vm))
+        .route("/vms/{id}/resume", post(resume_vm))
         .route("/vms/{id}/shutdown", post(shutdown_vm))
         .route("/oci/pull", post(oci::pull))
         .route("/oci/run", post(oci::run))
@@ -289,6 +291,40 @@ async fn start_vm(
     vm.start(&state.manager).await.map_err(ApiError::from)?;
     let summary = vm.summary();
     tracing::info!(%id, "elhone started the VM");
+    Ok(Json(StatusResponse {
+        id,
+        status: summary.status,
+    }))
+}
+
+#[tracing::instrument(skip(state))]
+async fn pause_vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts VM pause");
+    let id = parse_vm_id(&id)?;
+    let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
+    vm.pause(&state.manager).await.map_err(ApiError::from)?;
+    let summary = vm.summary();
+    tracing::info!(%id, "elhone paused the VM");
+    Ok(Json(StatusResponse {
+        id,
+        status: summary.status,
+    }))
+}
+
+#[tracing::instrument(skip(state))]
+async fn resume_vm(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    tracing::info!(vm_id = %id, "elhone starts VM resume");
+    let id = parse_vm_id(&id)?;
+    let mut vm = state.manager.vm_mut(id).map_err(ApiError::from)?;
+    vm.resume(&state.manager).await.map_err(ApiError::from)?;
+    let summary = vm.summary();
+    tracing::info!(%id, "elhone resumed the VM");
     Ok(Json(StatusResponse {
         id,
         status: summary.status,
@@ -714,6 +750,14 @@ mod tests {
                     "guest_mac": "06:00:ac:10:00:02"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn paused_status_serializes_as_paused() {
+        assert_eq!(
+            serde_json::to_value(VmStatus::Paused).expect("status should serialize"),
+            json!("paused")
         );
     }
 }

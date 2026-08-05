@@ -20,6 +20,8 @@ Commands:
   vm:show          Show details for a VM.
   vm:status        Show a VM status.
   vm:start         Start a VM.
+  vm:pause         Pause a running VM.
+  vm:resume        Resume a paused VM.
   vm:shutdown      Shutdown a VM.
   vm:delete        Delete a VM.
   vm:ssh           SSH into a running VM.
@@ -54,6 +56,8 @@ commands=(
     vm:show
     vm:status
     vm:start
+    vm:pause
+    vm:resume
     vm:shutdown
     vm:delete
     vm:ssh

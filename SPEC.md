@@ -86,10 +86,12 @@ and list responses show these stable states:
 
 - `discovered`: The VM is stored and stopped.
 - `running`: Firecracker actively manages the VM.
+- `paused`: Firecracker retains the VM runtime while guest execution is suspended.
 - `failed`: The VM startup, shutdown, or runtime cleanup failed.
 
-The daemon logs contain the `starting` and `shutting_down` transition events. Elhone serializes
-operations that change the same VM. Thus, API readers see the resultant stable state.
+The daemon logs contain the `starting`, `running`, `paused`, and `shutting_down` transition events.
+Elhone serializes operations that change the same VM. Thus, API readers see the resultant stable
+state.
 
 ## GET `/vms/:id`
 
@@ -123,6 +125,18 @@ GET /vms/:id/status
 
 ```http
 POST /vms/:id/start
+```
+
+## POST `/vms/:id/pause`
+
+```http
+POST /vms/:id/pause
+```
+
+## POST `/vms/:id/resume`
+
+```http
+POST /vms/:id/resume
 ```
 
 ## POST `/vms/:id/shutdown`
@@ -232,6 +246,7 @@ struct ManagedVm {
     latest_metrics: Arc<RwLock<Option<Metrics>>>,
     monitor: Mutex<Option<Monitor>>,
     failed: bool,
+    paused: bool,
 }
 ```
 
@@ -451,6 +466,9 @@ async fn create(&self, input: VmInput) -> Result<VmId> {
 }
 ```
 
+Paused VMs remain `Managed`, retain their runtime resources, and count toward the same capacity
+limit as running VMs.
+
 ### Starting a VM
 
 A start operation uses the `Discovered -> (Managed | Failed)` transition. For a `Failed` VM,
@@ -518,6 +536,7 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
         spec,
         vm,
         failed: false,
+        paused: false,
         monitor: Mutex::new(None),
         network: Some(network),
         cgroup: Some(cgroup),
@@ -531,6 +550,32 @@ async fn ManagedVm::start(spec: VmSpec, barbirolli: &Barbirolli) -> Result<Self>
 - Barbirolli creates the cgroup after Firecracker starts because it needs the Firecracker PID.
 - If a failure occurs after network preparation, startup rollback releases all acquired resources. The
   returned error contains all failures.
+
+### Pausing and resuming a VM
+
+Pause and resume operate on the existing managed Firecracker process through the typed
+`fctools::VmApi` methods. Discovered and failed VMs reject both operations with `409 Conflict`.
+
+```rust
+async fn pause(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+    barbirolli.is_app_alive()?;
+    self.managed_for("pause")?.pause().await?;
+    Ok(())
+}
+
+async fn resume(&mut self, barbirolli: &Barbirolli) -> Result<()> {
+    barbirolli.is_app_alive()?;
+    self.managed_for("resume")?.resume().await?;
+    Ok(())
+}
+```
+
+- Repeating an operation after the VM reaches its target state is idempotent.
+- The stable status changes only after Firecracker accepts the request.
+- A successful transition resets the idle-monitor baseline. Paused VMs continue through normal idle
+  detection and may be shut down automatically.
+- Pause state is runtime-only. Daemon warmup reconciles stale resources and registers the VM as
+  `discovered`.
 
 ### Shutting down a VM
 
@@ -567,6 +612,7 @@ async fn shutdown(&mut self, barbirolli: &Barbirolli) -> Result<()> {
 
 - On x86_64, `ManagedVm::shutdown` sends Ctrl-Alt-Del.
 - On aarch64, it writes `reboot\n` through the stored serial stdin.
+- An already paused VM is killed directly before the normal cleanup path.
 - After a timeout, it first uses pause-and-kill and then kill.
 - Removes the Firecracker resources, network, and cgroup.
 - Cleanup flushes the serial stdout writer and stops the metrics reader and tries each resource and combines the errors.
@@ -621,7 +667,7 @@ Application shutdown sets `draining`. It then shuts down each registered VM.
 
 ## Idle detection and automatic shutdown
 
-Barbirolli samples each running VM at the Firecracker boundary.
+Barbirolli samples each managed VM, including paused VMs, at the Firecracker boundary.
 
 - The VM cgroup supplies CPU, memory, and process use. The Firecracker metrics FIFO supplies the
   network and disk byte counters.

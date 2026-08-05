@@ -83,6 +83,8 @@ log output stay raw. The existing `x` and `scripts/` commands stay supported.
 ./x help # Show available VM commands
 ./x vm:create --publish 2222:22 # Create a VM
 ./x vm:start 0 # Start a VM
+./x vm:pause 0 # Pause a running VM
+./x vm:resume 0 # Resume a paused VM
 ./x vm:shutdown 0 # Stop a VM
 ./x vm:status 0 # Check the VM status
 ./x vm:logs 0 # Print retained serial output and follow new output
@@ -102,6 +104,8 @@ memory option.
 ./x vm:logs 0 --attach # Use the full form of the default follow mode
 ./x vm:ssh --identity ~/.ssh/my-key.pem 0 -- "cat /etc/os-release" # Use the private key that matches --authorized-key-file
 ./x help vm:create # Help for a specific command
+./x help vm:pause # Help for pausing a VM
+./x help vm:resume # Help for resuming a VM
 ```
 
 When you use the Nix shell, `x` is also in `PATH`:

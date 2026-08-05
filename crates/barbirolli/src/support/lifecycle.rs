@@ -100,6 +100,26 @@ impl VmLifecycleFixture {
         inspect(self);
     }
 
+    pub async fn pause(&self, inspect: impl FnOnce(&Self)) {
+        {
+            let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
+            vm.pause(&self.manager)
+                .await
+                .expect("failed to pause fixture VM");
+        }
+        inspect(self);
+    }
+
+    pub async fn resume(&self, inspect: impl FnOnce(&Self)) {
+        {
+            let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");
+            vm.resume(&self.manager)
+                .await
+                .expect("failed to resume fixture VM");
+        }
+        inspect(self);
+    }
+
     pub async fn shutdown(&self, inspect: impl FnOnce(&Self)) {
         {
             let mut vm = self.manager.vm_mut(self.id).expect("missing fixture VM");

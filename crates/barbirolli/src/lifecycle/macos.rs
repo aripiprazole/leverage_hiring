@@ -29,6 +29,14 @@ impl BarbirolliVm {
         async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
     }
 
+    pub fn pause(&mut self, _barbirolli: &Barbirolli) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
+
+    pub fn resume(&mut self, _barbirolli: &Barbirolli) -> BoxFuture<'_, Result<()>> {
+        async move { Err(LifecycleError::UnsupportedPlatform) }.boxed()
+    }
+
     pub fn balloon_config(
         &mut self,
         _barbirolli: &Barbirolli,
