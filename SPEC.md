@@ -13,8 +13,9 @@ bartender in early-twentieth-century New York.
 - `ELHONE_ADDR`. The default address is `127.0.0.1:3000`.
 - Returns JSON for all responses except the raw VM log stream. Error responses use
   `{"error": "..."}`.
-- VMs cause a `404` response. Invalid state changes and full VM capacity cause a `409`
-  response. Invalid input causes a `422` response. Internal lifecycle failures cause a `500`
+- Missing VMs cause a `404` response. Invalid state changes and full VM capacity cause a `409`
+  response. Invalid input causes a `422` response. Unavailable health samples and timed-out
+  forced stats refreshes cause a `503` response. Internal lifecycle failures cause a `500`
   response.
 - serializes operations that change the same VM.
 
@@ -118,6 +119,54 @@ GET /vms/:id/status
 ```json
 { "id": 0, "status": "discovered" }
 ```
+
+## GET `/vms/:id/stats`
+
+```http
+GET /vms/:id/stats?force=false
+```
+
+The route returns the most recent combined health sample for a running VM. The query is strict:
+`force` is an optional boolean and defaults to `false`; unknown parameters and values other than
+`true` or `false` are invalid.
+
+```json
+{
+  "id": 0,
+  "sample_age_ms": 84,
+  "cpu_percent": 0.42,
+  "memory_bytes": 67108864,
+  "process_count": 5,
+  "network_bytes": { "latest": 1024, "total": 4096 },
+  "disk_bytes": { "latest": 2048, "total": 8192 },
+  "established_tcp_connections": 1,
+  "total_connections": 2
+}
+```
+
+`VmStats` and its nested `ByteStats` are public Barbirolli types. `sample_age_ms` is the age of
+the combined cgroup, Firecracker, and conntrack sample when the response is built. `cpu_percent`
+is `null` until two valid cgroup CPU samples exist and becomes `null` again after a CPU counter
+reset. CPU is normalized by elapsed time and the VM's vCPU count. `network_bytes.latest` and
+`disk_bytes.latest` are the newest Firecracker emission intervals. Their `total` values are
+saturating sums for the current running VM instance.
+
+With `force=false`, the route only maps the monitor's latest one-second heartbeat sample. It does
+not create a sample when the monitor has no baseline. With `force=true`, Barbirolli records the
+current Firecracker metrics generation, sends the typed `FlushMetrics` API action, waits for a
+strictly newer FIFO emission for up to the existing Firecracker API timeout, and then resamples
+the cgroup and conntrack sources. CPU is calculated against the monitor's last sample for this
+response only; neither cached nor forced stats reads advance idle strikes, reset `last_activity`,
+change `next_check`, or replace the monitor baseline. Forced reads are serialized with lifecycle
+operations for the same VM.
+
+The route returns these statuses:
+
+- `404 Not Found` when the VM ID is not registered.
+- `409 Conflict` when the VM is stopped (`discovered`) or failed.
+- `422 Unprocessable Entity` for an invalid VM ID, invalid `force` value, or unknown query field.
+- `503 Service Unavailable` when no cached health sample exists or a forced refresh times out (or
+  its metrics reader has stopped). A failed forced refresh never falls back to stale data.
 
 ## POST `/vms/:id/start`
 
@@ -229,9 +278,18 @@ struct ManagedVm {
     pid: i32,
     cgroup: Option<VmCgroup>,
     metrics_task: JoinHandle<()>,
-    latest_metrics: Arc<RwLock<Option<Metrics>>>,
+    metrics: watch::Receiver<MetricsSnapshot>,
     monitor: Mutex<Option<Monitor>>,
     failed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MetricsSnapshot {
+    generation: u64,
+    latest_network_bytes: u64,
+    total_network_bytes: u64,
+    latest_disk_bytes: u64,
+    total_disk_bytes: u64,
 }
 ```
 
@@ -628,6 +686,19 @@ Barbirolli samples each running VM at the Firecracker boundary.
 - Conntrack entries for the guest IP supply the connection state.
 - Barbirolli reports memory as a health metric.
 
+The metrics FIFO is a stream of cumulative Firecracker records, not a replaceable latest-record
+cache. The reader owns a generation-aware watched snapshot. For each valid record it computes the
+delta from the previous record, stores that delta as `latest`, and adds it to a saturating `total`.
+The first record establishes the running-instance baseline. An invalid JSON record is logged and
+discarded without advancing the generation. If a valid counter regresses, that counter starts a
+new baseline and its total resets to the current value. The accumulator and generation are
+created anew for every `ManagedVm`, so both totals reset after a VM restart.
+
+The one-second heartbeat consumes the accumulated totals for idle comparisons. This prevents a
+normal Firecracker emission from looking like a counter regression when the monitor compares it
+with its previous sample. The monitor retains the latest CPU calculation separately for cached
+`VmStats`; a first sample and a CPU counter reset both retain a nullable CPU value.
+
 These conditions show activity:
 
 - CPU use above its configured threshold
@@ -672,6 +743,26 @@ flowchart TD
 - The first sample sets a new baseline. A lower counter also sets a new
   baseline.
 
+Stats reads are deliberately outside the idle state machine:
+
+```rust
+async fn stats(&mut self, force: bool) -> Result<VmStats> {
+    if !force {
+        return self.cached_monitor_sample();
+    }
+    let before = self.metrics.borrow().generation;
+    self.vm.flush_metrics().await?;
+    let metrics = self.metrics.wait_for_generation_after(before).await?;
+    let sample = self.sample_cgroup_and_conntrack(metrics).await?;
+    let cpu = sample.cpu_percent_since(self.monitor.last_sample);
+    Ok(VmStats::from_sample(sample, cpu))
+}
+```
+
+The forced operation takes the VM's lifecycle lock for its entire flush-and-resample sequence.
+The cached operation never flushes Firecracker and never samples local sources. Neither operation
+calls `Monitor::observe`.
+
 ## Testing
 
 The test system uses `cargo-mutants`, unit tests for agents, and integration tests.
@@ -683,4 +774,10 @@ fn bla_test() {}
 
 Each test that queries the Firecracker API uses this macro from `barbirolli_derive`.
 `RUN_ON_LIMA` prepares the complete test environment. Then it runs the selected test again inside
-Lima.
+Lima. The macro installs `tracing-test`'s subscriber and passes `--nocapture` to the Lima rerun,
+so Firecracker lifecycle, metrics generation, forced-refresh, and idle-strike events are visible
+in the test output. Integration coverage includes FIFO latest/total accumulation, generation
+notifications, saturation and invalid records; nullable and normalized CPU snapshots; total-based
+idle comparisons; cached/forced Barbirolli stats and unavailable/stopped errors; Elhone query
+parsing, exact nested JSON, and `404`/`409`/`422`/`503` mappings; and an ignored Lima/KVM test
+that exercises cached and forced stats against a real Firecracker VM.

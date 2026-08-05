@@ -71,7 +71,7 @@ mod tests {
 
     #[firecracker_test]
     async fn daemon_installs_the_entrypoint_and_authorized_key_before_boot() {
-        let fixture = FirecrackerFixture::new(ProvisioningConfig::default()).await;
+        let fixture = FirecrackerFixture::new(ProvisioningConfig::default(), None).await;
         assert_eq!(
             read_entrypoint(&fixture.source_rootfs()).expect("failed to inspect source rootfs"),
             None,

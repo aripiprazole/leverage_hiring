@@ -3,7 +3,7 @@ use std::{
     io::ErrorKind,
     net::Ipv4Addr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -40,6 +40,7 @@ use rustix::process::Pid;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncBufReadExt, BufReader},
+    sync::watch,
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -51,6 +52,7 @@ use crate::{
     idle::{Monitor, Sample},
     io_error,
     lifecycle::PidError,
+    lifecycle::{ByteStats, VmStats},
     network::{ManagedNetwork, NetworkError},
 };
 
@@ -72,7 +74,7 @@ pub struct ManagedVm {
     #[debug(skip)]
     vm: FirecrackerVm,
     cgroup: Option<VmCgroup>,
-    metrics: Arc<RwLock<Option<Metrics>>>,
+    metrics: watch::Receiver<MetricsSnapshot>,
     #[debug(skip)]
     metrics_task: JoinHandle<()>,
     console: SerialConsole,
@@ -86,24 +88,22 @@ struct SerialConsole {
     path: PathBuf,
     #[debug("{}", if stdin.is_some() { "open" } else { "closed" })]
     stdin: Option<FirecrackerStdin>,
-    #[debug(
-        "{}",
-        match stdout_task.as_ref() {
-            Some(task) if task.is_finished() => "finished",
-            Some(_) => "running",
-            None => "released",
-        }
-    )]
+    #[debug("{}", task_status(stdout_task.as_ref()))]
     stdout_task: Option<JoinHandle<()>>,
-    #[debug(
-        "{}",
-        match stderr_task.as_ref() {
-            Some(task) if task.is_finished() => "finished",
-            Some(_) => "running",
-            None => "released",
-        }
-    )]
+    #[debug("{}", task_status(stderr_task.as_ref()))]
     stderr_task: Option<JoinHandle<()>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "referenced by derive_more's Debug field formatter"
+)]
+fn task_status(task: Option<&JoinHandle<()>>) -> &'static str {
+    match task {
+        Some(task) if task.is_finished() => "finished",
+        Some(_) => "running",
+        None => "released",
+    }
 }
 
 impl SerialConsole {
@@ -111,6 +111,7 @@ impl SerialConsole {
         name = "attach_serial_console",
         skip(vm, path),
         fields(%vm_id, path = %path.display()),
+        ret,
         err
     )]
     async fn new(vm: &mut FirecrackerVm, vm_id: VmId, path: PathBuf) -> Result<Self> {
@@ -124,18 +125,14 @@ impl SerialConsole {
             path.clone()
         )?;
         let pipes = vm.take_pipes()?;
-        let console = Self {
+        tracing::info!("barbirolli starting the Firecracker serial console");
+        Ok(Self {
             vm_id,
             path: path.clone(),
             stdin: Some(pipes.stdin),
             stdout_task: Some(spawn_serial_stdout_reader(pipes.stdout, file, vm_id, &path)),
             stderr_task: Some(spawn_serial_stderr_reader(pipes.stderr, vm_id)),
-        };
-        tracing::debug!(
-            ?console,
-            "barbirolli attached the Firecracker serial console"
-        );
-        Ok(console)
+        })
     }
 
     #[tracing::instrument(
@@ -271,7 +268,9 @@ async fn join_serial_task(task: &mut Option<JoinHandle<()>>, stream: &'static st
 }
 
 impl VmSpec {
+    #[tracing::instrument(skip(self, barbirolli))]
     async fn prepare_vm(&self, barbirolli: &Barbirolli) -> Result<FirecrackerVm> {
+        tracing::info!("preparing vm");
         let mut resources = FirecrackerResourceSystem::with_capacity(
             DirectProcessSpawner,
             TokioRuntime,
@@ -336,7 +335,9 @@ impl VmSpec {
         self.artifact_dir.join("metrics.fifo")
     }
 
+    #[tracing::instrument(err)]
     pub(crate) fn ensure_serial_log(&self) -> Result<(), HealthError> {
+        tracing::trace!("ensure serial log");
         let path = self.serial_log();
         io_error!(
             HealthError,
@@ -546,43 +547,89 @@ impl ManagedVm {
                 });
             }
         };
-        let metrics = Arc::new(RwLock::new(None));
+        let (metrics_sender, metrics) = watch::channel(MetricsSnapshot::default());
 
-        let managed = Self {
+        tracing::info!(pid = pid.as_raw_pid(), "barbirolli started the managed VM");
+        Ok(Self {
             vm,
             network: Some(network),
             failed: false,
             pid,
             monitor: Mutex::new(None),
             cgroup: Some(cgroup),
-            metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics.clone()),
+            metrics_task: spawn_metrics_reader(spec.metrics_path(), metrics_sender),
             metrics,
             console,
             spec,
-        };
-        tracing::info!(
-            pid = managed.pid.as_raw_pid(),
-            "barbirolli started the managed VM"
-        );
-        Ok(managed)
+        })
     }
 
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     pub async fn balloon_config(&mut self) -> Result<BalloonDevice> {
+        tracing::info!("barbirolli gets balloon config");
         Ok(self.vm.get_balloon_device().await?)
     }
 
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     pub async fn update_balloon(&mut self, amount_mib: u16) -> Result<()> {
+        tracing::info!("barbirolli updates balloon");
         Ok(self
             .vm
             .update_balloon_device(UpdateBalloonDevice { amount_mib })
             .await?)
     }
 
-    pub async fn balloon_statistics(&mut self) -> Result<BalloonStatistics> {
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
+    pub async fn balloon_stats(&mut self) -> Result<BalloonStatistics> {
+        tracing::info!("barbirolli reads balloon stats");
         Ok(self.vm.get_balloon_statistics().await?)
     }
 
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
+    pub async fn stats(&mut self, force: bool, api_socket_timeout: Duration) -> Result<VmStats> {
+        tracing::info!("barbirolli reads VM stats");
+        if !force {
+            return self.cached_stats();
+        }
+
+        let mut metrics = self.metrics.clone();
+        let generation = metrics.borrow().generation;
+        tracing::debug!(
+            vm_id = %self.spec.id,
+            generation,
+            "barbirolli flushes Firecracker metrics for VM stats"
+        );
+        self.vm.flush_metrics().await?;
+        let snapshot = wait_for_metrics(&mut metrics, generation, api_socket_timeout).await?;
+        tracing::debug!(
+            vm_id = %self.spec.id,
+            generation = snapshot.generation,
+            latest_network_bytes = snapshot.latest_network_bytes,
+            total_network_bytes = snapshot.total_network_bytes,
+            latest_disk_bytes = snapshot.latest_disk_bytes,
+            total_disk_bytes = snapshot.total_disk_bytes,
+            "barbirolli received the forced Firecracker metrics generation"
+        );
+        let sample = self.activity_sample_from_metrics(snapshot)?;
+        let cpu_percent = self
+            .monitor
+            .lock()
+            .map_err(|_| HealthError::MonitorLock)?
+            .as_ref()
+            .and_then(|monitor| sample.cpu_percent_since(monitor.last_sample));
+        Ok(self.stats_from_sample(sample, cpu_percent))
+    }
+
+    #[cfg(test)]
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
+    pub(crate) async fn flush_metrics_for_test(&mut self) -> Result<()> {
+        tracing::info!("flush metrics for test");
+        Ok(self.vm.flush_metrics().await?)
+    }
+
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     pub async fn shutdown(&mut self, timeout: Duration) -> Result<()> {
+        tracing::info!("shutdown");
         if matches!(self.vm.get_state(), VmState::Exited | VmState::Crashed(_)) {
             return Ok(());
         }
@@ -633,10 +680,12 @@ impl ManagedVm {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self), fields(vm_id = %self.spec.id), err)]
     async fn shutdown_through_serial(
         &mut self,
         duration: Duration,
     ) -> Result<(), SerialShutdownError> {
+        tracing::info!("shutdown through serial");
         self.console.write(b"reboot\n").await?;
         timeout(duration, async {
             loop {
@@ -686,14 +735,52 @@ impl ManagedVm {
         }
     }
 
+    fn cached_stats(&self) -> Result<VmStats> {
+        let monitor = self.monitor.lock().map_err(|_| HealthError::MonitorLock)?;
+        let monitor = monitor.as_ref().ok_or_else(|| {
+            LifecycleError::StatsUnavailable("no cached health sample is available".to_owned())
+        })?;
+        Ok(self.stats_from_sample(monitor.last_sample, monitor.cpu_percent))
+    }
+
+    fn stats_from_sample(&self, sample: Sample, cpu_percent: Option<f64>) -> VmStats {
+        VmStats {
+            id: self.spec.id,
+            sample_age_ms: u64::try_from(
+                Instant::now()
+                    .saturating_duration_since(sample.sampled_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            cpu_percent,
+            memory_bytes: sample.memory_bytes,
+            process_count: sample.process_count,
+            network_bytes: ByteStats {
+                latest: sample.latest_network_bytes,
+                total: sample.network_bytes,
+            },
+            disk_bytes: ByteStats {
+                latest: sample.latest_disk_bytes,
+                total: sample.disk_bytes,
+            },
+            established_tcp_connections: sample.established_tcp_connections,
+            total_connections: sample.total_connections,
+        }
+    }
+
     pub(crate) fn activity_sample(&self) -> Result<Sample, HealthError> {
+        let snapshot = *self.metrics.borrow();
+        if snapshot.generation == 0 {
+            return Err(HealthError::MissingMetrics);
+        }
+        self.activity_sample_from_metrics(snapshot)
+    }
+
+    fn activity_sample_from_metrics(
+        &self,
+        metrics: MetricsSnapshot,
+    ) -> Result<Sample, HealthError> {
         let cgroup = self.cgroup.as_ref().ok_or(HealthError::MissingCgroup)?;
-        let metrics = self
-            .metrics
-            .read()
-            .map_err(|_| HealthError::MetricsLock)?
-            .clone()
-            .ok_or(HealthError::MissingMetrics)?;
         let connections = connection_counts(self.spec.network.guest_ip);
         Ok(Sample {
             instance_pid: self.pid.as_raw_pid(),
@@ -701,14 +788,10 @@ impl ManagedVm {
             cpu_usage_usec: cgroup.read_key("cpu.stat", "usage_usec")?,
             memory_bytes: cgroup.read_value("memory.current")?,
             process_count: cgroup.read_value("pids.current")?,
-            network_bytes: metrics
-                .net
-                .rx_bytes_count
-                .saturating_add(metrics.net.tx_bytes_count),
-            disk_bytes: metrics
-                .block
-                .read_bytes
-                .saturating_add(metrics.block.write_bytes),
+            network_bytes: metrics.total_network_bytes,
+            latest_network_bytes: metrics.latest_network_bytes,
+            disk_bytes: metrics.total_disk_bytes,
+            latest_disk_bytes: metrics.latest_disk_bytes,
             established_tcp_connections: connections.1,
             total_connections: connections.0,
             vcpu_count: self.spec.vcpu_count.into(),
@@ -718,28 +801,67 @@ impl ManagedVm {
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/barbirolli";
 
-fn spawn_metrics_reader(path: PathBuf, latest: Arc<RwLock<Option<Metrics>>>) -> JoinHandle<()> {
+fn spawn_metrics_reader(path: PathBuf, metrics: watch::Sender<MetricsSnapshot>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(error) = read_metrics(&path, &latest).await {
+        if let Err(error) = read_metrics(&path, &metrics).await {
             tracing::error!(%error, path = %path.display(), "the Firecracker metrics reader failed");
         }
     })
 }
 
-async fn read_metrics(path: &PathBuf, latest: &RwLock<Option<Metrics>>) -> Result<(), HealthError> {
+async fn read_metrics(
+    path: &PathBuf,
+    metrics: &watch::Sender<MetricsSnapshot>,
+) -> Result<(), HealthError> {
     let file = io_error!(HealthError, tokio::fs::File::open(path).await, path.clone())?;
     let mut lines = BufReader::new(file).lines();
+    let mut accumulator = MetricsAccumulator::default();
     while let Some(line) = io_error!(HealthError, lines.next_line().await, path.clone())? {
-        let metrics = match serde_json::from_str(&line) {
+        let metrics_record = match parse_metrics(&line) {
             Ok(metrics) => metrics,
             Err(error) => {
                 tracing::warn!(%error, "barbirolli discarded invalid Firecracker metrics");
                 continue;
             }
         };
-        *latest.write().map_err(|_| HealthError::MetricsLock)? = Some(metrics);
+        let snapshot = accumulator.push(metrics_record.into());
+        tracing::trace!(
+            generation = snapshot.generation,
+            latest_network_bytes = snapshot.latest_network_bytes,
+            total_network_bytes = snapshot.total_network_bytes,
+            latest_disk_bytes = snapshot.latest_disk_bytes,
+            total_disk_bytes = snapshot.total_disk_bytes,
+            "barbirolli accepted a Firecracker metrics emission"
+        );
+        if metrics.send(snapshot).is_err() {
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+fn parse_metrics(line: &str) -> std::result::Result<Metrics, serde_json::Error> {
+    serde_json::from_str(line)
+}
+
+async fn wait_for_metrics(
+    metrics: &mut watch::Receiver<MetricsSnapshot>,
+    generation: u64,
+    api_socket_timeout: Duration,
+) -> Result<MetricsSnapshot> {
+    timeout(api_socket_timeout, async {
+        loop {
+            metrics.changed().await.map_err(|_| {
+                LifecycleError::StatsUnavailable("metrics reader stopped".to_owned())
+            })?;
+            let snapshot = *metrics.borrow();
+            if snapshot.generation > generation {
+                return Ok(snapshot);
+            }
+        }
+    })
+    .await
+    .map_err(|_| LifecycleError::StatsUnavailable("forced metrics refresh timed out".to_owned()))?
 }
 
 #[derive(Debug)]
@@ -832,6 +954,76 @@ fn connection_counts(guest_ip: Ipv4Addr) -> (u64, u64) {
         })
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetricsSnapshot {
+    generation: u64,
+    latest_network_bytes: u64,
+    total_network_bytes: u64,
+    latest_disk_bytes: u64,
+    total_disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MetricsCounters {
+    network_bytes: u64,
+    disk_bytes: u64,
+}
+
+impl From<Metrics> for MetricsCounters {
+    fn from(metrics: Metrics) -> Self {
+        Self {
+            network_bytes: metrics
+                .net
+                .rx_bytes_count
+                .saturating_add(metrics.net.tx_bytes_count),
+            disk_bytes: metrics
+                .block
+                .read_bytes
+                .saturating_add(metrics.block.write_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MetricsAccumulator {
+    previous: Option<MetricsCounters>,
+    snapshot: MetricsSnapshot,
+}
+
+impl MetricsAccumulator {
+    fn push(&mut self, counters: MetricsCounters) -> MetricsSnapshot {
+        let (latest_network_bytes, total_network_bytes) = accumulate_counter(
+            self.previous.map(|previous| previous.network_bytes),
+            counters.network_bytes,
+            self.snapshot.total_network_bytes,
+        );
+        let (latest_disk_bytes, total_disk_bytes) = accumulate_counter(
+            self.previous.map(|previous| previous.disk_bytes),
+            counters.disk_bytes,
+            self.snapshot.total_disk_bytes,
+        );
+        self.snapshot = MetricsSnapshot {
+            generation: self.snapshot.generation.saturating_add(1),
+            latest_network_bytes,
+            total_network_bytes,
+            latest_disk_bytes,
+            total_disk_bytes,
+        };
+        self.previous = Some(counters);
+        self.snapshot
+    }
+}
+
+fn accumulate_counter(previous: Option<u64>, current: u64, total: u64) -> (u64, u64) {
+    match previous {
+        Some(previous) if current >= previous => {
+            let latest = current - previous;
+            (latest, total.saturating_add(latest))
+        }
+        None | Some(_) => (current, current),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error(transparent)]
@@ -869,6 +1061,8 @@ pub enum LifecycleError {
     Reconcile(Validated<(), ReconcileFailure>),
     #[error(transparent)]
     Health(#[from] HealthError),
+    #[error("VM stats are unavailable: {0}")]
+    StatsUnavailable(String),
     #[error("FIRECRACKER must name a Firecracker 1.13 executable, got {0:?}")]
     UnsupportedFirecracker(String),
 }
@@ -889,8 +1083,6 @@ pub enum HealthError {
     MissingCgroup,
     #[error("Firecracker has not emitted a metrics sample")]
     MissingMetrics,
-    #[error("the Firecracker metrics lock was poisoned")]
-    MetricsLock,
     #[error("the VM monitor lock was poisoned")]
     MonitorLock,
     #[error("cgroup setup failed: {setup}; rollback also failed: {rollback}")]
@@ -923,6 +1115,8 @@ pub enum ReconcileFailure {
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::Path};
+
+    use tokio::sync::watch;
 
     use super::*;
 
@@ -1035,5 +1229,102 @@ mod tests {
                 .expect("failed to read serial log"),
             b"reboot\n"
         );
+    }
+
+    #[test]
+    fn metrics_accumulate_latest_intervals_and_saturate_totals() {
+        let mut accumulator = MetricsAccumulator::default();
+
+        assert_eq!(
+            accumulator.push(MetricsCounters {
+                network_bytes: 10,
+                disk_bytes: 20,
+            }),
+            MetricsSnapshot {
+                generation: 1,
+                latest_network_bytes: 10,
+                total_network_bytes: 10,
+                latest_disk_bytes: 20,
+                total_disk_bytes: 20,
+            }
+        );
+        assert_eq!(
+            accumulator.push(MetricsCounters {
+                network_bytes: 15,
+                disk_bytes: 25,
+            }),
+            MetricsSnapshot {
+                generation: 2,
+                latest_network_bytes: 5,
+                total_network_bytes: 15,
+                latest_disk_bytes: 5,
+                total_disk_bytes: 25,
+            }
+        );
+
+        let saturated = accumulator.push(MetricsCounters {
+            network_bytes: u64::MAX,
+            disk_bytes: u64::MAX,
+        });
+        assert_eq!(saturated.latest_network_bytes, u64::MAX - 15);
+        assert_eq!(saturated.total_network_bytes, u64::MAX);
+        assert_eq!(saturated.latest_disk_bytes, u64::MAX - 25);
+        assert_eq!(saturated.total_disk_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn metrics_counter_regression_starts_a_new_accumulation_baseline() {
+        let mut accumulator = MetricsAccumulator::default();
+        accumulator.push(MetricsCounters {
+            network_bytes: 100,
+            disk_bytes: 200,
+        });
+
+        let snapshot = accumulator.push(MetricsCounters {
+            network_bytes: 3,
+            disk_bytes: 4,
+        });
+
+        assert_eq!(snapshot.latest_network_bytes, 3);
+        assert_eq!(snapshot.total_network_bytes, 3);
+        assert_eq!(snapshot.latest_disk_bytes, 4);
+        assert_eq!(snapshot.total_disk_bytes, 4);
+    }
+
+    #[tokio::test]
+    async fn metrics_generation_notifies_forced_refresh_waiters() {
+        let (sender, mut receiver) = watch::channel(MetricsSnapshot::default());
+        let snapshot = MetricsSnapshot {
+            generation: 1,
+            latest_network_bytes: 2,
+            total_network_bytes: 2,
+            latest_disk_bytes: 4,
+            total_disk_bytes: 4,
+        };
+        sender.send(snapshot).expect("receiver is still alive");
+
+        assert!(receiver.changed().await.is_ok());
+        assert_eq!(*receiver.borrow(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn forced_refresh_times_out_without_a_new_metrics_generation() {
+        let (_sender, mut receiver) = watch::channel(MetricsSnapshot::default());
+
+        let error = wait_for_metrics(&mut receiver, 0, Duration::from_millis(1))
+            .await
+            .expect_err("a missing generation should time out");
+
+        assert!(matches!(
+            error,
+            LifecycleError::StatsUnavailable(message)
+                if message == "forced metrics refresh timed out"
+        ));
+    }
+
+    #[test]
+    fn invalid_metrics_records_are_rejected_without_advancing_state() {
+        assert!(parse_metrics("not json").is_err());
+        assert_eq!(MetricsAccumulator::default().snapshot.generation, 0);
     }
 }

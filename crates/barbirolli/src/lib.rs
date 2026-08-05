@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 pub use idle::IdlePolicy;
 pub use lifecycle::{
-    BalloonConfig, BalloonStatistics, Barbirolli, DaemonConfig, LifecycleError, ProvisioningConfig,
-    VmStatus, VmSummary,
+    BalloonConfig, BalloonStatistics, Barbirolli, ByteStats, DaemonConfig, LifecycleError,
+    ProvisioningConfig, VmStats, VmStatus, VmSummary,
 };
 pub use network::{InterfaceName, NetworkSpec};
 #[cfg(target_os = "linux")]
